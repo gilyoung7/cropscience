@@ -1,0 +1,30 @@
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# env / secrets
+.venv/
+env/
+*.env
+
+# outputs / logs / checkpoints
+outputs/
+logs/
+checkpoints/
+runs/
+wandb/
+*.pt
+*.pth
+
+# data (repo에 넣지 않음)
+data/
+datasets/
+*.csv
+*.parquet
+*.npy
+*.npz
+*.zip
+
+# macOS
+.DS_Store
