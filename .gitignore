@@ -28,3 +28,19 @@ datasets/
 
 # macOS
 .DS_Store
+
+# artifacts
+outputs/
+*.pt
+*.pth
+*.log
+*.csv
+run*_pi_*.csv
+run*_topk.txt
+run*_sfs_*.txt
+checkpoint_run*.pt
+eval_run*.csv
+train_run*.log
+
+# venv
+.venv/
