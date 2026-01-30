@@ -29,6 +29,7 @@ from src.dataset import (
     split_by_site,
     compute_norm_stats,
     IntervalEventDataset,
+    log_split_fingerprint,
 )
 from src.model import HazardTransformer
 from src.interpret import permutation_importance_features, summarize_importance
@@ -82,7 +83,8 @@ def rebuild_val_dataset(run: int):
         print("WARNING: dropped groups (len!=T):", dropped)
 
     # same split as train/eval
-    train_s, val_s, _ = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=42)
+    train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=C.SPLIT_SEED)
+    log_split_fingerprint("pi", train_s, val_s, test_s)
     x_mean, x_std = compute_norm_stats(train_s)
 
     val_ds = IntervalEventDataset(val_s, x_mean, x_std)
@@ -105,12 +107,36 @@ def resolve_out_prefix(run: int, out_root: str, out_prefix: str | None) -> Path:
     return out_dir / f"pi_run{run}"
 
 
-def main(ckpt_path: str | None, run: int, n_repeats: int, topk: int, out_prefix: str | None, out_root: str):
+def check_run_match(ckpt_run: int, cli_run: int, allow_run_mismatch: bool, ckpt_path: Path):
+    if ckpt_run != cli_run:
+        msg = (
+            f"Run mismatch: ckpt has run={ckpt_run} but CLI --run={cli_run}. "
+            f"Pass --run {ckpt_run} or specify --ckpt correctly.\n"
+            f"Example: python -m scripts.run_pi --run {ckpt_run} --ckpt {ckpt_path}"
+        )
+        if allow_run_mismatch:
+            print("WARNING:", msg)
+        else:
+            raise ValueError(msg)
+
+
+def main(
+    ckpt_path: str | None,
+    run: int,
+    n_repeats: int,
+    topk: int,
+    out_prefix: str | None,
+    out_root: str,
+    seed_only: int | None,
+    allow_run_mismatch: bool,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
     ckpt_path_resolved = resolve_ckpt_path(run, out_root, ckpt_path)
     ckpt = torch.load(ckpt_path_resolved, map_location="cpu")
+    ckpt_run = int(ckpt.get("run", -1))
+    check_run_match(ckpt_run, run, allow_run_mismatch, ckpt_path_resolved)
     states = ckpt["trained_states"]
     print("loaded ckpt:", ckpt_path_resolved, "| seeds:", [d["seed"] for d in states])
 
@@ -126,6 +152,8 @@ def main(ckpt_path: str | None, run: int, n_repeats: int, topk: int, out_prefix:
 
     for d in states:
         seed = int(d["seed"])
+        if seed_only is not None and seed != seed_only:
+            continue
 
         model = HazardTransformer(
             d_in=len(feature_cols),
@@ -187,5 +215,16 @@ if __name__ == "__main__":
     p.add_argument("--topk", type=int, default=20)
     p.add_argument("--out_prefix", type=str, default=None)
     p.add_argument("--out_root", type=str, default="outputs")
+    p.add_argument("--seed_only", type=int, default=None)
+    p.add_argument("--allow_run_mismatch", action="store_true")
     args = p.parse_args()
-    main(args.ckpt, args.run, args.n_repeats, args.topk, args.out_prefix, args.out_root)
+    main(
+        args.ckpt,
+        args.run,
+        args.n_repeats,
+        args.topk,
+        args.out_prefix,
+        args.out_root,
+        args.seed_only,
+        args.allow_run_mismatch,
+    )

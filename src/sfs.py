@@ -11,6 +11,7 @@ from src.dataset import (
     split_by_site,
     compute_norm_stats,
     IntervalEventDataset,
+    log_split_fingerprint,
 )
 from src.model import HazardTransformer
 from src.train_eval import run_epoch_weighted, eval_nll_model
@@ -22,7 +23,9 @@ def make_loaders_for_features(
     Tend: int,
     doy_start: int,
     doy_end: int,
-    seed: int,
+    split_seed: int,
+    train_seed: int,
+    log_split: bool = False,
 ):
     """
     trial_cols -> samples -> (train,val) split -> norm -> datasets -> loaders
@@ -33,13 +36,15 @@ def make_loaders_for_features(
         # SFS에서는 빠르게 돌리므로 경고만
         pass
 
-    train_s, val_s, _ = split_by_site(samples_trial, val_frac=0.1, test_frac=0.1, seed=seed)
+    train_s, val_s, test_s = split_by_site(samples_trial, val_frac=0.1, test_frac=0.1, seed=split_seed)
+    if log_split:
+        log_split_fingerprint("sfs", train_s, val_s, test_s)
     x_mean, x_std = compute_norm_stats(train_s)
 
     train_ds = IntervalEventDataset(train_s, x_mean, x_std)
     val_ds = IntervalEventDataset(val_s, x_mean, x_std)
 
-    gen = torch.Generator().manual_seed(seed)
+    gen = torch.Generator().manual_seed(train_seed)
     train_loader = DataLoader(
         train_ds,
         batch_size=C.BATCH_TRAIN,
@@ -71,12 +76,16 @@ def sfs_topk(
     doy_start: int,
     doy_end: int,
     device,
-    seed: int = 0,
+    train_seed: int = 42,
+    split_seed: int = C.SPLIT_SEED,
     max_k: int = 12,
     max_epochs_fs: int = 25,
     patience_fs: int = 5,
     min_delta_fs: float = 1e-3,
     min_gain: float = 1e-4,
+    elbow_patience: int = 2,
+    elbow_ratio: float = 0.3,
+    bad_patience: int = 1,
 ):
     """
     Sequential Forward Selection:
@@ -84,8 +93,14 @@ def sfs_topk(
     """
     selected: list[str] = []
     best_val = float("inf")
+    history: list[dict] = []
+    max_gain_so_far = None
+    elbow_count = 0
+    bad_count = 0
 
+    split_logged = False
     for step in range(1, max_k + 1):
+        prev_best_val = best_val
         best_feat = None
         best_val_step = best_val
 
@@ -96,9 +111,9 @@ def sfs_topk(
             trial = selected + [f]
 
             # seed 고정
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+            random.seed(train_seed)
+            np.random.seed(train_seed)
+            torch.manual_seed(train_seed)
 
             train_loader, val_loader = make_loaders_for_features(
                 train_df_season=train_df_season,
@@ -106,8 +121,11 @@ def sfs_topk(
                 Tend=Tend,
                 doy_start=doy_start,
                 doy_end=doy_end,
-                seed=seed,
+                split_seed=split_seed,
+                train_seed=train_seed,
+                log_split=not split_logged,
             )
+            split_logged = True
 
             model = HazardTransformer(
                 d_in=len(trial),
@@ -138,13 +156,59 @@ def sfs_topk(
                 best_val_step = best_local
                 best_feat = f
 
-        gain = best_val - best_val_step
-        if best_feat is None or gain < min_gain:
+        if best_feat is None:
+            gain = None
+        elif prev_best_val == float("inf"):
+            gain = None
+        else:
+            gain = prev_best_val - best_val_step
+
+        if gain is not None:
+            if gain > 0:
+                if max_gain_so_far is None:
+                    max_gain_so_far = gain
+                else:
+                    max_gain_so_far = max(max_gain_so_far, gain)
+
+            if gain <= 0:
+                bad_count += 1
+            else:
+                bad_count = 0
+
+            if max_gain_so_far is not None:
+                if gain < max_gain_so_far * elbow_ratio:
+                    elbow_count += 1
+                else:
+                    elbow_count = 0
+
+        history.append(
+            {
+                "step": step,
+                "added_feature": best_feat if best_feat is not None else "",
+                "best_val_nll_after_step": float(best_val_step),
+                "gain": None if gain is None else float(gain),
+                "selected_features_so_far": str(selected + ([best_feat] if best_feat else [])),
+            }
+        )
+
+        if best_feat is None:
+            print(f"[SFS] stop at step {step} | no improvement candidate")
+            break
+        if gain is not None and bad_count >= bad_patience:
+            print(f"[SFS] stop at step {step} | bad_count={bad_count} gain={gain:.6f}")
+            break
+        if gain is not None and gain < min_gain:
             print(f"[SFS] stop at step {step} | gain={gain:.6f}")
+            break
+        if gain is not None and elbow_count >= elbow_patience:
+            print(f"[SFS] stop at step {step} | elbow_count={elbow_count} gain={gain:.6f}")
             break
 
         selected.append(best_feat)
         best_val = best_val_step
-        print(f"[SFS] step {step:02d}: +{best_feat:25s} val_nll={best_val:.5f} gain={gain:.6f}")
+        if gain is None:
+            print(f"[SFS] step {step:02d}: +{best_feat:25s} val_nll={best_val:.5f} gain=NA")
+        else:
+            print(f"[SFS] step {step:02d}: +{best_feat:25s} val_nll={best_val:.5f} gain={gain:.6f}")
 
-    return selected, best_val
+    return selected, best_val, history

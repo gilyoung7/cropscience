@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import numpy as np
 import pandas as pd
 import torch
@@ -116,6 +117,144 @@ def split_by_site(samples: list[dict], val_frac=0.1, test_frac=0.1, seed=42):
     val = [s for s in samples if s["site_id"] in val_sites]
     test = [s for s in samples if s["site_id"] in test_sites]
     return train, val, test
+
+
+def split_fingerprint(train: list[dict], val: list[dict], test: list[dict], sample_n: int = 5) -> dict:
+    def _sites(samples: list[dict]) -> list[str]:
+        return sorted({s["site_id"] for s in samples})
+
+    def _hash(sites: list[str]) -> str:
+        joined = "|".join(sites)
+        return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+    train_sites = _sites(train)
+    val_sites = _sites(val)
+    test_sites = _sites(test)
+
+    return {
+        "train_sites_sample": train_sites[:sample_n],
+        "val_sites_sample": val_sites[:sample_n],
+        "test_sites_sample": test_sites[:sample_n],
+        "train_sites_hash": _hash(train_sites),
+        "val_sites_hash": _hash(val_sites),
+        "test_sites_hash": _hash(test_sites),
+        "n_train_sites": len(train_sites),
+        "n_val_sites": len(val_sites),
+        "n_test_sites": len(test_sites),
+    }
+
+
+def log_split_fingerprint(
+    label: str,
+    train: list[dict],
+    val: list[dict],
+    test: list[dict],
+    sample_n: int = 5,
+):
+    fp = split_fingerprint(train, val, test, sample_n=sample_n)
+    print(
+        f"[split:{label}] train_sites={fp['n_train_sites']} val_sites={fp['n_val_sites']} test_sites={fp['n_test_sites']} "
+        f"train_hash={fp['train_sites_hash']} val_hash={fp['val_sites_hash']} test_hash={fp['test_sites_hash']} "
+        f"train_sample={fp['train_sites_sample']} val_sample={fp['val_sites_sample']} test_sample={fp['test_sites_sample']}"
+    )
+
+
+def censor_type_counts(samples: list[dict]) -> dict[str, int]:
+    counts = {"left": 0, "interval": 0, "right": 0}
+    for s in samples:
+        c = str(s.get("censor_type", ""))
+        if c in counts:
+            counts[c] += 1
+    return counts
+
+
+def _counts_to_probs(counts: dict[str, int]) -> dict[str, float]:
+    total = sum(counts.values())
+    if total == 0:
+        return {k: 0.0 for k in counts}
+    return {k: counts[k] / total for k in counts}
+
+
+def split_seed_search_topk(
+    samples: list[dict],
+    val_frac: float,
+    test_frac: float,
+    seed_candidates: list[int],
+    target_test_interval: int | None = None,
+    tol_test_interval: int | None = None,
+    topk: int = 1,
+) -> dict:
+    overall_counts = censor_type_counts(samples)
+    overall_probs = _counts_to_probs(overall_counts)
+
+    scored = []
+    for seed in seed_candidates:
+        train_s, val_s, test_s = split_by_site(samples, val_frac=val_frac, test_frac=test_frac, seed=seed)
+
+        train_counts = censor_type_counts(train_s)
+        val_counts = censor_type_counts(val_s)
+        test_counts = censor_type_counts(test_s)
+
+        train_probs = _counts_to_probs(train_counts)
+        val_probs = _counts_to_probs(val_counts)
+        test_probs = _counts_to_probs(test_counts)
+
+        score = 0.0
+        for t in ("left", "interval", "right"):
+            score += (train_probs[t] - overall_probs[t]) ** 2
+            score += (val_probs[t] - overall_probs[t]) ** 2
+            score += (test_probs[t] - overall_probs[t]) ** 2
+
+        meets_constraint = True
+        if target_test_interval is not None and tol_test_interval is not None:
+            test_int = test_counts.get("interval", 0)
+            if abs(test_int - target_test_interval) > tol_test_interval:
+                meets_constraint = False
+
+        scored.append(
+            {
+                "seed": seed,
+                "score": float(score),
+                "counts": {
+                    "overall": overall_counts,
+                    "train": train_counts,
+                    "val": val_counts,
+                    "test": test_counts,
+                },
+                "meets_constraint": meets_constraint,
+            }
+        )
+
+    filtered = [s for s in scored if s["meets_constraint"]]
+    used_fallback = False
+    if not filtered:
+        filtered = scored
+        used_fallback = True
+
+    filtered.sort(key=lambda x: x["score"])
+    topk_list = filtered[: max(1, int(topk))]
+
+    return {"topk": topk_list, "used_fallback": used_fallback}
+
+
+def split_seed_search(
+    samples: list[dict],
+    val_frac: float,
+    test_frac: float,
+    seed_candidates: list[int],
+    target_test_interval: int | None = None,
+    tol_test_interval: int | None = None,
+) -> dict:
+    result = split_seed_search_topk(
+        samples=samples,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        seed_candidates=seed_candidates,
+        target_test_interval=target_test_interval,
+        tol_test_interval=tol_test_interval,
+        topk=1,
+    )
+    return {"topk": result["topk"], "used_fallback": result["used_fallback"]}
 
 
 def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:

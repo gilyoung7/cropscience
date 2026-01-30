@@ -1,0 +1,25 @@
+일강수량(mm)
+최고기온(°C)
+최저기온(°C)
+평균기온(°C)
+평균 풍속(m/s)
+최대 풍속(m/s)
+DD10
+GDD10_since_db
+first_obs_season
+n_obs
+max_gap
+좌표-위도
+좌표-경도
+rain_7d_sum
+rain_14d_sum
+rain_7d_days
+tmean_7d_mean
+tmax_7d_max
+tmin_7d_min
+DD10_7d_sum
+trange
+trange_7d_mean
+days_since_flowering
+days_since_growing_start
+is_growing

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -29,6 +31,9 @@ from src.dataset import (
     split_by_site,
     compute_norm_stats,
     IntervalEventDataset,
+    log_split_fingerprint,
+    split_fingerprint,
+    split_seed_search_topk,
 )
 from src.model import HazardTransformer
 from src.train_eval import eval_nll_model, eval_metrics_with_overlap
@@ -47,7 +52,7 @@ def make_loader(ds, batch_size, shuffle):
     )
 
 
-def rebuild_datasets(run: int):
+def build_samples_for_run(run: int):
     """
     Rebuild datasets deterministically (same as training pipeline split seed=42).
     Norm stats are recomputed from train split.
@@ -85,14 +90,16 @@ def rebuild_datasets(run: int):
     if dropped > 0:
         print("WARNING: dropped groups (len!=T):", dropped)
 
-    train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=42)
-    x_mean, x_std = compute_norm_stats(train_s)
+    return feature_cols, T, samples
 
-    train_ds = IntervalEventDataset(train_s, x_mean, x_std)
-    val_ds   = IntervalEventDataset(val_s,   x_mean, x_std)
-    test_ds  = IntervalEventDataset(test_s,  x_mean, x_std)
 
-    return feature_cols, T, train_ds, val_ds, test_ds
+def parse_seed_candidates(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    if ":" in raw:
+        start_s, end_s = raw.split(":", 1)
+        return list(range(int(start_s), int(end_s)))
+    return [int(x) for x in raw.split(",") if x.strip()]
 
 
 def mean_std(arr):
@@ -116,16 +123,132 @@ def resolve_out_csv(run: int, out_root: str, out_csv: str | None) -> str | None:
     return out_csv
 
 
-def main(ckpt_path: str | None, run: int, out_csv: str | None, out_root: str):
+def check_run_match(ckpt_run: int, cli_run: int, allow_run_mismatch: bool, ckpt_path: Path):
+    if ckpt_run != cli_run:
+        msg = (
+            f"Run mismatch: ckpt has run={ckpt_run} but CLI --run={cli_run}. "
+            f"Pass --run {ckpt_run} or specify --ckpt correctly.\n"
+            f"Example: python -m scripts.run_eval --run {ckpt_run} --ckpt {ckpt_path}"
+        )
+        if allow_run_mismatch:
+            print("WARNING:", msg)
+        else:
+            raise ValueError(msg)
+
+
+def main(
+    ckpt_path: str | None,
+    run: int,
+    out_csv: str | None,
+    out_root: str,
+    allow_run_mismatch: bool,
+    split_seed: int,
+    seeds: list[int] | None,
+    auto_split_seed: bool,
+    seed_candidates_raw: str | None,
+    target_test_interval: int | None,
+    tol_test_interval: int | None,
+    auto_split_topk: int,
+    split_seed_from_topk_idx: int | None,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
     ckpt_path_resolved = resolve_ckpt_path(run, out_root, ckpt_path)
+    print(f"Using checkpoint: {ckpt_path_resolved}")
     ckpt = torch.load(ckpt_path_resolved, map_location="cpu")
+    ckpt_run = int(ckpt.get("run", -1))
+    check_run_match(ckpt_run, run, allow_run_mismatch, ckpt_path_resolved)
     trained_states = ckpt["trained_states"]
     print("loaded ckpt:", ckpt_path_resolved, "| seeds:", [d["seed"] for d in trained_states])
 
-    feature_cols, T, train_ds, val_ds, test_ds = rebuild_datasets(run)
+    feature_cols, T, samples = build_samples_for_run(run)
+    result = None
+    chosen = None
+    if auto_split_seed:
+        candidates = parse_seed_candidates(seed_candidates_raw) or list(range(0, 200))
+        result = split_seed_search_topk(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed_candidates=candidates,
+            target_test_interval=target_test_interval,
+            tol_test_interval=tol_test_interval,
+            topk=auto_split_topk,
+        )
+        topk_list = result["topk"]
+        if not topk_list:
+            raise ValueError("auto_split_seed produced no candidates")
+        if split_seed_from_topk_idx is None:
+            split_seed_from_topk_idx = 0
+        if split_seed_from_topk_idx < 0 or split_seed_from_topk_idx >= len(topk_list):
+            raise ValueError(f"--split_seed_from_topk_idx out of range (0..{len(topk_list)-1})")
+        chosen = topk_list[split_seed_from_topk_idx]
+        split_seed = int(chosen["seed"])
+        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        print(
+            f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} "
+            f"counts={chosen['counts']}"
+        )
+        if result.get("used_fallback"):
+            print("[auto_split] WARNING: no seed met constraints; using best score fallback.")
+        print("[auto_split] topk seeds (seed, score, test_counts):")
+        for i, item in enumerate(topk_list):
+            print(f"  [{i}] seed={item['seed']} score={item['score']:.6f} test={item['counts']['test']}")
+    else:
+        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+
+    log_split_fingerprint("eval", train_s, val_s, test_s)
+    fp = split_fingerprint(train_s, val_s, test_s)
+    split_out_dir = Path(out_root) / "splits"
+    split_out_dir.mkdir(parents=True, exist_ok=True)
+    split_path = split_out_dir / f"selected_split_seed_run{run}.json"
+    split_payload = {
+        "seed": split_seed,
+        "score": chosen["score"] if chosen is not None else None,
+        "counts": chosen["counts"] if chosen is not None else None,
+        "hashes": {
+            "train": fp["train_sites_hash"],
+            "val": fp["val_sites_hash"],
+            "test": fp["test_sites_hash"],
+        },
+    }
+    with open(split_path, "w", encoding="utf-8") as f:
+        json.dump(split_payload, f, ensure_ascii=False, indent=2)
+    print("saved:", split_path)
+
+    if result is not None:
+        topk_payload = {
+            "target_test_interval": target_test_interval,
+            "tol_test_interval": tol_test_interval,
+            "seed_candidates": seed_candidates_raw,
+            "topk": [],
+        }
+        for item in result["topk"]:
+            seed_i = int(item["seed"])
+            tr_i, va_i, te_i = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=seed_i)
+            fp_i = split_fingerprint(tr_i, va_i, te_i)
+            topk_payload["topk"].append(
+                {
+                    "seed": seed_i,
+                    "score": item["score"],
+                    "counts": item["counts"],
+                    "hashes": {
+                        "train": fp_i["train_sites_hash"],
+                        "val": fp_i["val_sites_hash"],
+                        "test": fp_i["test_sites_hash"],
+                    },
+                }
+            )
+        topk_path = split_out_dir / f"selected_split_seeds_run{run}.json"
+        with open(topk_path, "w", encoding="utf-8") as f:
+            json.dump(topk_payload, f, ensure_ascii=False, indent=2)
+        print("saved:", topk_path)
+
+    x_mean, x_std = compute_norm_stats(train_s)
+    train_ds = IntervalEventDataset(train_s, x_mean, x_std)
+    val_ds   = IntervalEventDataset(val_s,   x_mean, x_std)
+    test_ds  = IntervalEventDataset(test_s,  x_mean, x_std)
     print(f"RUN={run} | D_in={len(feature_cols)} | T={T}")
 
     val_loader  = make_loader(val_ds,  C.BATCH_EVAL, shuffle=False)
@@ -134,6 +257,8 @@ def main(ckpt_path: str | None, run: int, out_csv: str | None, out_root: str):
     records = []
     for d in trained_states:
         seed = int(d["seed"])
+        if seeds is not None and seed not in seeds:
+            continue
 
         model = HazardTransformer(
             d_in=len(feature_cols),
@@ -198,5 +323,28 @@ if __name__ == "__main__":
     p.add_argument("--run", type=int, default=5)
     p.add_argument("--out_csv", type=str, default=None)
     p.add_argument("--out_root", type=str, default="outputs")
+    p.add_argument("--allow_run_mismatch", action="store_true")
+    p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
+    p.add_argument("--seeds", type=int, nargs="*", default=None)
+    p.add_argument("--auto_split_seed", action="store_true")
+    p.add_argument("--auto_split_topk", type=int, default=1)
+    p.add_argument("--split_seed_from_topk_idx", type=int, default=None)
+    p.add_argument("--seed_candidates", type=str, default=None)
+    p.add_argument("--target_test_interval", type=int, default=None)
+    p.add_argument("--tol_test_interval", type=int, default=None)
     args = p.parse_args()
-    main(args.ckpt, args.run, args.out_csv, args.out_root)
+    main(
+        args.ckpt,
+        args.run,
+        args.out_csv,
+        args.out_root,
+        args.allow_run_mismatch,
+        args.split_seed,
+        args.seeds,
+        args.auto_split_seed,
+        args.seed_candidates,
+        args.target_test_interval,
+        args.tol_test_interval,
+        args.auto_split_topk,
+        args.split_seed_from_topk_idx,
+    )

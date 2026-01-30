@@ -68,9 +68,23 @@ def weighted_loss_from_ctype(nll_vec, ctype):
     return (w * nll_vec).mean()
 
 
-def run_epoch_weighted(model, opt, loader, Tend, device, train=True):
+def run_epoch_weighted(
+    model,
+    opt,
+    loader,
+    Tend,
+    device,
+    train=True,
+    lambda_mass: float = 0.0,
+    log_mass: bool = False,
+    epoch_idx: int | None = None,
+    return_parts: bool = False,
+):
     model.train(train)
     total, n = 0.0, 0
+    base_total = 0.0
+    mass_total = 0.0
+    logged = False
     for X, L, R, ctype in loader:
         X = X.to(device, non_blocking=True)
         L = L.to(device, non_blocking=True)
@@ -79,7 +93,66 @@ def run_epoch_weighted(model, opt, loader, Tend, device, train=True):
 
         hazard = model(X)
         nll_vec = interval_nll_per_sample(hazard, L, R, ctype, Tend=Tend)
-        loss = weighted_loss_from_ctype(nll_vec, ctype)
+        base_loss = weighted_loss_from_ctype(nll_vec, ctype)
+        loss = base_loss
+        mass_loss_tensor = None
+
+        if train and log_mass and not logged:
+            mi = (ctype == CTYPE_INTERVAL)
+            mi_frac = float(mi.float().mean().item())
+            if mi.any():
+                _, _, logS = hazard_to_pmf_cdf_logS(hazard)
+                idxL = (torch.clamp(L, 1, Tend) - 1).long()
+                idxR = (torch.clamp(R, 1, Tend) - 1).long()
+                logS_L = logS.gather(1, idxL.view(-1, 1)).squeeze(1)
+                logS_R = logS.gather(1, idxR.view(-1, 1)).squeeze(1)
+                mass = (torch.exp(logS_L) - torch.exp(logS_R)).clamp(min=0.0)
+                mass_mi = mass[mi]
+                mass_mean = float(mass_mi.mean().item())
+                mass_min = float(mass_mi.min().item())
+                mass_max = float(mass_mi.max().item())
+                mass_loss_tensor = -mass_mi.mean()
+                mass_loss_val = float(mass_loss_tensor.item())
+                mass_loss_requires_grad = mass_loss_tensor.requires_grad
+                mass_loss_grad_fn = str(mass_loss_tensor.grad_fn)
+                logS_requires_grad = logS.requires_grad
+            else:
+                mass_mean = float("nan")
+                mass_min = float("nan")
+                mass_max = float("nan")
+                mass_loss_val = 0.0
+                mass_loss_requires_grad = False
+                mass_loss_grad_fn = "None"
+                logS_requires_grad = False
+            prefix = f"[mass] epoch {epoch_idx:02d} " if epoch_idx is not None else "[mass] "
+            print(
+                prefix
+                + f"mi_frac={mi_frac:.4f} mass_mean={mass_mean:.6f} "
+                + f"mass_min={mass_min:.6f} mass_max={mass_max:.6f} "
+                + f"mass_loss={mass_loss_val:.6f} lambda_mass={lambda_mass} "
+                + f"mass_loss_requires_grad={mass_loss_requires_grad} "
+                + f"mass_loss_grad_fn={mass_loss_grad_fn}"
+            )
+            if epoch_idx == 1:
+                print(
+                    prefix
+                    + f"logS_requires_grad={logS_requires_grad} "
+                    + f"mass_loss_requires_grad={mass_loss_requires_grad} "
+                    + f"mass_loss_grad_fn={mass_loss_grad_fn}"
+                )
+            logged = True
+
+        if lambda_mass > 0:
+            mi = (ctype == CTYPE_INTERVAL)
+            if mi.any():
+                _, _, logS = hazard_to_pmf_cdf_logS(hazard)
+                idxL = (torch.clamp(L, 1, Tend) - 1).long()
+                idxR = (torch.clamp(R, 1, Tend) - 1).long()
+                logS_L = logS.gather(1, idxL.view(-1, 1)).squeeze(1)
+                logS_R = logS.gather(1, idxR.view(-1, 1)).squeeze(1)
+                mass = (torch.exp(logS_L) - torch.exp(logS_R)).clamp(min=0.0)
+                mass_loss_tensor = -mass[mi].mean()
+                loss = loss + lambda_mass * mass_loss_tensor
 
         if train:
             opt.zero_grad(set_to_none=True)
@@ -88,9 +161,17 @@ def run_epoch_weighted(model, opt, loader, Tend, device, train=True):
             opt.step()
 
         total += float(loss.item()) * X.size(0)
+        base_total += float(base_loss.item()) * X.size(0)
+        if mass_loss_tensor is not None:
+            mass_total += float(mass_loss_tensor.item()) * X.size(0)
         n += X.size(0)
 
-    return total / max(n, 1)
+    total_avg = total / max(n, 1)
+    if return_parts:
+        base_avg = base_total / max(n, 1)
+        mass_avg = mass_total / max(n, 1)
+        return total_avg, base_avg, mass_avg
+    return total_avg
 
 
 @torch.no_grad()
@@ -116,7 +197,6 @@ def eval_nll_model(model, loader, Tend, device):
 # -------------------------
 # Metrics
 # -------------------------
-@torch.no_grad()
 def hazard_to_pmf_cdf_logS(hazard):
     B, T = hazard.shape
     logS = torch.cumsum(torch.log1p(-hazard), dim=1)  # log S_t
