@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+
+CTYPE2ID = {"interval": 0, "right": 1, "left": 2}
+
+
+def build_train_frame(
+    daily_feat: pd.DataFrame,
+    labels: pd.DataFrame,
+    obs_meta: pd.DataFrame,
+    T: int,
+) -> pd.DataFrame:
+    """
+    daily_feat: [site_id, year, doy, date] + base/rolling features
+    labels: [site_id, year, censor_type, L_doy, R_doy, ...]
+    obs_meta: [site_id, year, first_obs_season, n_obs, max_gap, ...]
+    """
+    df = daily_feat.copy()
+
+    # type unify
+    df["site_id"] = df["site_id"].astype(str)
+    df["year"] = df["year"].astype(int)
+    labels = labels.copy()
+    labels["site_id"] = labels["site_id"].astype(str)
+    labels["year"] = labels["year"].astype(int)
+    obs_meta = obs_meta.copy()
+    obs_meta["site_id"] = obs_meta["site_id"].astype(str)
+    obs_meta["year"] = obs_meta["year"].astype(int)
+
+    # merge labels
+    df = df.merge(labels, on=["site_id", "year"], how="inner")
+
+    # merge obs_meta (관측 프로세스 feature)
+    df = df.merge(
+        obs_meta[["site_id", "year", "first_obs_season", "n_obs", "max_gap"]],
+        on=["site_id", "year"],
+        how="left",
+    )
+
+    # fill missing obs_meta
+    df["first_obs_season"] = df["first_obs_season"].fillna(1).astype(int)
+    df["n_obs"] = df["n_obs"].fillna(0).astype(int)
+    df["max_gap"] = df["max_gap"].fillna(T).astype(int)
+
+    return df
+
+
+def slice_season(df: pd.DataFrame, doy_start: int, doy_end: int) -> pd.DataFrame:
+    out = df[(df["doy"] >= doy_start) & (df["doy"] <= doy_end)].copy()
+
+    # label clamp to season
+    out["L_doy"] = out["L_doy"].clip(lower=doy_start, upper=doy_end)
+    out["R_doy"] = out["R_doy"].clip(lower=doy_start, upper=doy_end)
+    return out
+
+
+def build_samples_season(
+    df_season: pd.DataFrame,
+    feature_cols: list[str],
+    doy_start: int,
+    doy_end: int,
+) -> tuple[list[dict], int]:
+    """
+    Returns (samples, dropped_groups)
+    samples item: {"site_id","year","X","L","R","censor_type"}
+      - X: (T,D) float32
+      - L,R: season coordinates in 1..T
+    """
+    T = doy_end - doy_start + 1
+    samples: list[dict] = []
+    dropped = 0
+
+    for (site, year), sub in df_season.groupby(["site_id", "year"], sort=False):
+        sub = sub.sort_values("doy")
+
+        # 시즌 구간이 정확히 T개인지 확인 (빠진 day 있으면 drop)
+        if len(sub) != T:
+            dropped += 1
+            continue
+
+        X = sub[feature_cols].to_numpy(dtype=np.float32)
+
+        L = int(sub["L_doy"].iloc[0]) - doy_start + 1
+        R = int(sub["R_doy"].iloc[0]) - doy_start + 1
+        ctype = str(sub["censor_type"].iloc[0])
+
+        # clamp to [1, T]
+        L = min(max(L, 1), T)
+        R = min(max(R, 1), T)
+
+        samples.append({"site_id": site, "year": int(year), "X": X, "L": L, "R": R, "censor_type": ctype})
+
+    return samples, dropped
+
+
+def split_by_site(samples: list[dict], val_frac=0.1, test_frac=0.1, seed=42):
+    rng = np.random.default_rng(seed)
+    sites = sorted(list({s["site_id"] for s in samples}))
+    rng.shuffle(sites)
+
+    n = len(sites)
+    n_test = int(n * test_frac)
+    n_val = int(n * val_frac)
+
+    test_sites = set(sites[:n_test])
+    val_sites = set(sites[n_test : n_test + n_val])
+    train_sites = set(sites[n_test + n_val :])
+
+    train = [s for s in samples if s["site_id"] in train_sites]
+    val = [s for s in samples if s["site_id"] in val_sites]
+    test = [s for s in samples if s["site_id"] in test_sites]
+    return train, val, test
+
+
+def split_fingerprint(train: list[dict], val: list[dict], test: list[dict], sample_n: int = 5) -> dict:
+    def _sites(samples: list[dict]) -> list[str]:
+        return sorted({s["site_id"] for s in samples})
+
+    def _hash(sites: list[str]) -> str:
+        joined = "|".join(sites)
+        return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+    train_sites = _sites(train)
+    val_sites = _sites(val)
+    test_sites = _sites(test)
+
+    return {
+        "train_sites_sample": train_sites[:sample_n],
+        "val_sites_sample": val_sites[:sample_n],
+        "test_sites_sample": test_sites[:sample_n],
+        "train_sites_hash": _hash(train_sites),
+        "val_sites_hash": _hash(val_sites),
+        "test_sites_hash": _hash(test_sites),
+        "n_train_sites": len(train_sites),
+        "n_val_sites": len(val_sites),
+        "n_test_sites": len(test_sites),
+    }
+
+
+def log_split_fingerprint(
+    label: str,
+    train: list[dict],
+    val: list[dict],
+    test: list[dict],
+    sample_n: int = 5,
+):
+    fp = split_fingerprint(train, val, test, sample_n=sample_n)
+    print(
+        f"[split:{label}] train_sites={fp['n_train_sites']} val_sites={fp['n_val_sites']} test_sites={fp['n_test_sites']} "
+        f"train_hash={fp['train_sites_hash']} val_hash={fp['val_sites_hash']} test_hash={fp['test_sites_hash']} "
+        f"train_sample={fp['train_sites_sample']} val_sample={fp['val_sites_sample']} test_sample={fp['test_sites_sample']}"
+    )
+
+
+def censor_type_counts(samples: list[dict]) -> dict[str, int]:
+    counts = {"left": 0, "interval": 0, "right": 0}
+    for s in samples:
+        c = str(s.get("censor_type", ""))
+        if c in counts:
+            counts[c] += 1
+    return counts
+
+
+def _counts_to_probs(counts: dict[str, int]) -> dict[str, float]:
+    total = sum(counts.values())
+    if total == 0:
+        return {k: 0.0 for k in counts}
+    return {k: counts[k] / total for k in counts}
+
+
+def split_seed_search_topk(
+    samples: list[dict],
+    val_frac: float,
+    test_frac: float,
+    seed_candidates: list[int],
+    target_test_interval: int | None = None,
+    tol_test_interval: int | None = None,
+    topk: int = 1,
+) -> dict:
+    overall_counts = censor_type_counts(samples)
+    overall_probs = _counts_to_probs(overall_counts)
+
+    scored = []
+    for seed in seed_candidates:
+        train_s, val_s, test_s = split_by_site(samples, val_frac=val_frac, test_frac=test_frac, seed=seed)
+
+        train_counts = censor_type_counts(train_s)
+        val_counts = censor_type_counts(val_s)
+        test_counts = censor_type_counts(test_s)
+
+        train_probs = _counts_to_probs(train_counts)
+        val_probs = _counts_to_probs(val_counts)
+        test_probs = _counts_to_probs(test_counts)
+
+        score = 0.0
+        for t in ("left", "interval", "right"):
+            score += (train_probs[t] - overall_probs[t]) ** 2
+            score += (val_probs[t] - overall_probs[t]) ** 2
+            score += (test_probs[t] - overall_probs[t]) ** 2
+
+        meets_constraint = True
+        if target_test_interval is not None and tol_test_interval is not None:
+            test_int = test_counts.get("interval", 0)
+            if abs(test_int - target_test_interval) > tol_test_interval:
+                meets_constraint = False
+
+        scored.append(
+            {
+                "seed": seed,
+                "score": float(score),
+                "counts": {
+                    "overall": overall_counts,
+                    "train": train_counts,
+                    "val": val_counts,
+                    "test": test_counts,
+                },
+                "meets_constraint": meets_constraint,
+            }
+        )
+
+    filtered = [s for s in scored if s["meets_constraint"]]
+    used_fallback = False
+    if not filtered:
+        filtered = scored
+        used_fallback = True
+
+    filtered.sort(key=lambda x: x["score"])
+    topk_list = filtered[: max(1, int(topk))]
+
+    return {"topk": topk_list, "used_fallback": used_fallback}
+
+
+def split_seed_search(
+    samples: list[dict],
+    val_frac: float,
+    test_frac: float,
+    seed_candidates: list[int],
+    target_test_interval: int | None = None,
+    tol_test_interval: int | None = None,
+) -> dict:
+    result = split_seed_search_topk(
+        samples=samples,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        seed_candidates=seed_candidates,
+        target_test_interval=target_test_interval,
+        tol_test_interval=tol_test_interval,
+        topk=1,
+    )
+    return {"topk": result["topk"], "used_fallback": result["used_fallback"]}
+
+
+def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Train samples only -> mean/std for each feature dim
+    """
+    X_all = np.concatenate([s["X"][None, :, :] for s in samples], axis=0)  # (N,T,D)
+    mean = X_all.reshape(-1, X_all.shape[-1]).mean(axis=0)
+    std = X_all.reshape(-1, X_all.shape[-1]).std(axis=0)
+    std = np.where(std < 1e-8, 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+class IntervalEventDataset(Dataset):
+    def __init__(self, samples: list[dict], mean: np.ndarray, std: np.ndarray):
+        self.samples = samples
+        self.mean = mean
+        self.std = std
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        X = (s["X"] - self.mean) / self.std
+        X = torch.from_numpy(X).float()  # (T,D)
+        L = torch.tensor(int(s["L"]), dtype=torch.long)
+        R = torch.tensor(int(s["R"]), dtype=torch.long)
+        c = torch.tensor(CTYPE2ID[str(s["censor_type"])], dtype=torch.long)
+        return X, L, R, c

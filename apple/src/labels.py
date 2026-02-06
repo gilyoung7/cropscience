@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from configs import config as C
+from apple.configs import config as C
 
 
 def build_interval_labels_from_doy(

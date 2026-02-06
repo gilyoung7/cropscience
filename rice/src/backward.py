@@ -4,11 +4,11 @@ import random
 import numpy as np
 import torch
 
-from configs import config as C
-from src.sfs import make_loaders_for_features
-from src.dataset import build_samples_season, split_by_site, log_split_fingerprint
-from src.model import HazardTransformer
-from src.train_eval import run_epoch_weighted, eval_nll_model
+from rice.configs import config as C
+from rice.src.sfs import make_loaders_for_features
+from rice.src.dataset import build_samples_season, split_by_site, log_split_fingerprint
+from rice.src.model import HazardTransformer
+from rice.src.train_eval import run_epoch_weighted, eval_nll_model
 
 
 def train_trial_val_nll(

@@ -5,16 +5,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from configs import config as C
-from src.dataset import (
+from apple.configs import config as C
+from apple.src.dataset import (
     build_samples_season,
     split_by_site,
     compute_norm_stats,
     IntervalEventDataset,
     log_split_fingerprint,
 )
-from src.model import HazardTransformer
-from src.train_eval import run_epoch_weighted, eval_nll_model
+from apple.src.model import HazardTransformer
+from apple.src.train_eval import run_epoch_weighted, eval_nll_model
 
 
 def make_loaders_for_features(

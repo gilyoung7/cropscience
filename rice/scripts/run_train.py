@@ -10,9 +10,9 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from configs import config as C
-from src.featuresets import get_feature_cols
-from src.data_pipeline import (
+from rice.configs import config as C
+from rice.src.featuresets import get_feature_cols
+from rice.src.data_pipeline import (
     load_daily,
     load_gdd_since_db,
     merge_gdd_since_db,
@@ -24,8 +24,8 @@ from src.data_pipeline import (
     merge_pheno_daily_ffill,
     make_daily_feature_frame,
 )
-from src.labels import build_interval_labels_from_doy, filter_labels_by_gap
-from src.dataset import (
+from rice.src.labels import build_interval_labels_from_doy, filter_labels_by_gap
+from rice.src.dataset import (
     build_train_frame,
     slice_season,
     build_samples_season,
@@ -36,8 +36,8 @@ from src.dataset import (
     split_fingerprint,
     split_seed_search_topk,
 )
-from src.model import HazardTransformer
-from src.train_eval import run_epoch_weighted, eval_nll_model
+from rice.src.model import HazardTransformer
+from rice.src.train_eval import run_epoch_weighted, eval_nll_model
 
 
 def make_loader(ds, batch_size, shuffle, seed=None):

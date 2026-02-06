@@ -5,7 +5,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from configs import config as C
+from rice.configs import config as C
 
 
 # =========================

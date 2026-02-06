@@ -6,9 +6,9 @@ import re
 import torch
 import pandas as pd
 
-from configs import config as C
-from src.featuresets import get_feature_cols
-from src.data_pipeline import (
+from apple.configs import config as C
+from apple.src.featuresets import get_feature_cols
+from apple.src.data_pipeline import (
     load_daily,
     load_gdd_since_db,
     merge_gdd_since_db,
@@ -20,9 +20,9 @@ from src.data_pipeline import (
     merge_pheno_daily_ffill,
     make_daily_feature_frame,
 )
-from src.labels import build_interval_labels_from_doy, filter_labels_by_gap
-from src.dataset import build_train_frame, slice_season
-from src.sfs import sfs_topk
+from apple.src.labels import build_interval_labels_from_doy, filter_labels_by_gap
+from apple.src.dataset import build_train_frame, slice_season
+from apple.src.sfs import sfs_topk
 
 
 def rebuild_train_df_season():

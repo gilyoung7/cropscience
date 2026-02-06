@@ -44,3 +44,15 @@ train_run*.log
 
 # venv
 .venv/
+# outputs
+apple/outputs/
+
+# outputs
+rice/outputs/
+
+# legacy root outputs
+outputs/
+
+# python cache
+__pycache__/
+*.pyc

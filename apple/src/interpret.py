@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from src.train_eval import eval_nll_model, interval_nll_per_sample, weighted_loss_from_ctype
+from apple.src.train_eval import eval_nll_model, interval_nll_per_sample, weighted_loss_from_ctype
 
 
 @torch.no_grad()

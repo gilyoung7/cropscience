@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from configs import config as C
+from apple.configs import config as C
 
 CTYPE_INTERVAL = 0  # interval=0, right=1, left=2
 
