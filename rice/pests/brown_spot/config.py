@@ -1,0 +1,46 @@
+from pathlib import Path
+from rice.configs.base import PATH_DAILY, YEAR_MAX
+
+PATH_OBS = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_깨씨무늬병.csv")
+PEST_SLUG = "brown_spot"
+GDD_DIR = None
+
+COUNT_COL = "obs_value"
+THRESHOLD = 0.0
+PEST_COL = "pest"
+TARGET_PEST = "깨씨무늬병"
+LABEL_COL = "label_event"
+APPLY_PEST_FILTER = False
+
+SEASON_START_DOY = 1
+SEASON_END_DOY = 365
+DOY_START = 60
+DOY_END = 300
+MAX_GAP = 30
+
+SEEDS = [0, 1, 2]
+SPLIT_SEED = 42
+PATIENCE = 6
+MAX_EPOCHS = 60
+MIN_DELTA = 1e-3
+
+LR = 1e-4
+WEIGHT_DECAY = 1e-4
+GRAD_CLIP_NORM = 1.0
+
+W_INTERVAL = 1.0
+W_RIGHT = 0.5
+W_LEFT = 0.5
+
+BATCH_TRAIN = 64
+BATCH_EVAL = 128
+NUM_WORKERS = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 2
+
+D_MODEL = 64
+N_HEAD = 4
+N_LAYERS = 3
+DROPOUT = 0.2
+MAX_LEN = 400

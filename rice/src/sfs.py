@@ -31,7 +31,7 @@ def make_loaders_for_features(
     trial_cols -> samples -> (train,val) split -> norm -> datasets -> loaders
     (test는 SFS에는 사용 안 함)
     """
-    samples_trial, dropped = build_samples_season(train_df_season, trial_cols, doy_start, doy_end)
+    samples_trial, dropped, _ = build_samples_season(train_df_season, trial_cols, doy_start, doy_end)
     if dropped > 0:
         # SFS에서는 빠르게 돌리므로 경고만
         pass

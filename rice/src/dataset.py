@@ -66,9 +66,9 @@ def build_samples_season(
     feature_cols: list[str],
     doy_start: int,
     doy_end: int,
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, list[str]]:
     """
-    Returns (samples, dropped_groups)
+    Returns (samples, dropped_groups, feature_names)
     samples item: {"site_id","year","X","L","R","censor_type"}
       - X: (T,D) float32
       - L,R: season coordinates in 1..T
@@ -76,6 +76,8 @@ def build_samples_season(
     T = doy_end - doy_start + 1
     samples: list[dict] = []
     dropped = 0
+    printed_nan = False
+    feature_names: list[str] = []
 
     for (site, year), sub in df_season.groupby(["site_id", "year"], sort=False):
         sub = sub.sort_values("doy")
@@ -85,7 +87,19 @@ def build_samples_season(
             dropped += 1
             continue
 
-        X = sub[feature_cols].to_numpy(dtype=np.float32)
+        # impute + missing indicator
+        X_df = sub[feature_cols].copy()
+        for c in feature_cols:
+            if c in X_df.columns:
+                X_df[c] = pd.to_numeric(X_df[c], errors="coerce")
+                miss = X_df[c].isna().astype(np.float32)
+                X_df[c] = X_df[c].fillna(0.0)
+                X_df[f"{c}__miss"] = miss
+
+        if not feature_names:
+            feature_names = list(X_df.columns)
+
+        X = X_df.to_numpy(dtype=np.float32)
 
         L = int(sub["L_doy"].iloc[0]) - doy_start + 1
         R = int(sub["R_doy"].iloc[0]) - doy_start + 1
@@ -95,9 +109,18 @@ def build_samples_season(
         L = min(max(L, 1), T)
         R = min(max(R, 1), T)
 
+        # debug: detect non-finite
+        if not printed_nan and not np.isfinite(X).all():
+            bad = []
+            for i, col in enumerate(X_df.columns):
+                if not np.isfinite(X[:, i]).all():
+                    bad.append(col)
+            print(f"[nan_check] non-finite in site={site} year={year} cols={bad}")
+            printed_nan = True
+
         samples.append({"site_id": site, "year": int(year), "X": X, "L": L, "R": R, "censor_type": ctype})
 
-    return samples, dropped
+    return samples, dropped, feature_names
 
 
 def split_by_site(samples: list[dict], val_frac=0.1, test_frac=0.1, seed=42):
@@ -264,7 +287,13 @@ def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     X_all = np.concatenate([s["X"][None, :, :] for s in samples], axis=0)  # (N,T,D)
     mean = X_all.reshape(-1, X_all.shape[-1]).mean(axis=0)
     std = X_all.reshape(-1, X_all.shape[-1]).std(axis=0)
-    std = np.where(std < 1e-8, 1.0, std)
+    std = np.where(std < 1e-6, 1.0, std)
+    # keep missing indicators as 0/1 (no normalization)
+    # missing indicators are appended after each base feature -> odd indices.
+    miss_idx = np.arange(1, mean.shape[0], 2)
+    if miss_idx.size > 0:
+        mean[miss_idx] = 0.0
+        std[miss_idx] = 1.0
     return mean.astype(np.float32), std.astype(np.float32)
 
 

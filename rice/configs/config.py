@@ -1,42 +1,48 @@
 from pathlib import Path
+import importlib
+from rice.configs.base import (
+    PATH_DAILY,
+    YEAR_MAX,
+    DAILY_CACHE_DIR,
+    PREPROC_VERSION,
+    IMPUTE_POLICY,
+    MISS_INDICATOR_POLICY,
+)
+# -----------------------------
+# Minimal common runtime skeleton
+# Values below are expected to be overridden by --pest config.
+# -----------------------------
+PATH_OBS = None
+GDD_DIR = None
 
-PATH_DAILY = Path("/home/gpu4080/ygdata/apple/joined_SAMPLE_GDD_2013_2024_APPLE_복숭아순나방.csv")
-PATH_OBS   = Path("/home/gpu4080/ygdata/apple/peach_moth_obs_with_fuzzy_features_LONG2.csv")
-GDD_DIR    = Path("/home/gpu4080/ygdata/apple/GDD_since_db")
+COUNT_COL = "obs_value"
+THRESHOLD = 0.0
+LABEL_COL = "label_event"
+PEST_COL = "pest"
+TARGET_PEST = None
+APPLY_PEST_FILTER = False
 
-COUNT_COL = "(트랩)복숭아순나방-마리수"
-
-THRESHOLD = 1
-SEASON_START_DOY = 1
-SEASON_END_DOY   = 365
-
-DOY_START = 60
-DOY_END   = 300
-MAX_GAP   = 30
-
-SEEDS = [0, 1, 2]
+# Needed at import-time in several modules/CLI defaults.
 SPLIT_SEED = 42
-PATIENCE = 6
-MAX_EPOCHS = 60
-MIN_DELTA = 1e-3
+LEFT_WINDOW_DAYS = 15
 
-LR = 1e-4
-WEIGHT_DECAY = 1e-4
-GRAD_CLIP_NORM = 1.0
-
-W_INTERVAL = 1.0
-W_RIGHT    = 0.5
-W_LEFT     = 0.5
-
+# DataLoader defaults (can be overridden by pest config via apply_pest_config).
 BATCH_TRAIN = 64
-BATCH_EVAL  = 128
+BATCH_EVAL = 128
 NUM_WORKERS = 4
-PIN_MEMORY  = True
+PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 PREFETCH_FACTOR = 2
 
-D_MODEL  = 64
-N_HEAD   = 4
-N_LAYERS = 3
-DROPOUT  = 0.2
-MAX_LEN  = 400
+PEST_SLUG = None
+
+
+def apply_pest_config(pest_slug: str):
+    mod = importlib.import_module(f"rice.pests.{pest_slug}.config")
+    for k in dir(mod):
+        if k.isupper():
+            globals()[k] = getattr(mod, k)
+    globals()["PEST_SLUG"] = pest_slug
+    # cache dir is globally fixed and must not be pest-specific
+    from rice.configs.base import DAILY_CACHE_DIR as _FIXED_CACHE_DIR
+    globals()["DAILY_CACHE_DIR"] = _FIXED_CACHE_DIR

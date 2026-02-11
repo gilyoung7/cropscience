@@ -36,16 +36,19 @@ def interval_nll_per_sample(hazard, L, R, ctype, Tend):
     mr = (ctype == 1)   # right
     ml = (ctype == 2)   # left
 
+    eps = 1e-12
+
     # interval: -log(S_L - S_R)
     if mi.any():
         a = logS_L[mi]
         b = logS_R[mi]
         a = torch.maximum(a, b + 1e-8)
-        nll[mi] = -(a + torch.log1p(-torch.exp(b - a)))
+        log_interval = a + torch.log1p(-torch.exp(b - a))
+        nll[mi] = -torch.clamp(log_interval, min=np.log(eps))
 
     # right: -log(S_T)
     if mr.any():
-        nll[mr] = -logS[:, -1][mr]
+        nll[mr] = torch.clamp(-logS[:, -1][mr], max=1e6)
 
     # left: -log(1 - S_R)
     if ml.any():
@@ -55,7 +58,9 @@ def interval_nll_per_sample(hazard, L, R, ctype, Tend):
         m = a < cutoff
         out[m] = torch.log1p(-torch.exp(a[m]))
         out[~m] = torch.log(-torch.expm1(a[~m]))
-        nll[ml] = -out
+        nll[ml] = torch.clamp(-out, max=1e6)
+
+    nll = torch.nan_to_num(nll, nan=1e6, posinf=1e6, neginf=0.0)
 
     return nll
 
@@ -76,6 +81,8 @@ def run_epoch_weighted(
     device,
     train=True,
     lambda_mass: float = 0.0,
+    lambda_right_late: float = 0.0,
+    right_late_tau: float | None = None,
     log_mass: bool = False,
     epoch_idx: int | None = None,
     return_parts: bool = False,
@@ -84,7 +91,9 @@ def run_epoch_weighted(
     total, n = 0.0, 0
     base_total = 0.0
     mass_total = 0.0
+    late_total = 0.0
     logged = False
+    bad_batches = 0
     for X, L, R, ctype in loader:
         X = X.to(device, non_blocking=True)
         L = L.to(device, non_blocking=True)
@@ -92,10 +101,14 @@ def run_epoch_weighted(
         ctype = ctype.to(device, non_blocking=True)
 
         hazard = model(X)
+        if not torch.isfinite(hazard).all():
+            bad_batches += 1
+            continue
         nll_vec = interval_nll_per_sample(hazard, L, R, ctype, Tend=Tend)
         base_loss = weighted_loss_from_ctype(nll_vec, ctype)
         loss = base_loss
         mass_loss_tensor = None
+        late_loss_tensor = None
 
         if train and log_mass and not logged:
             mi = (ctype == CTYPE_INTERVAL)
@@ -154,9 +167,32 @@ def run_epoch_weighted(
                 mass_loss_tensor = -mass[mi].mean()
                 loss = loss + lambda_mass * mass_loss_tensor
 
+        if lambda_right_late > 0 and right_late_tau is not None:
+            mr = (ctype == 1)
+            if mr.any():
+                pmf, _, logS = hazard_to_pmf_cdf_logS(hazard)
+                t = torch.arange(1, Tend + 1, device=hazard.device, dtype=pmf.dtype).view(1, -1)
+                exp_doy = (pmf * t).sum(dim=1) + torch.exp(logS[:, -1]) * float(Tend)
+                late_margin = torch.relu(exp_doy[mr] - float(right_late_tau))
+                late_loss_tensor = late_margin.mean()
+                loss = loss + lambda_right_late * late_loss_tensor
+
+        if not torch.isfinite(loss):
+            bad_batches += 1
+            continue
+
         if train:
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            grad_finite = True
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grad_finite = False
+                    break
+            if not grad_finite:
+                bad_batches += 1
+                opt.zero_grad(set_to_none=True)
+                continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), C.GRAD_CLIP_NORM)
             opt.step()
 
@@ -164,13 +200,22 @@ def run_epoch_weighted(
         base_total += float(base_loss.item()) * X.size(0)
         if mass_loss_tensor is not None:
             mass_total += float(mass_loss_tensor.item()) * X.size(0)
+        if late_loss_tensor is not None:
+            late_total += float(late_loss_tensor.item()) * X.size(0)
         n += X.size(0)
 
-    total_avg = total / max(n, 1)
+    if bad_batches > 0 and train:
+        print(f"[warn] skipped non-finite batches: {bad_batches}")
+
+    if n == 0:
+        total_avg = float("nan")
+    else:
+        total_avg = total / n
     if return_parts:
         base_avg = base_total / max(n, 1)
         mass_avg = mass_total / max(n, 1)
-        return total_avg, base_avg, mass_avg
+        late_avg = late_total / max(n, 1)
+        return total_avg, base_avg, mass_avg, late_avg
     return total_avg
 
 

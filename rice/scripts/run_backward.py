@@ -6,12 +6,9 @@ import pandas as pd
 import torch
 
 from rice.configs import config as C
-from rice.src.featuresets import get_feature_cols
+from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
 from rice.src.data_pipeline import (
-    load_daily,
-    load_gdd_since_db,
-    merge_gdd_since_db,
-    add_rolling_features,
+    load_daily_preprocessed,
     load_obs,
     aggregate_obs_daily_max,
     make_obs_meta,
@@ -25,10 +22,7 @@ from rice.src.backward import backward_elimination
 
 
 def rebuild_train_df_season():
-    daily = load_daily(C.PATH_DAILY)
-    gdd_db, _ = load_gdd_since_db(C.GDD_DIR)
-    daily = merge_gdd_since_db(daily, gdd_db)
-    daily = add_rolling_features(daily)
+    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
 
     obs = load_obs(C.PATH_OBS)
     obs2 = aggregate_obs_daily_max(obs)
@@ -53,8 +47,9 @@ def rebuild_train_df_season():
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run", type=int, default=5)
-    p.add_argument("--out_root", type=str, default="outputs")
+    p.add_argument("--pest", type=str, required=True)
+    p.add_argument("--run", type=int, default=0)
+    p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
 
@@ -70,6 +65,10 @@ def main():
     p.add_argument("--protect", nargs="*", default=[])
 
     args = p.parse_args()
+    _, get_feature_cols = resolve_pest(args.pest)
+    if not args.out_root:
+        args.out_root = default_out_root(args.pest)
+    ensure_output_dirs(args.out_root)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)

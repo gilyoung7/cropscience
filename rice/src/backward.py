@@ -120,7 +120,7 @@ def backward_elimination(
         max_epochs_fs=max_epochs_fs, patience_fs=patience_fs, min_delta_fs=min_delta_fs
     )
 
-    samples_full, _ = build_samples_season(train_df_season, cols, doy_start, doy_end)
+    samples_full, _, _ = build_samples_season(train_df_season, cols, doy_start, doy_end)
     train_s, val_s, test_s = split_by_site(samples_full, val_frac=0.1, test_frac=0.1, seed=split_seed)
     log_split_fingerprint("backward", train_s, val_s, test_s)
 

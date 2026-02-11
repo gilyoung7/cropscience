@@ -7,12 +7,9 @@ import torch
 import pandas as pd
 
 from rice.configs import config as C
-from rice.src.featuresets import get_feature_cols
+from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
 from rice.src.data_pipeline import (
-    load_daily,
-    load_gdd_since_db,
-    merge_gdd_since_db,
-    add_rolling_features,
+    load_daily_preprocessed,
     load_obs,
     aggregate_obs_daily_max,
     make_obs_meta,
@@ -27,10 +24,7 @@ from rice.src.sfs import sfs_topk
 
 def rebuild_train_df_season():
     # DAILY
-    daily = load_daily(C.PATH_DAILY)
-    gdd_db, _ = load_gdd_since_db(C.GDD_DIR)
-    daily = merge_gdd_since_db(daily, gdd_db)
-    daily = add_rolling_features(daily)
+    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
 
     # OBS
     obs = load_obs(C.PATH_OBS)
@@ -106,6 +100,7 @@ def check_topk_run_match(run: int, topk_path: Path, used_default_path: bool):
 
 
 def main(
+    pest: str,
     topk_path: str | None,
     seed: int,
     max_k: int,
@@ -119,6 +114,11 @@ def main(
     steps_csv: str | None,
     split_seed: int,
 ):
+    _, get_feature_cols = resolve_pest(pest)
+    if not out_root:
+        out_root = default_out_root(pest)
+    ensure_output_dirs(out_root)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
@@ -169,7 +169,8 @@ def main(
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--topk_path", type=str, default=None)
-    p.add_argument("--run", type=int, default=5)
+    p.add_argument("--pest", type=str, required=True)
+    p.add_argument("--run", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
     p.add_argument("--max_k", type=int, default=12)
@@ -178,7 +179,7 @@ if __name__ == "__main__":
     p.add_argument("--elbow_ratio", type=float, default=0.3)
     p.add_argument("--bad_patience", type=int, default=1)
     p.add_argument("--out_txt", type=str, default=None)
-    p.add_argument("--out_root", type=str, default="outputs")
+    p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--steps_csv", type=str, default=None)
     args = p.parse_args()
     if args.topk_path is not None and args.run == 5:
@@ -192,6 +193,7 @@ if __name__ == "__main__":
         elif inferred_run is None:
             print("WARNING: --run defaulted to 5 and topk_path has no run pattern; outputs will use run=5.")
     main(
+        args.pest,
         args.topk_path,
         args.seed,
         args.max_k,

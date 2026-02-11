@@ -5,15 +5,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
 from rice.configs import config as C
-from rice.src.featuresets import get_feature_cols
+from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
+from rice.scripts.common import make_loader
 from rice.src.data_pipeline import (
-    load_daily,
-    load_gdd_since_db,
-    merge_gdd_since_db,
-    add_rolling_features,
+    load_daily_preprocessed,
     load_obs,
     aggregate_obs_daily_max,
     make_obs_meta,
@@ -31,29 +28,14 @@ from rice.src.dataset import (
     IntervalEventDataset,
     log_split_fingerprint,
 )
+from rice.src.ckpt_schema import validate_ckpt_meta
 from rice.src.model import HazardTransformer
 from rice.src.interpret import permutation_importance_features, summarize_importance
 
 
-def make_loader(ds, batch_size, shuffle):
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=False,
-        num_workers=C.NUM_WORKERS,
-        pin_memory=C.PIN_MEMORY,
-        persistent_workers=C.PERSISTENT_WORKERS,
-        prefetch_factor=C.PREFETCH_FACTOR,
-    )
-
-
-def rebuild_val_dataset(run: int):
+def rebuild_val_dataset(run: int, get_feature_cols):
     # DAILY
-    daily = load_daily(C.PATH_DAILY)
-    gdd_db, _ = load_gdd_since_db(C.GDD_DIR)
-    daily = merge_gdd_since_db(daily, gdd_db)
-    daily = add_rolling_features(daily)
+    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
 
     # OBS
     obs = load_obs(C.PATH_OBS)
@@ -78,7 +60,7 @@ def rebuild_val_dataset(run: int):
     feature_cols = get_feature_cols(run)
 
     df_season = slice_season(train_df, C.DOY_START, C.DOY_END)
-    samples, dropped = build_samples_season(df_season, feature_cols, C.DOY_START, C.DOY_END)
+    samples, dropped, feature_names = build_samples_season(df_season, feature_cols, C.DOY_START, C.DOY_END)
     if dropped > 0:
         print("WARNING: dropped groups (len!=T):", dropped)
 
@@ -88,7 +70,7 @@ def rebuild_val_dataset(run: int):
     x_mean, x_std = compute_norm_stats(train_s)
 
     val_ds = IntervalEventDataset(val_s, x_mean, x_std)
-    return feature_cols, T, val_ds
+    return feature_cols, feature_names, T, val_ds
 
 
 def resolve_ckpt_path(run: int, out_root: str, ckpt_path: str | None) -> Path:
@@ -121,6 +103,7 @@ def check_run_match(ckpt_run: int, cli_run: int, allow_run_mismatch: bool, ckpt_
 
 
 def main(
+    pest: str,
     ckpt_path: str | None,
     run: int,
     n_repeats: int,
@@ -130,6 +113,11 @@ def main(
     seed_only: int | None,
     allow_run_mismatch: bool,
 ):
+    _, get_feature_cols = resolve_pest(pest)
+    if not out_root:
+        out_root = default_out_root(pest)
+    ensure_output_dirs(out_root)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
@@ -140,12 +128,21 @@ def main(
     states = ckpt["trained_states"]
     print("loaded ckpt:", ckpt_path_resolved, "| seeds:", [d["seed"] for d in states])
 
-    feature_cols, T, val_ds = rebuild_val_dataset(run)
+    feature_cols, feature_names, T, val_ds = rebuild_val_dataset(run, get_feature_cols)
+    print(f"[features] n={len(feature_names)} head={feature_names[:5]} tail={feature_names[-5:]}")
     val_loader = make_loader(val_ds, C.BATCH_EVAL, shuffle=False)
 
-    # sanity
     X0, *_ = next(iter(val_loader))
-    assert int(X0.shape[-1]) == len(feature_cols), f"D mismatch: loader {X0.shape[-1]} vs feature_cols {len(feature_cols)}"
+    D_in = int(X0.shape[-1])
+    print(f"[D_in] computed_from_dataset={D_in}")
+    validate_ckpt_meta(
+        ckpt,
+        pest=pest,
+        run=run,
+        d_in=D_in,
+        feature_names=feature_names,
+        allow_run_mismatch=allow_run_mismatch,
+    )
 
     all_imps = []
     records = []
@@ -156,7 +153,7 @@ def main(
             continue
 
         model = HazardTransformer(
-            d_in=len(feature_cols),
+            d_in=D_in,
             d_model=C.D_MODEL,
             nhead=C.N_HEAD,
             num_layers=C.N_LAYERS,
@@ -171,7 +168,7 @@ def main(
             val_loader,
             Tend=T,
             device=device,
-            feature_names=feature_cols,
+            feature_names=feature_names,
             n_repeats=n_repeats,
             seed=seed,
         )
@@ -193,7 +190,7 @@ def main(
     df_long.to_csv(out_long, index=False)
     print("saved:", out_long)
 
-    ranked_mean, top_names = summarize_importance(all_imps, feature_cols, topk=topk)
+    ranked_mean, top_names = summarize_importance(all_imps, feature_names, topk=topk)
     df_mean = pd.DataFrame([{"feature": n, "mean_delta_nll": float(v)} for n, v in ranked_mean])
     out_mean = out_prefix_path.with_name(out_prefix_path.name + "_mean.csv")
     df_mean.to_csv(out_mean, index=False)
@@ -209,16 +206,18 @@ def main(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
+    p.add_argument("--pest", type=str, required=True)
     p.add_argument("--ckpt", type=str, default=None)
-    p.add_argument("--run", type=int, default=5)
+    p.add_argument("--run", type=int, default=0)
     p.add_argument("--n_repeats", type=int, default=3)
     p.add_argument("--topk", type=int, default=20)
     p.add_argument("--out_prefix", type=str, default=None)
-    p.add_argument("--out_root", type=str, default="outputs")
+    p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--seed_only", type=int, default=None)
     p.add_argument("--allow_run_mismatch", action="store_true")
     args = p.parse_args()
     main(
+        args.pest,
         args.ckpt,
         args.run,
         args.n_repeats,
