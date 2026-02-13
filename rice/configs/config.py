@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib
 from rice.configs.base import (
     PATH_DAILY,
+    YEAR_MIN,
     YEAR_MAX,
     DAILY_CACHE_DIR,
     PREPROC_VERSION,
@@ -33,6 +34,7 @@ NUM_WORKERS = 4
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 PREFETCH_FACTOR = 2
+PI_METHOD = "shortest"
 
 PEST_SLUG = None
 

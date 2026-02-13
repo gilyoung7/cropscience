@@ -1,8 +1,8 @@
 from pathlib import Path
 from rice.configs.base import PATH_DAILY, YEAR_MAX
 
-PATH_OBS = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_벼멸구.csv")
-PEST_SLUG = "sbw"
+PATH_OBS = Path("/home/gpu4080/ygdata/rice/RICE_LONG_mod_벼멸구_2020_2024_merged_with_tgtmin_arrivedmask.csv")
+PEST_SLUG = "sbw2"
 GDD_DIR = None
 
 COUNT_COL = "obs_value"
@@ -11,7 +11,6 @@ PEST_COL = "pest"
 TARGET_PEST = "벼멸구"
 LABEL_COL = "label_event"
 APPLY_PEST_FILTER = False
-YEAR_MIN = 2020
 
 SEASON_START_DOY = 1
 SEASON_END_DOY = 365

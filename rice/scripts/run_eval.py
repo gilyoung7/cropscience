@@ -232,8 +232,22 @@ def main(
         val_nll  = float(eval_nll_model(model, val_loader, Tend=T, device=device))
         test_nll = float(eval_nll_model(model, test_loader, Tend=T, device=device))
 
-        val_stats  = eval_metrics_with_overlap(model, val_loader, Tend=T, device=device, alpha=0.2)
-        test_stats = eval_metrics_with_overlap(model, test_loader, Tend=T, device=device, alpha=0.2)
+        val_stats = eval_metrics_with_overlap(
+            model,
+            val_loader,
+            Tend=T,
+            device=device,
+            alpha=0.2,
+            pi_method=getattr(C, "PI_METHOD", "shortest"),
+        )
+        test_stats = eval_metrics_with_overlap(
+            model,
+            test_loader,
+            Tend=T,
+            device=device,
+            alpha=0.2,
+            pi_method=getattr(C, "PI_METHOD", "shortest"),
+        )
 
         rec = {
             "seed": seed,

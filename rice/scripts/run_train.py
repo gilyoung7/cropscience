@@ -166,6 +166,8 @@ def main(
     lambda_mass: float,
     lambda_right_late: float,
     right_late_tau: float | None,
+    lambda_event_cls: float,
+    event_pos_weight: float,
     train_balance_ratio: str | None,
 ):
     _, get_feature_cols = resolve_pest(pest)
@@ -179,7 +181,10 @@ def main(
         f"NUM_WORKERS={C.NUM_WORKERS}, PIN_MEMORY={C.PIN_MEMORY}, "
         f"PERSISTENT_WORKERS={C.PERSISTENT_WORKERS}, PREFETCH_FACTOR={C.PREFETCH_FACTOR}"
     )
-    print(f"Effective Best-Epoch Metric: VAL_IoU80(interval-only), train_balance_ratio={train_balance_ratio}")
+    print(
+        f"Effective Best-Epoch Metric: VAL_IoU80(interval-only), "
+        f"train_balance_ratio={train_balance_ratio}, PI_METHOD={getattr(C, 'PI_METHOD', 'shortest')}"
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -324,7 +329,8 @@ def main(
     print(
         f"[hparams] dropout={C.DROPOUT} weight_decay={C.WEIGHT_DECAY} lr={C.LR} "
         f"w_interval={C.W_INTERVAL} w_left={C.W_LEFT} w_right={C.W_RIGHT} "
-        f"lambda_mass={lambda_mass} lambda_right_late={lambda_right_late} right_late_tau={right_late_tau}"
+        f"lambda_mass={lambda_mass} lambda_right_late={lambda_right_late} right_late_tau={right_late_tau} "
+        f"lambda_event_cls={lambda_event_cls} event_pos_weight={event_pos_weight}"
     )
 
     hparams = {
@@ -342,6 +348,8 @@ def main(
         "lambda_mass": lambda_mass,
         "lambda_right_late": lambda_right_late,
         "right_late_tau": right_late_tau,
+        "lambda_event_cls": lambda_event_cls,
+        "event_pos_weight": event_pos_weight,
     }
     hparams_path = Path(out_root) / "hparams.json"
     hparams_path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,7 +438,7 @@ def main(
         pat = 0
 
         for epoch in range(1, C.MAX_EPOCHS + 1):
-            tr, tr_base, tr_mass, tr_late = run_epoch_weighted(
+            tr, tr_base, tr_mass, tr_late, tr_cls = run_epoch_weighted(
                 model,
                 opt,
                 train_loader,
@@ -440,12 +448,21 @@ def main(
                 lambda_mass=lambda_mass,
                 lambda_right_late=lambda_right_late,
                 right_late_tau=right_late_tau,
+                lambda_event_cls=lambda_event_cls,
+                event_pos_weight=event_pos_weight,
                 log_mass=True,
                 epoch_idx=epoch,
                 return_parts=True,
             )
             va = eval_nll_model(model, val_loader, Tend=T, device=device)
-            va_stats = eval_metrics_with_overlap(model, val_loader, Tend=T, device=device, alpha=0.2)
+            va_stats = eval_metrics_with_overlap(
+                model,
+                val_loader,
+                Tend=T,
+                device=device,
+                alpha=0.2,
+                pi_method=getattr(C, "PI_METHOD", "shortest"),
+            )
             va_iou = float(va_stats["IoU_mean_interval_only(80%)"])
             if np.isnan(va_iou):
                 va_iou = float("-inf")
@@ -454,7 +471,8 @@ def main(
                 va = float("inf")
             print(
                 f"[seed {SEED}] epoch {epoch:02d} | train_total {tr:.4f} | train_base {tr_base:.4f} "
-                f"| train_mass {tr_mass:.4f} | train_late {tr_late:.4f} | val_nll {va:.4f} | val_iou80 {va_iou:.4f}"
+                f"| train_mass {tr_mass:.4f} | train_late {tr_late:.4f} | train_cls {tr_cls:.4f} "
+                f"| val_nll {va:.4f} | val_iou80 {va_iou:.4f}"
             )
 
             improved_iou = va_iou > (best_val_iou + C.MIN_DELTA)
@@ -536,6 +554,8 @@ if __name__ == "__main__":
     p.add_argument("--lambda_mass", type=float, default=0.0)
     p.add_argument("--lambda_right_late", type=float, default=0.0)
     p.add_argument("--right_late_tau", type=float, default=220.0)
+    p.add_argument("--lambda_event_cls", type=float, default=0.0)
+    p.add_argument("--event_pos_weight", type=float, default=1.0)
     p.add_argument("--train_balance_ratio", type=str, default="1:1:1")
     args = p.parse_args()
     main(
@@ -561,5 +581,7 @@ if __name__ == "__main__":
         args.lambda_mass,
         args.lambda_right_late,
         args.right_late_tau,
+        args.lambda_event_cls,
+        args.event_pos_weight,
         args.train_balance_ratio,
     )

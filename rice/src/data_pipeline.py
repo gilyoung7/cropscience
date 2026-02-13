@@ -51,6 +51,8 @@ def load_daily(path: Path) -> pd.DataFrame:
 
     daily["year"] = daily["date"].dt.year.astype(int)
     daily["doy"] = daily["date"].dt.dayofyear.astype(int)
+    if getattr(C, "YEAR_MIN", None) is not None:
+        daily = daily[daily["year"] >= int(C.YEAR_MIN)].copy()
     if getattr(C, "YEAR_MAX", None) is not None:
         daily = daily[daily["year"] <= int(C.YEAR_MAX)].copy()
     daily = daily.sort_values(["site_id", "date"]).reset_index(drop=True)
@@ -189,6 +191,7 @@ def _daily_cache_key(path_daily: Path, gdd_dir: Path | None) -> str:
         "impute_policy": getattr(C, "IMPUTE_POLICY", "unknown"),
         "miss_indicator_policy": getattr(C, "MISS_INDICATOR_POLICY", "unknown"),
         "year_max": getattr(C, "YEAR_MAX", None),
+        "year_min": getattr(C, "YEAR_MIN", None),
     }
     roll_hash = hashlib.sha1(json.dumps(roll_config, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     preproc_version = getattr(C, "PREPROC_VERSION", "v1.0")
@@ -198,6 +201,7 @@ def _daily_cache_key(path_daily: Path, gdd_dir: Path | None) -> str:
             str(st.st_mtime_ns),
             str(st.st_size),
             str(getattr(C, "YEAR_MAX", None)),
+            str(getattr(C, "YEAR_MIN", None)),
             gdd_sig,
             preproc_version,
             roll_hash,
@@ -261,6 +265,8 @@ def load_obs(path: Path) -> pd.DataFrame:
 
     obs["site_id"] = obs["site_id"].astype(str)
     obs["year"] = pd.to_numeric(obs["year"], errors="coerce").astype(int)
+    if getattr(C, "YEAR_MIN", None) is not None:
+        obs = obs[obs["year"] >= int(C.YEAR_MIN)].copy()
     if getattr(C, "YEAR_MAX", None) is not None:
         obs = obs[obs["year"] <= int(C.YEAR_MAX)].copy()
     year_min = int(obs["year"].min()) if not obs.empty else None
@@ -276,6 +282,16 @@ def load_obs(path: Path) -> pd.DataFrame:
         obs[C.LABEL_COL] = pd.to_numeric(obs[C.LABEL_COL], errors="coerce")
     for c in ["days_since_growing_start", "days_until_growing_end", "is_growing"]:
         obs[c] = pd.to_numeric(obs[c], errors="coerce")
+
+    # Optional target guidance columns from LONG
+    for c in [
+        "tgt_doy_min",
+        "tgt_dst_min",
+        "has_arrived",
+        "days_since_arrival",
+    ]:
+        if c in obs.columns:
+            obs[c] = pd.to_numeric(obs[c], errors="coerce")
 
     obs["좌표-위도"] = pd.to_numeric(obs["좌표-위도"], errors="coerce")
     obs["좌표-경도"] = pd.to_numeric(obs["좌표-경도"], errors="coerce")
@@ -373,6 +389,10 @@ def merge_pheno_daily_ffill(train_df: pd.DataFrame, obs: pd.DataFrame) -> pd.Dat
         "growing_end_doy",
         "growing_mid_doy",
         "growing_len_days",
+        "tgt_doy_min",
+        "tgt_dst_min",
+        "has_arrived",
+        "days_since_arrival",
     ]
     pheno_cols = [c for c in candidate_cols if c in obs.columns]
     if not pheno_cols:
@@ -406,6 +426,9 @@ def merge_pheno_daily_ffill(train_df: pd.DataFrame, obs: pd.DataFrame) -> pd.Dat
 
     out[pheno_cols] = out.groupby(["site_id", "year"], sort=False)[pheno_cols].ffill()
     for c in pheno_cols:
+        # Keep optional arrival features as NaN so __miss indicators are meaningful.
+        if c in {"tgt_doy_min", "tgt_dst_min", "days_since_arrival"}:
+            continue
         out[c] = out[c].fillna(0.0)
     return out
 

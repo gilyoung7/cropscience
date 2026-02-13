@@ -83,6 +83,8 @@ def run_epoch_weighted(
     lambda_mass: float = 0.0,
     lambda_right_late: float = 0.0,
     right_late_tau: float | None = None,
+    lambda_event_cls: float = 0.0,
+    event_pos_weight: float = 1.0,
     log_mass: bool = False,
     epoch_idx: int | None = None,
     return_parts: bool = False,
@@ -92,6 +94,7 @@ def run_epoch_weighted(
     base_total = 0.0
     mass_total = 0.0
     late_total = 0.0
+    cls_total = 0.0
     logged = False
     bad_batches = 0
     for X, L, R, ctype in loader:
@@ -177,6 +180,22 @@ def run_epoch_weighted(
                 late_loss_tensor = late_margin.mean()
                 loss = loss + lambda_right_late * late_loss_tensor
 
+        if lambda_event_cls > 0:
+            # Event label: left/interval => 1, right => 0
+            y_event = (ctype != 1).float()
+            _, _, logS = hazard_to_pmf_cdf_logS(hazard)
+            p_event = 1.0 - torch.exp(logS[:, -1])
+            p_event = torch.clamp(p_event, min=1e-8, max=1.0 - 1e-8)
+            w_pos = float(event_pos_weight)
+            # Weighted BCE on probabilities.
+            cls_loss = -(
+                w_pos * y_event * torch.log(p_event)
+                + (1.0 - y_event) * torch.log(1.0 - p_event)
+            ).mean()
+            loss = loss + lambda_event_cls * cls_loss
+        else:
+            cls_loss = None
+
         if not torch.isfinite(loss):
             bad_batches += 1
             continue
@@ -202,6 +221,8 @@ def run_epoch_weighted(
             mass_total += float(mass_loss_tensor.item()) * X.size(0)
         if late_loss_tensor is not None:
             late_total += float(late_loss_tensor.item()) * X.size(0)
+        if cls_loss is not None:
+            cls_total += float(cls_loss.item()) * X.size(0)
         n += X.size(0)
 
     if bad_batches > 0 and train:
@@ -215,7 +236,8 @@ def run_epoch_weighted(
         base_avg = base_total / max(n, 1)
         mass_avg = mass_total / max(n, 1)
         late_avg = late_total / max(n, 1)
-        return total_avg, base_avg, mass_avg, late_avg
+        cls_avg = cls_total / max(n, 1)
+        return total_avg, base_avg, mass_avg, late_avg, cls_avg
     return total_avg
 
 
@@ -257,6 +279,44 @@ def quantile_from_cdf_1d(cdf_1d, q, Tend):
     return int(np.searchsorted(cdf_1d, q) + 1)  # 1..T
 
 
+def shortest_mass_interval_1d(pmf_1d, target_mass, Tend):
+    """
+    Find shortest contiguous [L,R] (1-indexed, inclusive) with mass >= target_mass.
+    Tie-breaker: earlier L (smaller start index).
+    Fallback: [1, Tend] when total mass < target_mass or no valid window.
+    """
+    p = np.asarray(pmf_1d, dtype=float)
+    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+    p = np.clip(p, 0.0, None)
+    total_mass = float(p.sum())
+    if total_mass < float(target_mass):
+        return 1, int(Tend), True
+
+    a = 0
+    cum = 0.0
+    best_a = 0
+    best_b = int(Tend) - 1
+    best_len = int(1e18)
+    found = False
+
+    for b in range(int(Tend)):
+        cum += float(p[b])
+        while a <= b and (cum - float(p[a])) >= float(target_mass):
+            cum -= float(p[a])
+            a += 1
+        if cum >= float(target_mass):
+            cur_len = b - a
+            if (not found) or (cur_len < best_len) or (cur_len == best_len and a < best_a):
+                found = True
+                best_len = cur_len
+                best_a = a
+                best_b = b
+
+    if not found:
+        return 1, int(Tend), True
+    return int(best_a + 1), int(best_b + 1), False
+
+
 def overlap_metrics(pred_L, pred_R, true_L, true_R):
     true_L2 = true_L + 1
     inter_L = max(pred_L, true_L2)
@@ -276,15 +336,17 @@ def overlap_metrics(pred_L, pred_R, true_L, true_R):
 
 
 @torch.no_grad()
-def eval_metrics_with_overlap(model, loader, Tend, device, alpha=0.2):
+def eval_metrics_with_overlap(model, loader, Tend, device, alpha=0.2, pi_method: str = "shortest"):
     model.eval()
     q_lo = alpha / 2
     q_hi = 1 - alpha / 2
+    target_mass = 1.0 - float(alpha)
 
     hits_all, maes_all, mass_all = [], [], []
     ious, recalls, precs = [], [], []
     hits_int, maes_int, mass_int = [], [], []
     n_int = 0
+    shortest_fallback_count = 0
 
     for X, L, R, ctype in loader:
         X = X.to(device, non_blocking=True)
@@ -296,7 +358,7 @@ def eval_metrics_with_overlap(model, loader, Tend, device, alpha=0.2):
         R_np = R.cpu().numpy().astype(int)
 
         hazard = model(X)
-        _, cdf, logS = hazard_to_pmf_cdf_logS(hazard)
+        pmf, cdf, logS = hazard_to_pmf_cdf_logS(hazard)
 
         # median
         cdf_last = cdf[:, -1]
@@ -321,14 +383,26 @@ def eval_metrics_with_overlap(model, loader, Tend, device, alpha=0.2):
 
         # overlap (interval-only)
         cdf_np = cdf.cpu().numpy()
+        pmf_np = pmf.cpu().numpy()
         for b in range(len(L_np)):
             if ctype_np[b] != CTYPE_INTERVAL:
                 continue
             n_int += 1
             hits_int.append(hit[b]); maes_int.append(mae[b]); mass_int.append(mass[b])
 
-            pL = quantile_from_cdf_1d(cdf_np[b], q_lo, Tend)
-            pR = quantile_from_cdf_1d(cdf_np[b], q_hi, Tend)
+            if pi_method == "shortest":
+                pL, pR, used_fallback = shortest_mass_interval_1d(pmf_np[b], target_mass=target_mass, Tend=Tend)
+                if used_fallback:
+                    shortest_fallback_count += 1
+            elif pi_method == "quantile":
+                pL = quantile_from_cdf_1d(cdf_np[b], q_lo, Tend)
+                pR = quantile_from_cdf_1d(cdf_np[b], q_hi, Tend)
+            else:
+                raise ValueError(f"Unknown pi_method: {pi_method}. expected 'shortest' or 'quantile'")
+
+            # [reference: old quantile PI logic]
+            # pL = quantile_from_cdf_1d(cdf_np[b], q_lo, Tend)
+            # pR = quantile_from_cdf_1d(cdf_np[b], q_hi, Tend)
             pL = max(1, min(pL, Tend))
             pR = max(1, min(pR, Tend))
             if pL > pR:
@@ -351,4 +425,5 @@ def eval_metrics_with_overlap(model, loader, Tend, device, alpha=0.2):
         "Recall_mean_interval_only(80%)": float(np.mean(recalls)) if n_int > 0 else np.nan,
         "Precision_mean_interval_only(80%)": float(np.mean(precs)) if n_int > 0 else np.nan,
         "N_interval_samples": int(n_int),
+        "PI_shortest_fallback_count_interval_only": int(shortest_fallback_count),
     }

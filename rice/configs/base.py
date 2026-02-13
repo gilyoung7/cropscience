@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 PATH_DAILY = Path("/home/gpu4080/ygdata/rice/1997_2024_RICE_union_all_sites_with_GDD10_since_gs.csv")
+YEAR_MIN = None
 YEAR_MAX = 2024
 
 # Always shared across all pests to avoid duplicated caches.
