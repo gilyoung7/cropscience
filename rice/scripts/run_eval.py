@@ -34,7 +34,7 @@ from rice.src.ckpt_schema import validate_ckpt_meta
 from rice.src.model import HazardTransformer
 from rice.src.train_eval import eval_nll_model, eval_metrics_with_overlap
 
-def build_samples_for_run(run: int, get_feature_cols):
+def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool = False):
     """
     Rebuild datasets deterministically (same as training pipeline split seed=42).
     Norm stats are recomputed from train split.
@@ -65,11 +65,27 @@ def build_samples_for_run(run: int, get_feature_cols):
     feature_cols = get_feature_cols(run)
 
     df_season = slice_season(train_df, C.DOY_START, C.DOY_END)
+    group_len = (
+        df_season.groupby(["site_id", "year"], sort=False)
+        .size()
+        .reset_index(name="n_rows")
+    )
+    dropped_groups_df = group_len[group_len["n_rows"] != T][["site_id", "year"]].copy()
     samples, dropped, feature_names = build_samples_season(df_season, feature_cols, C.DOY_START, C.DOY_END)
     if dropped > 0:
         print("WARNING: dropped groups (len!=T):", dropped)
 
-    return feature_cols, feature_names, T, samples
+    if not return_debug_stats:
+        return feature_cols, feature_names, T, samples
+
+    debug_stats = {
+        "n_groups_total": int(len(group_len)),
+        "n_groups_kept": int(len(samples)),
+        "n_groups_dropped_len_mismatch": int(dropped),
+        "drop_ratio_len_mismatch": float(dropped / max(int(len(group_len)), 1)),
+        "dropped_site_year": [(str(r.site_id), int(r.year)) for r in dropped_groups_df.itertuples(index=False)],
+    }
+    return feature_cols, feature_names, T, samples, debug_stats
 
 
 def mean_std(arr):

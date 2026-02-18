@@ -83,8 +83,6 @@ def run_epoch_weighted(
     lambda_mass: float = 0.0,
     lambda_right_late: float = 0.0,
     right_late_tau: float | None = None,
-    lambda_event_cls: float = 0.0,
-    event_pos_weight: float = 1.0,
     log_mass: bool = False,
     epoch_idx: int | None = None,
     return_parts: bool = False,
@@ -94,7 +92,6 @@ def run_epoch_weighted(
     base_total = 0.0
     mass_total = 0.0
     late_total = 0.0
-    cls_total = 0.0
     logged = False
     bad_batches = 0
     for X, L, R, ctype in loader:
@@ -180,22 +177,6 @@ def run_epoch_weighted(
                 late_loss_tensor = late_margin.mean()
                 loss = loss + lambda_right_late * late_loss_tensor
 
-        if lambda_event_cls > 0:
-            # Event label: left/interval => 1, right => 0
-            y_event = (ctype != 1).float()
-            _, _, logS = hazard_to_pmf_cdf_logS(hazard)
-            p_event = 1.0 - torch.exp(logS[:, -1])
-            p_event = torch.clamp(p_event, min=1e-8, max=1.0 - 1e-8)
-            w_pos = float(event_pos_weight)
-            # Weighted BCE on probabilities.
-            cls_loss = -(
-                w_pos * y_event * torch.log(p_event)
-                + (1.0 - y_event) * torch.log(1.0 - p_event)
-            ).mean()
-            loss = loss + lambda_event_cls * cls_loss
-        else:
-            cls_loss = None
-
         if not torch.isfinite(loss):
             bad_batches += 1
             continue
@@ -221,8 +202,6 @@ def run_epoch_weighted(
             mass_total += float(mass_loss_tensor.item()) * X.size(0)
         if late_loss_tensor is not None:
             late_total += float(late_loss_tensor.item()) * X.size(0)
-        if cls_loss is not None:
-            cls_total += float(cls_loss.item()) * X.size(0)
         n += X.size(0)
 
     if bad_batches > 0 and train:
@@ -236,8 +215,7 @@ def run_epoch_weighted(
         base_avg = base_total / max(n, 1)
         mass_avg = mass_total / max(n, 1)
         late_avg = late_total / max(n, 1)
-        cls_avg = cls_total / max(n, 1)
-        return total_avg, base_avg, mass_avg, late_avg, cls_avg
+        return total_avg, base_avg, mass_avg, late_avg
     return total_avg
 
 

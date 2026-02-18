@@ -17,7 +17,8 @@ def build_interval_labels_from_doy(
     threshold: y >= threshold -> "above" (LABEL_COL이 없을 때만 사용)
     returns labels: [site_id, year, censor_type, L_doy, R_doy, threshold]
       - interval: 마지막 below 시점 L_doy, 첫 above 시점 R_doy
-      - left: L_doy=max(season_start_doy, R_doy-LEFT_WINDOW_DAYS), R_doy=첫 above 시점
+      - left-like early hit is converted to interval:
+          L_doy=max(season_start_doy, R_doy-LEFT_WINDOW_DAYS), R_doy=첫 above 시점
       - right: 시즌 끝까지 (이 구현은 L_doy=season_start, R_doy=season_end로 둠)
     """
     rows = []
@@ -42,12 +43,12 @@ def build_interval_labels_from_doy(
             left_L = max(int(season_start_doy), int(R_doy) - left_window_days)
 
             if idx_R == 0:
-                censor_type = "left"
+                censor_type = "interval"
                 L_doy = left_L
             else:
                 idx_Ls = np.where(~above[:idx_R])[0]
                 if len(idx_Ls) == 0:
-                    censor_type = "left"
+                    censor_type = "interval"
                     L_doy = left_L
                 else:
                     censor_type = "interval"
