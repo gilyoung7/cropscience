@@ -280,6 +280,114 @@ def split_seed_search(
     return {"topk": result["topk"], "used_fallback": result["used_fallback"]}
 
 
+def _mask_to_recent_window(X: np.ndarray, tstar: int, window: int) -> np.ndarray:
+    """
+    Keep only recent [tstar-window+1, tstar] observations (1-based, inclusive).
+    Equivalent 0-based slice is X[tstar-window : tstar], i.e. no future leakage.
+    Everything else becomes missing: value=0, miss-indicator=1.
+    Assumes miss indicators are appended after each base feature (odd dims).
+    """
+    T, D = X.shape
+    X_out = np.zeros_like(X, dtype=np.float32)
+    if D > 1:
+        X_out[:, 1::2] = 1.0
+
+    start = max(1, int(tstar) - int(window) + 1)
+    end = min(T, int(tstar))
+    if end >= start:
+        i0 = start - 1
+        i1 = end
+        X_out[i0:i1, :] = X[i0:i1, :]
+    return X_out
+
+
+def build_stage2_nowcast_samples(
+    samples: list[dict],
+    window: int,
+    stride: int,
+    tstar_start: int | None = None,
+    only_pre_event: bool = True,
+    event_time_proxy: str = "r",
+) -> list[dict]:
+    """
+    Build Stage-2 nowcast samples for "first event after t*" target.
+    Output keeps season-length X (masked outside recent window) so hazard axis remains 1..T.
+
+    Event-time handling:
+      - proxy='r': event_time = R
+      - proxy='mid': event_time = floor((L+R)/2)
+    Interval ambiguity region L <= t* < R is retained and tracked by `case_bucket`.
+    """
+    out: list[dict] = []
+    if not samples:
+        return out
+    if window <= 0:
+        raise ValueError("window must be >= 1")
+    if stride <= 0:
+        raise ValueError("stride must be >= 1")
+    if event_time_proxy not in ("r", "mid"):
+        raise ValueError("event_time_proxy must be one of: r, mid")
+
+    T = int(samples[0]["X"].shape[0])
+    t0 = int(window if tstar_start is None else tstar_start)
+    t0 = max(1, min(t0, T))
+
+    for s in samples:
+        X = np.asarray(s["X"], dtype=np.float32)
+        ctype = str(s["censor_type"])
+        has_event = ctype != "right"
+
+        if has_event:
+            L0 = int(s["L"])
+            R0 = int(s["R"])
+            if event_time_proxy == "mid":
+                event_time = int((L0 + R0) // 2)
+            else:
+                event_time = int(R0)
+        else:
+            event_time = None
+
+        for tstar in range(t0, T + 1, stride):
+            if only_pre_event and has_event and event_time is not None and tstar >= event_time:
+                continue
+
+            X_now = _mask_to_recent_window(X, tstar=tstar, window=window)
+
+            if has_event and event_time is not None and event_time > tstar:
+                # Convert to a point-like interval at first-future event proxy.
+                R_new = int(event_time)
+                L_new = int(max(1, R_new - 1))
+                c_new = "interval"
+            else:
+                # No future event after t* in season horizon.
+                L_new = int(T)
+                R_new = int(T)
+                c_new = "right"
+
+            out.append(
+                {
+                    "site_id": s["site_id"],
+                    "year": int(s["year"]),
+                    "X": X_now.astype(np.float32, copy=False),
+                    "L": L_new,
+                    "R": R_new,
+                    "censor_type": c_new,
+                    "tstar": int(tstar),
+                    "event_time": int(event_time) if event_time is not None else None,
+                    "orig_L": int(s["L"]),
+                    "orig_R": int(s["R"]),
+                    "orig_censor_type": str(s["censor_type"]),
+                    "case_bucket": (
+                        "right"
+                        if not has_event
+                        else ("pre_L" if tstar < int(s["L"]) else ("in_LR" if tstar < int(s["R"]) else "post_R"))
+                    ),
+                }
+            )
+
+    return out
+
+
 def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     """
     Train samples only -> mean/std for each feature dim

@@ -29,6 +29,7 @@ from rice.src.dataset import (
     IntervalEventDataset,
     log_split_fingerprint,
     split_seed_search_topk,
+    build_stage2_nowcast_samples,
 )
 from rice.src.ckpt_schema import validate_ckpt_meta
 from rice.src.model import HazardTransformer
@@ -148,6 +149,12 @@ def main(
     auto_split_topk: int,
     split_seed_from_topk_idx: int | None,
     split_seeds_json: str | None,
+    stage2_nowcast: bool,
+    stage2_nowcast_window: int,
+    stage2_nowcast_stride: int,
+    stage2_nowcast_tstar_start: int | None,
+    stage2_nowcast_only_pre_event: int,
+    stage2_nowcast_event_time_proxy: str,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -206,6 +213,56 @@ def main(
     else:
         train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
 
+    stage2_nowcast = bool(ckpt.get("stage2_nowcast", stage2_nowcast))
+    if stage2_nowcast:
+        stage2_nowcast_window = int(ckpt.get("stage2_nowcast_window", stage2_nowcast_window))
+        stage2_nowcast_stride = int(ckpt.get("stage2_nowcast_stride", stage2_nowcast_stride))
+        stage2_nowcast_tstar_start = ckpt.get("stage2_nowcast_tstar_start", stage2_nowcast_tstar_start)
+        stage2_nowcast_only_pre_event = int(ckpt.get("stage2_nowcast_only_pre_event", stage2_nowcast_only_pre_event))
+        stage2_nowcast_event_time_proxy = str(ckpt.get("stage2_nowcast_event_time_proxy", stage2_nowcast_event_time_proxy))
+
+        train_s = build_stage2_nowcast_samples(
+            train_s,
+            window=stage2_nowcast_window,
+            stride=stage2_nowcast_stride,
+            tstar_start=stage2_nowcast_tstar_start,
+            only_pre_event=bool(stage2_nowcast_only_pre_event),
+            event_time_proxy=stage2_nowcast_event_time_proxy,
+        )
+        val_s = build_stage2_nowcast_samples(
+            val_s,
+            window=stage2_nowcast_window,
+            stride=stage2_nowcast_stride,
+            tstar_start=stage2_nowcast_tstar_start,
+            only_pre_event=bool(stage2_nowcast_only_pre_event),
+            event_time_proxy=stage2_nowcast_event_time_proxy,
+        )
+        test_s = build_stage2_nowcast_samples(
+            test_s,
+            window=stage2_nowcast_window,
+            stride=stage2_nowcast_stride,
+            tstar_start=stage2_nowcast_tstar_start,
+            only_pre_event=bool(stage2_nowcast_only_pre_event),
+            event_time_proxy=stage2_nowcast_event_time_proxy,
+        )
+        print(
+            f"[stage2_nowcast] window={stage2_nowcast_window} stride={stage2_nowcast_stride} "
+            f"tstar_start={stage2_nowcast_tstar_start} only_pre_event={bool(stage2_nowcast_only_pre_event)} "
+            f"event_time_proxy={stage2_nowcast_event_time_proxy} | "
+            f"samples train={len(train_s)} val={len(val_s)} test={len(test_s)}"
+        )
+        def _bucket_counts(ss: list[dict]) -> dict[str, int]:
+            out = {"pre_L": 0, "in_LR": 0, "post_R": 0, "right": 0}
+            for x in ss:
+                b = str(x.get("case_bucket", ""))
+                if b in out:
+                    out[b] += 1
+            return out
+        print(
+            f"[stage2_nowcast] case_bucket train={_bucket_counts(train_s)} "
+            f"val={_bucket_counts(val_s)} test={_bucket_counts(test_s)}"
+        )
+
     log_split_fingerprint("eval", train_s, val_s, test_s)
 
     x_mean, x_std = compute_norm_stats(train_s)
@@ -229,6 +286,7 @@ def main(
     test_loader = make_loader(test_ds, C.BATCH_EVAL, shuffle=False)
 
     records = []
+    by_tstar_rows = []
     for d in trained_states:
         seed = int(d["seed"])
         if seeds is not None and seed not in seeds:
@@ -280,6 +338,44 @@ def main(
         }
         records.append(rec)
 
+        if stage2_nowcast:
+            for split_name, split_samples in (("val", val_s), ("test", test_s)):
+                tvals = sorted({int(s.get("tstar", -1)) for s in split_samples if "tstar" in s})
+                for tstar in tvals:
+                    sub = [s for s in split_samples if int(s.get("tstar", -1)) == tstar]
+                    if not sub:
+                        continue
+                    sub_ds = IntervalEventDataset(sub, x_mean, x_std)
+                    sub_loader = make_loader(sub_ds, C.BATCH_EVAL, shuffle=False)
+                    sub_stats = eval_metrics_with_overlap(
+                        model,
+                        sub_loader,
+                        Tend=T,
+                        device=device,
+                        alpha=0.2,
+                        pi_method=getattr(C, "PI_METHOD", "shortest"),
+                    )
+                    by_tstar_rows.append(
+                        {
+                            "seed": seed,
+                            "split": split_name,
+                            "tstar": int(tstar),
+                            "n": int(len(sub)),
+                            "N_total": int(len(sub)),
+                            "N_interval_label": int(sum(1 for s in sub if str(s.get("censor_type", "")) == "interval")),
+                            "N_right_label": int(sum(1 for s in sub if str(s.get("censor_type", "")) == "right")),
+                            "N_preL": int(sum(1 for s in sub if str(s.get("case_bucket", "")) == "pre_L")),
+                            "N_inLR": int(sum(1 for s in sub if str(s.get("case_bucket", "")) == "in_LR")),
+                            "N_postR": int(sum(1 for s in sub if str(s.get("case_bucket", "")) == "post_R")),
+                            "IoU80_interval_only": float(sub_stats["IoU_mean_interval_only(80%)"]),
+                            "Precision80_interval_only": float(sub_stats["Precision_mean_interval_only(80%)"]),
+                            "Recall80_interval_only": float(sub_stats["Recall_mean_interval_only(80%)"]),
+                            "MAE_int_interval_only": float(sub_stats["mae_mid_mean_interval_only"]),
+                            "Mass_int_interval_only": float(sub_stats["mass_in_interval_mean_interval_only"]),
+                            "N_int": int(sub_stats["N_interval_samples"]),
+                        }
+                    )
+
     df = pd.DataFrame(records).sort_values("seed").reset_index(drop=True)
     print("\n=== per-seed ===")
     print(df.to_string(index=False))
@@ -303,6 +399,11 @@ def main(
     if out_csv_resolved:
         df.to_csv(out_csv_resolved, index=False)
         print("saved:", out_csv_resolved)
+        if stage2_nowcast and by_tstar_rows:
+            by_tstar_df = pd.DataFrame(by_tstar_rows).sort_values(["seed", "split", "tstar"]).reset_index(drop=True)
+            by_tstar_out = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_by_tstar.csv"))
+            by_tstar_df.to_csv(by_tstar_out, index=False)
+            print("saved:", by_tstar_out)
 
 
 if __name__ == "__main__":
@@ -322,6 +423,18 @@ if __name__ == "__main__":
     p.add_argument("--seed_candidates", type=str, default=None)
     p.add_argument("--target_test_interval", type=int, default=None)
     p.add_argument("--tol_test_interval", type=int, default=None)
+    p.add_argument("--stage2_nowcast", action="store_true")
+    p.add_argument("--stage2_nowcast_window", type=int, default=56)
+    p.add_argument("--stage2_nowcast_stride", type=int, default=7)
+    p.add_argument("--stage2_nowcast_tstar_start", type=int, default=None)
+    p.add_argument("--stage2_nowcast_only_pre_event", type=int, default=1)
+    p.add_argument("--stage2_nowcast_event_time_proxy", type=str, default="r", choices=["r", "mid"])
+    # Stage-1 style aliases for pipeline consistency.
+    p.add_argument("--nowcast_window", dest="stage2_nowcast_window", type=int)
+    p.add_argument("--nowcast_stride", dest="stage2_nowcast_stride", type=int)
+    p.add_argument("--nowcast_tstar_start", dest="stage2_nowcast_tstar_start", type=int)
+    p.add_argument("--nowcast_only_pre_event", dest="stage2_nowcast_only_pre_event", type=int)
+    p.add_argument("--nowcast_event_time_proxy", dest="stage2_nowcast_event_time_proxy", type=str, choices=["r", "mid"])
     args = p.parse_args()
     main(
         args.pest,
@@ -339,4 +452,10 @@ if __name__ == "__main__":
         args.auto_split_topk,
         args.split_seed_from_topk_idx,
         args.split_seeds_json,
+        args.stage2_nowcast,
+        args.stage2_nowcast_window,
+        args.stage2_nowcast_stride,
+        args.stage2_nowcast_tstar_start,
+        args.stage2_nowcast_only_pre_event,
+        args.stage2_nowcast_event_time_proxy,
     )

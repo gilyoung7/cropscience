@@ -34,6 +34,7 @@ from rice.src.dataset import (
     IntervalEventDataset,
     log_split_fingerprint,
     split_seed_search_topk,
+    build_stage2_nowcast_samples,
 )
 from rice.src.ckpt_schema import build_ckpt_meta
 from rice.src.model import HazardTransformer
@@ -167,6 +168,12 @@ def main(
     lambda_right_late: float,
     right_late_tau: float | None,
     train_balance_ratio: str | None,
+    stage2_nowcast: bool,
+    stage2_nowcast_window: int,
+    stage2_nowcast_stride: int,
+    stage2_nowcast_tstar_start: int | None,
+    stage2_nowcast_only_pre_event: int,
+    stage2_nowcast_event_time_proxy: str,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -297,6 +304,50 @@ def main(
         train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
 
     # split stats
+    if stage2_nowcast:
+        train_s = build_stage2_nowcast_samples(
+            train_s,
+            window=stage2_nowcast_window,
+            stride=stage2_nowcast_stride,
+            tstar_start=stage2_nowcast_tstar_start,
+            only_pre_event=bool(stage2_nowcast_only_pre_event),
+            event_time_proxy=stage2_nowcast_event_time_proxy,
+        )
+        val_s = build_stage2_nowcast_samples(
+            val_s,
+            window=stage2_nowcast_window,
+            stride=stage2_nowcast_stride,
+            tstar_start=stage2_nowcast_tstar_start,
+            only_pre_event=bool(stage2_nowcast_only_pre_event),
+            event_time_proxy=stage2_nowcast_event_time_proxy,
+        )
+        test_s = build_stage2_nowcast_samples(
+            test_s,
+            window=stage2_nowcast_window,
+            stride=stage2_nowcast_stride,
+            tstar_start=stage2_nowcast_tstar_start,
+            only_pre_event=bool(stage2_nowcast_only_pre_event),
+            event_time_proxy=stage2_nowcast_event_time_proxy,
+        )
+        print(
+            f"[stage2_nowcast] window={stage2_nowcast_window} stride={stage2_nowcast_stride} "
+            f"tstar_start={stage2_nowcast_tstar_start} only_pre_event={bool(stage2_nowcast_only_pre_event)} "
+            f"event_time_proxy={stage2_nowcast_event_time_proxy} | "
+            f"samples train={len(train_s)} val={len(val_s)} test={len(test_s)}"
+        )
+        def _bucket_counts(ss: list[dict]) -> dict[str, int]:
+            out = {"pre_L": 0, "in_LR": 0, "post_R": 0, "right": 0}
+            for x in ss:
+                b = str(x.get("case_bucket", ""))
+                if b in out:
+                    out[b] += 1
+            return out
+        print(
+            f"[stage2_nowcast] case_bucket train={_bucket_counts(train_s)} "
+            f"val={_bucket_counts(val_s)} test={_bucket_counts(test_s)}"
+        )
+
+    # split stats
     tr = _split_stats(train_s)
     va = _split_stats(val_s)
     te = _split_stats(test_s)
@@ -345,6 +396,12 @@ def main(
         "lambda_mass": lambda_mass,
         "lambda_right_late": lambda_right_late,
         "right_late_tau": right_late_tau,
+        "stage2_nowcast": bool(stage2_nowcast),
+        "stage2_nowcast_window": int(stage2_nowcast_window),
+        "stage2_nowcast_stride": int(stage2_nowcast_stride),
+        "stage2_nowcast_tstar_start": None if stage2_nowcast_tstar_start is None else int(stage2_nowcast_tstar_start),
+        "stage2_nowcast_only_pre_event": int(stage2_nowcast_only_pre_event),
+        "stage2_nowcast_event_time_proxy": stage2_nowcast_event_time_proxy,
     }
     hparams_path = Path(out_root) / "hparams.json"
     hparams_path.parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +569,12 @@ def main(
         "doy_start": C.DOY_START,
         "doy_end": C.DOY_END,
         "T": T,
+        "stage2_nowcast": bool(stage2_nowcast),
+        "stage2_nowcast_window": int(stage2_nowcast_window),
+        "stage2_nowcast_stride": int(stage2_nowcast_stride),
+        "stage2_nowcast_tstar_start": None if stage2_nowcast_tstar_start is None else int(stage2_nowcast_tstar_start),
+        "stage2_nowcast_only_pre_event": int(stage2_nowcast_only_pre_event),
+        "stage2_nowcast_event_time_proxy": stage2_nowcast_event_time_proxy,
         "norm_mean": x_mean,
         "norm_std": x_std,
         "trained_states": trained_states,
@@ -547,6 +610,18 @@ if __name__ == "__main__":
     p.add_argument("--lambda_right_late", type=float, default=0.0)
     p.add_argument("--right_late_tau", type=float, default=220.0)
     p.add_argument("--train_balance_ratio", type=str, default="1:1:1")
+    p.add_argument("--stage2_nowcast", action="store_true")
+    p.add_argument("--stage2_nowcast_window", type=int, default=56)
+    p.add_argument("--stage2_nowcast_stride", type=int, default=7)
+    p.add_argument("--stage2_nowcast_tstar_start", type=int, default=None)
+    p.add_argument("--stage2_nowcast_only_pre_event", type=int, default=1)
+    p.add_argument("--stage2_nowcast_event_time_proxy", type=str, default="r", choices=["r", "mid"])
+    # Stage-1 style aliases for pipeline consistency.
+    p.add_argument("--nowcast_window", dest="stage2_nowcast_window", type=int)
+    p.add_argument("--nowcast_stride", dest="stage2_nowcast_stride", type=int)
+    p.add_argument("--nowcast_tstar_start", dest="stage2_nowcast_tstar_start", type=int)
+    p.add_argument("--nowcast_only_pre_event", dest="stage2_nowcast_only_pre_event", type=int)
+    p.add_argument("--nowcast_event_time_proxy", dest="stage2_nowcast_event_time_proxy", type=str, choices=["r", "mid"])
     args = p.parse_args()
     main(
         args.pest,
@@ -572,4 +647,10 @@ if __name__ == "__main__":
         args.lambda_right_late,
         args.right_late_tau,
         args.train_balance_ratio,
+        args.stage2_nowcast,
+        args.stage2_nowcast_window,
+        args.stage2_nowcast_stride,
+        args.stage2_nowcast_tstar_start,
+        args.stage2_nowcast_only_pre_event,
+        args.stage2_nowcast_event_time_proxy,
     )

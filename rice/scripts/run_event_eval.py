@@ -323,6 +323,7 @@ def main(
     nowcast_stride = int(ckpt.get("nowcast_stride", 7))
     nowcast_tstar_start = ckpt.get("nowcast_tstar_start", None)
     nowcast_only_pre_event = int(ckpt.get("nowcast_only_pre_event", 1))
+    nowcast_event_time_proxy = str(ckpt.get("nowcast_event_time_proxy", "r"))
     if task_mode == "nowcast":
         val_s = build_nowcast_samples(
             val_s,
@@ -330,6 +331,7 @@ def main(
             stride=nowcast_stride,
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
+            event_time_proxy=nowcast_event_time_proxy,
         )
         test_s = build_nowcast_samples(
             test_s,
@@ -337,10 +339,12 @@ def main(
             stride=nowcast_stride,
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
+            event_time_proxy=nowcast_event_time_proxy,
         )
         print(
             f"[nowcast] window={nowcast_window} stride={nowcast_stride} "
-            f"tstar_start={nowcast_tstar_start} only_pre_event={bool(nowcast_only_pre_event)} | "
+            f"tstar_start={nowcast_tstar_start} only_pre_event={bool(nowcast_only_pre_event)} "
+            f"event_time_proxy={nowcast_event_time_proxy} | "
             f"samples val={len(val_s)} test={len(test_s)}"
         )
 
@@ -402,8 +406,12 @@ def main(
                 raise ValueError("checkpoint does not include sklearn model object for tabular event model")
             X_val_tab = build_tabular_from_samples(val_s)
             X_test_tab = build_tabular_from_samples(test_s)
-            p_val_raw = clf.predict_proba(X_val_tab)[:, 1]
-            p_test_raw = clf.predict_proba(X_test_tab)[:, 1]
+            if hasattr(clf, "predict_proba"):
+                p_val_raw = clf.predict_proba(X_val_tab)[:, 1]
+                p_test_raw = clf.predict_proba(X_test_tab)[:, 1]
+            else:
+                p_val_raw = np.asarray(clf.predict(X_val_tab), dtype=float)
+                p_test_raw = np.asarray(clf.predict(X_test_tab), dtype=float)
 
         t_best, val_nll_cal = fit_temperature_grid(y_val, p_val_raw)
         p_val_cal = apply_temperature(p_val_raw, t_best)
@@ -501,6 +509,7 @@ def main(
                 "nowcast_stride": nowcast_stride,
                 "nowcast_tstar_start": nowcast_tstar_start,
                 "nowcast_only_pre_event": nowcast_only_pre_event,
+                "nowcast_event_time_proxy": nowcast_event_time_proxy,
                 "tau_mode": tau_mode,
                 "tau_target_precision": float(tau_target_precision),
                 "tau_target_recall": float(tau_target_recall),

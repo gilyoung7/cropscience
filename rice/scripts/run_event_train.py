@@ -181,6 +181,7 @@ def build_nowcast_samples(
     stride: int,
     tstar_start: int | None = None,
     only_pre_event: bool = True,
+    event_time_proxy: str = "r",
 ) -> list[dict]:
     out = []
     if not samples:
@@ -199,9 +200,15 @@ def build_nowcast_samples(
         x = np.asarray(s["X"], dtype=np.float32)
         ctype = str(s["censor_type"])
         has_event = ctype != "right"
-        # Proxy event time for nowcasting target:
-        # use R (first observed positive upper bound / earliest guaranteed occurrence by censoring def).
-        event_time = int(s["R"]) if has_event else None
+        if has_event:
+            L_time = int(s["L"])
+            R_time = int(s["R"])
+            if event_time_proxy == "mid":
+                event_time = int((L_time + R_time) // 2)
+            else:
+                event_time = int(R_time)
+        else:
+            event_time = None
 
         for tstar in range(t0, T + 1, stride):
             if only_pre_event and has_event and event_time is not None and tstar >= event_time:
@@ -249,6 +256,7 @@ def main(
     nowcast_stride: int,
     nowcast_tstar_start: int | None,
     nowcast_only_pre_event: int,
+    nowcast_event_time_proxy: str,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -304,6 +312,7 @@ def main(
             stride=nowcast_stride,
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
+            event_time_proxy=nowcast_event_time_proxy,
         )
         val_s = build_nowcast_samples(
             val_s,
@@ -311,6 +320,7 @@ def main(
             stride=nowcast_stride,
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
+            event_time_proxy=nowcast_event_time_proxy,
         )
         test_s = build_nowcast_samples(
             test_s,
@@ -318,10 +328,12 @@ def main(
             stride=nowcast_stride,
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
+            event_time_proxy=nowcast_event_time_proxy,
         )
         print(
             f"[nowcast] window={nowcast_window} stride={nowcast_stride} "
-            f"tstar_start={nowcast_tstar_start} only_pre_event={bool(nowcast_only_pre_event)} | "
+            f"tstar_start={nowcast_tstar_start} only_pre_event={bool(nowcast_only_pre_event)} "
+            f"event_time_proxy={nowcast_event_time_proxy} | "
             f"samples train={len(train_s)} val={len(val_s)} test={len(test_s)}"
         )
 
@@ -451,7 +463,10 @@ def main(
             else:
                 raise ValueError(f"unsupported --model: {model}")
 
-            p_va = clf.predict_proba(X_va)[:, 1]
+            if hasattr(clf, "predict_proba"):
+                p_va = clf.predict_proba(X_va)[:, 1]
+            else:
+                p_va = np.asarray(clf.predict(X_va), dtype=float)
             eps = 1e-8
             p_va = np.clip(p_va, eps, 1.0 - eps)
             best_val = float(-np.mean(y_va * np.log(p_va) + (1.0 - y_va) * np.log(1.0 - p_va)))
@@ -485,6 +500,7 @@ def main(
         "nowcast_stride": int(nowcast_stride),
         "nowcast_tstar_start": None if nowcast_tstar_start is None else int(nowcast_tstar_start),
         "nowcast_only_pre_event": int(nowcast_only_pre_event),
+        "nowcast_event_time_proxy": nowcast_event_time_proxy,
         "norm_mean": x_mean,
         "norm_std": x_std,
         "tab_feature_dim": tab_feature_dim,
@@ -526,6 +542,7 @@ if __name__ == "__main__":
     p.add_argument("--nowcast_stride", type=int, default=7)
     p.add_argument("--nowcast_tstar_start", type=int, default=None)
     p.add_argument("--nowcast_only_pre_event", type=int, default=1)
+    p.add_argument("--nowcast_event_time_proxy", type=str, default="r", choices=["r", "mid"])
     args = p.parse_args()
     main(
         pest=args.pest,
@@ -554,4 +571,5 @@ if __name__ == "__main__":
         nowcast_stride=args.nowcast_stride,
         nowcast_tstar_start=args.nowcast_tstar_start,
         nowcast_only_pre_event=args.nowcast_only_pre_event,
+        nowcast_event_time_proxy=args.nowcast_event_time_proxy,
     )
