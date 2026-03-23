@@ -354,8 +354,6 @@ def build_stage2_nowcast_samples(
             if only_pre_event and has_event and event_time is not None and tstar >= event_time:
                 continue
 
-            X_now = _mask_to_recent_window(X, tstar=tstar, window=window)
-
             if has_event and event_time is not None and event_time > tstar:
                 L_new = int(s["L"])
                 R_new = int(s["R"])
@@ -370,11 +368,13 @@ def build_stage2_nowcast_samples(
                 {
                     "site_id": s["site_id"],
                     "year": int(s["year"]),
-                    "X": X_now.astype(np.float32, copy=False),
+                    # store base X only; do masking on-the-fly in __getitem__
+                    "X": X,
                     "L": L_new,
                     "R": R_new,
                     "censor_type": c_new,
                     "tstar": int(tstar),
+                    "window": int(window),
                     "event_time": int(event_time) if event_time is not None else None,
                     "orig_L": int(s["L"]),
                     "orig_R": int(s["R"]),
@@ -411,7 +411,11 @@ def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     count = 0
 
     for i, s in enumerate(samples):
-        x = np.asarray(s["X"], dtype=np.float32)
+        x_base = np.asarray(s["X"], dtype=np.float32)
+        if "tstar" in s and "window" in s:
+            x = _mask_to_recent_window(x_base, tstar=int(s["tstar"]), window=int(s["window"]))
+        else:
+            x = x_base
         x2d = x.reshape(-1, x.shape[-1]).astype(np.float64, copy=False)
         if sum_ is None:
             sum_ = np.zeros(x2d.shape[1], dtype=np.float64)
@@ -449,7 +453,12 @@ class IntervalEventDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        X = (s["X"] - self.mean) / self.std
+        X_base = s["X"]
+        if "tstar" in s and "window" in s:
+            X = _mask_to_recent_window(X_base, tstar=int(s["tstar"]), window=int(s["window"]))
+        else:
+            X = X_base
+        X = (X - self.mean) / self.std
         X = torch.from_numpy(X).float()  # (T,D)
         L = torch.tensor(int(s["L"]), dtype=torch.long)
         R = torch.tensor(int(s["R"]), dtype=torch.long)
