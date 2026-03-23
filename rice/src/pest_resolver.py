@@ -7,8 +7,9 @@ from rice.configs import config as C
 from rice.configs.base import RICE_ROOT, DAILY_CACHE_DIR
 
 PEST_SLUG_MAP = {
-    "sbw": "벼멸구",
-    "rbw": "흰등멸구",
+    "BPH": "벼멸구",
+    "BPH2": "벼멸구",
+    "WBPH": "흰등멸구",
     "sheath_blight": "잎집무늬마름병",
     "blast": "잎도열병",
     "bacterial_blight": "흰잎마름병",

@@ -24,7 +24,7 @@ from rice.src.sfs import sfs_topk
 
 def rebuild_train_df_season():
     # DAILY
-    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
+    daily = load_daily_preprocessed(C.PATH_DAILY)
 
     # OBS
     obs = load_obs(C.PATH_OBS)

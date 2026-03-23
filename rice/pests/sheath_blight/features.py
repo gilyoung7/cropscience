@@ -12,7 +12,7 @@ def get_feature_cols(run: int) -> list[str]:
         "rh_7d_mean",         "sun_7d_sum", "rad_7d_sum",
         "trange", "trange_7d_mean",
     ]
-    meta = ["first_obs_season", "n_obs", "max_gap", "좌표-위도", "좌표-경도"]
+    meta = ["좌표-위도", "좌표-경도"]
 
     if run == 0:
         cols = base
@@ -22,6 +22,8 @@ def get_feature_cols(run: int) -> list[str]:
         cols = base + pheno + roll
     elif run == 3:
         cols = base + pheno + roll + meta
+    elif run == 4:
+        cols = roll + meta + pheno
     else:
-        raise ValueError("run must be 0..3")
+        raise ValueError("run must be 0..4")
     return list(dict.fromkeys(cols))

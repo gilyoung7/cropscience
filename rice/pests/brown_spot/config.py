@@ -3,7 +3,6 @@ from rice.configs.base import PATH_DAILY, YEAR_MAX
 
 PATH_OBS = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_깨씨무늬병.csv")
 PEST_SLUG = "brown_spot"
-GDD_DIR = None
 
 COUNT_COL = "obs_value"
 THRESHOLD = 0.0
@@ -11,6 +10,7 @@ PEST_COL = "pest"
 TARGET_PEST = "깨씨무늬병"
 LABEL_COL = "label_event"
 APPLY_PEST_FILTER = False
+YEAR_MIN = 2002
 
 SEASON_START_DOY = 1
 SEASON_END_DOY = 365

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 import hashlib
 import json
 import numpy as np
@@ -95,47 +94,6 @@ def load_daily(path: Path) -> pd.DataFrame:
     return daily
 
 
-def load_gdd_since_db(gdd_dir: Path) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Read many per-site GDD csvs (filename like site_32458_56647_GDD_timeseries.csv)
-    -> dataframe [site_id, date, GDD10_since_gs]
-    """
-    dfs = []
-    bad_files: list[str] = []
-
-    for fp in sorted(gdd_dir.glob("*.csv")):
-        m = re.search(r"site_(\d+_\d+)", fp.name)
-        if not m:
-            bad_files.append(fp.name)
-            continue
-        site_id = m.group(1)
-
-        df = pd.read_csv(fp, usecols=["date", "GDD10_since_gs"])
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df["GDD10_since_gs"] = pd.to_numeric(df["GDD10_since_gs"], errors="coerce")
-        df["site_id"] = site_id
-
-        df = df.dropna(subset=["date"]).copy()
-        dfs.append(df)
-
-    if not dfs:
-        raise RuntimeError(f"No GDD csv found under: {gdd_dir}")
-
-    gdd_db = pd.concat(dfs, ignore_index=True)
-    gdd_db = gdd_db.drop_duplicates(["site_id", "date"], keep="last")
-    return gdd_db, bad_files
-
-
-def merge_gdd_since_db(daily: pd.DataFrame, gdd_db: pd.DataFrame) -> pd.DataFrame:
-    daily = daily.copy()
-    daily["site_id"] = daily["site_id"].astype(str)
-    daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
-
-    out = daily.merge(gdd_db, on=["site_id", "date"], how="left")
-    out["GDD10_since_gs"] = out["GDD10_since_gs"].fillna(0.0)
-    return out
-
-
 def add_rolling_features(daily: pd.DataFrame) -> pd.DataFrame:
     """
     rolling/파생 feature 생성 (site-year 기준)
@@ -176,11 +134,8 @@ def add_rolling_features(daily: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-def _daily_cache_key(path_daily: Path, gdd_dir: Path | None) -> str:
+def _daily_cache_key(path_daily: Path) -> str:
     st = path_daily.stat()
-    gdd_sig = "none"
-    if gdd_dir is not None:
-        gdd_sig = str(gdd_dir)
     roll_config = {
         "rain_windows": [7, 14],
         "temp_windows": [7],
@@ -202,7 +157,6 @@ def _daily_cache_key(path_daily: Path, gdd_dir: Path | None) -> str:
             str(st.st_size),
             str(getattr(C, "YEAR_MAX", None)),
             str(getattr(C, "YEAR_MIN", None)),
-            gdd_sig,
             preproc_version,
             roll_hash,
         ]
@@ -210,10 +164,10 @@ def _daily_cache_key(path_daily: Path, gdd_dir: Path | None) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def load_daily_preprocessed(path_daily: Path, gdd_dir: Path | None) -> pd.DataFrame:
+def load_daily_preprocessed(path_daily: Path) -> pd.DataFrame:
     cache_dir = Path(getattr(C, "DAILY_CACHE_DIR", BASE_DAILY_CACHE_DIR))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_key = _daily_cache_key(path_daily, gdd_dir)
+    cache_key = _daily_cache_key(path_daily)
     cache_path = cache_dir / f"daily_preprocessed_{cache_key}.pkl"
 
     if cache_path.exists():
@@ -222,11 +176,6 @@ def load_daily_preprocessed(path_daily: Path, gdd_dir: Path | None) -> pd.DataFr
 
     print(f"[cache] miss: {cache_path}")
     daily = load_daily(path_daily)
-    if gdd_dir is not None:
-        gdd_db, bad = load_gdd_since_db(gdd_dir)
-        if bad:
-            print("GDD filename parse failed (first 5):", bad[:5])
-        daily = merge_gdd_since_db(daily, gdd_db)
     daily = add_rolling_features(daily)
     daily.to_pickle(cache_path)
     print(f"[cache] saved: {cache_path}")
@@ -241,7 +190,15 @@ def load_obs(path: Path) -> pd.DataFrame:
     LONG2 file loader. Requires:
     site_id, year, obs_doy, COUNT_COL, days_since_growing_start, days_until_growing_end, is_growing, and lat/lon columns.
     """
-    obs = pd.read_csv(path)
+    # utf-8-sig handles BOM-prefixed headers (e.g., "\ufeffsite_id")
+    obs = pd.read_csv(path, encoding="utf-8-sig")
+    obs = obs.rename(columns=lambda c: c.strip() if isinstance(c, str) else c)
+
+    # Backward-compatible aliases for arrival guidance columns.
+    if "tgt_doy_min" not in obs.columns and "tgt_doy_rule" in obs.columns:
+        obs["tgt_doy_min"] = obs["tgt_doy_rule"]
+    if "tgt_dst_min" not in obs.columns and "tgt_dst_rule" in obs.columns:
+        obs["tgt_dst_min"] = obs["tgt_dst_rule"]
     if getattr(C, "APPLY_PEST_FILTER", False) and C.PEST_COL in obs.columns and C.TARGET_PEST is not None:
         obs = obs.loc[obs[C.PEST_COL] == C.TARGET_PEST].copy()
 

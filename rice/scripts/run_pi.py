@@ -35,7 +35,7 @@ from rice.src.interpret import permutation_importance_features, summarize_import
 
 def rebuild_val_dataset(run: int, get_feature_cols):
     # DAILY
-    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
+    daily = load_daily_preprocessed(C.PATH_DAILY)
 
     # OBS
     obs = load_obs(C.PATH_OBS)

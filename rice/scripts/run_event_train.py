@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 from rice.configs import config as C
 from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
-from rice.scripts.common import make_loader, parse_seed_candidates
+from rice.scripts.common import make_loader, parse_seed_candidates, parse_tags, init_wandb_run, finish_wandb_run
 from rice.scripts.run_eval import build_samples_for_run
 from rice.src.dataset import (
     split_by_site,
@@ -24,6 +24,9 @@ from rice.src.dataset import (
     log_split_fingerprint,
 )
 from rice.src.ckpt_schema import build_ckpt_meta
+
+WANDB_ENTITY_DEFAULT = "gilyoung7-seoul-national-university"
+WANDB_PROJECT_DEFAULT = "agro-rice"
 
 
 class EventTransformer(nn.Module):
@@ -127,6 +130,80 @@ def run_epoch_event(model, loader, device, train, opt=None, pos_weight: float = 
     return total / max(n, 1)
 
 
+@torch.no_grad()
+def predict_event_prob_and_labels(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    probs = []
+    labels = []
+    for batch in loader:
+        if isinstance(batch, (tuple, list)) and len(batch) == 4:
+            X, _, _, ctype = batch
+            X = X.to(device, non_blocking=True)
+            y = (ctype.to(device, non_blocking=True) != 1).float()
+        elif isinstance(batch, (tuple, list)) and len(batch) == 2:
+            X, y = batch
+            X = X.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True).float()
+        else:
+            raise ValueError("unexpected batch format in predict_event_prob_and_labels")
+        logits = model(X)
+        p = torch.sigmoid(logits).detach().cpu().numpy()
+        probs.append(p)
+        labels.append(y.detach().cpu().numpy())
+    if probs:
+        probs = np.concatenate(probs)
+        labels = np.concatenate(labels)
+    else:
+        probs = np.asarray([], dtype=float)
+        labels = np.asarray([], dtype=float)
+    return probs, labels
+
+
+def auc_roc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=int)
+    y_score = np.asarray(y_score, dtype=float)
+    pos = y_true == 1
+    neg = y_true == 0
+    n_pos = int(pos.sum())
+    n_neg = int(neg.sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(y_score)
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(1, len(y_score) + 1)
+    sum_pos = float(ranks[pos].sum())
+    return (sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def pr_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    y = np.asarray(y_true, dtype=int)
+    s = np.asarray(y_score, dtype=float)
+    n_pos = int((y == 1).sum())
+    if n_pos == 0:
+        return float("nan")
+    order = np.argsort(-s)
+    y_sorted = y[order]
+    tp = np.cumsum(y_sorted == 1)
+    fp = np.cumsum(y_sorted == 0)
+    recall = tp / max(n_pos, 1)
+    precision = tp / np.maximum(tp + fp, 1)
+    recall = np.concatenate([[0.0], recall])
+    precision = np.concatenate([[1.0], precision])
+    return float(np.trapz(precision, recall))
+
+
+def pr_at_tau(y_true: np.ndarray, p: np.ndarray, tau: float) -> tuple[float, float, float]:
+    y = np.asarray(y_true, dtype=int)
+    pred = (p >= float(tau)).astype(int)
+    tp = int(((pred == 1) & (y == 1)).sum())
+    fp = int(((pred == 1) & (y == 0)).sum())
+    fn = int(((pred == 0) & (y == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+    return float(prec), float(rec), float(f1)
+
+
 class EventBinaryDataset(Dataset):
     def __init__(self, samples: list[dict], mean: np.ndarray, std: np.ndarray):
         self.samples = samples
@@ -223,6 +300,8 @@ def build_nowcast_samples(
                     "y_event": int(y_event),
                     "tstar": int(tstar),
                     "event_time": int(event_time) if event_time is not None else None,
+                    "L": int(L_time) if has_event else None,
+                    "R": int(R_time) if has_event else None,
                     "base_censor_type": ctype,
                 }
             )
@@ -257,6 +336,13 @@ def main(
     nowcast_tstar_start: int | None,
     nowcast_only_pre_event: int,
     nowcast_event_time_proxy: str,
+    use_wandb: bool,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+    wandb_group: str | None,
+    wandb_run_name: str | None,
+    wandb_tags: str | None,
+    wandb_job_type: str | None,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -272,6 +358,34 @@ def main(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+
+    wandb_run = init_wandb_run(
+        use_wandb=use_wandb,
+        project=wandb_project or WANDB_PROJECT_DEFAULT,
+        entity=wandb_entity or WANDB_ENTITY_DEFAULT,
+        run_name=wandb_run_name,
+        group=wandb_group,
+        job_type=wandb_job_type,
+        tags=parse_tags(wandb_tags) + [f"pest:{pest}", "script:run_event_train"],
+        config={
+            "pest": pest,
+            "run": run,
+            "split_seed": int(split_seed),
+            "model": model,
+            "task_mode": task_mode,
+            "nowcast_window": int(nowcast_window),
+            "nowcast_stride": int(nowcast_stride),
+            "nowcast_tstar_start": None if nowcast_tstar_start is None else int(nowcast_tstar_start),
+            "nowcast_only_pre_event": int(nowcast_only_pre_event),
+            "nowcast_event_time_proxy": nowcast_event_time_proxy,
+            "lr": float(C.LR),
+            "weight_decay": float(C.WEIGHT_DECAY),
+            "dropout": float(C.DROPOUT),
+            "max_epochs": int(max_epochs),
+            "patience": int(patience),
+            "pos_weight": float(event_pos_weight),
+        },
+    )
 
     feature_cols, feature_names, T, samples = build_samples_for_run(run, get_feature_cols)
     print(f"[features] n={len(feature_names)} head={feature_names[:5]} tail={feature_names[-5:]}")
@@ -390,6 +504,27 @@ def main(
                 tr = run_epoch_event(model_obj, train_loader, device=device, train=True, opt=opt, pos_weight=event_pos_weight)
                 va = run_epoch_event(model_obj, val_loader, device=device, train=False, pos_weight=event_pos_weight)
                 print(f"[seed {SEED}] epoch {epoch:02d} | train_bce {tr:.4f} | val_bce {va:.4f}")
+                if wandb_run is not None:
+                    p_val, y_val = predict_event_prob_and_labels(model_obj, val_loader, device=device)
+                    val_auroc = auc_roc_binary(y_val, p_val)
+                    val_auprc = pr_auc_binary(y_val, p_val)
+                    val_prec, val_rec, val_f1 = pr_at_tau(y_val, p_val, tau=0.5)
+                    val_pred_rate = float((p_val >= 0.5).mean()) if p_val.size else float("nan")
+                    wandb_run.log(
+                        {
+                            "seed": int(SEED),
+                            "epoch": int(epoch),
+                            "train/bce": float(tr),
+                            "val/bce": float(va),
+                            "val/auroc": float(val_auroc),
+                            "val/auprc": float(val_auprc),
+                            "val/precision@0.5": float(val_prec),
+                            "val/recall@0.5": float(val_rec),
+                            "val/f1@0.5": float(val_f1),
+                            "val/pred_pos_rate@0.5": float(val_pred_rate),
+                        },
+                        step=int(epoch),
+                    )
                 if va < best_val - min_delta:
                     best_val = float(va)
                     best_epoch = epoch
@@ -470,6 +605,25 @@ def main(
             eps = 1e-8
             p_va = np.clip(p_va, eps, 1.0 - eps)
             best_val = float(-np.mean(y_va * np.log(p_va) + (1.0 - y_va) * np.log(1.0 - p_va)))
+            if wandb_run is not None:
+                val_auroc = auc_roc_binary(y_va, p_va)
+                val_auprc = pr_auc_binary(y_va, p_va)
+                val_prec, val_rec, val_f1 = pr_at_tau(y_va, p_va, tau=0.5)
+                val_pred_rate = float((p_va >= 0.5).mean()) if p_va.size else float("nan")
+                wandb_run.log(
+                    {
+                        "seed": int(SEED),
+                        "epoch": 1,
+                        "val/bce": float(best_val),
+                        "val/auroc": float(val_auroc),
+                        "val/auprc": float(val_auprc),
+                        "val/precision@0.5": float(val_prec),
+                        "val/recall@0.5": float(val_rec),
+                        "val/f1@0.5": float(val_f1),
+                        "val/pred_pos_rate@0.5": float(val_pred_rate),
+                    },
+                    step=1,
+                )
 
             trained_states.append(
                 {
@@ -512,6 +666,7 @@ def main(
     out_path_resolved = resolve_out_path(run, out_root, out_path)
     torch.save(bundle, out_path_resolved)
     print("saved:", out_path_resolved)
+    finish_wandb_run(wandb_run)
 
 
 if __name__ == "__main__":
@@ -543,6 +698,13 @@ if __name__ == "__main__":
     p.add_argument("--nowcast_tstar_start", type=int, default=None)
     p.add_argument("--nowcast_only_pre_event", type=int, default=1)
     p.add_argument("--nowcast_event_time_proxy", type=str, default="r", choices=["r", "mid"])
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default=None)
+    p.add_argument("--wandb_entity", type=str, default=None)
+    p.add_argument("--wandb_group", type=str, default=None)
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--wandb_tags", type=str, default=None)
+    p.add_argument("--wandb_job_type", type=str, default=None)
     args = p.parse_args()
     main(
         pest=args.pest,
@@ -572,4 +734,11 @@ if __name__ == "__main__":
         nowcast_tstar_start=args.nowcast_tstar_start,
         nowcast_only_pre_event=args.nowcast_only_pre_event,
         nowcast_event_time_proxy=args.nowcast_event_time_proxy,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_group=args.wandb_group,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=args.wandb_tags,
+        wandb_job_type=args.wandb_job_type,
     )

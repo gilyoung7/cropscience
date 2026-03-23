@@ -14,7 +14,6 @@ from rice.configs.base import (
 # Values below are expected to be overridden by --pest config.
 # -----------------------------
 PATH_OBS = None
-GDD_DIR = None
 
 COUNT_COL = "obs_value"
 THRESHOLD = 0.0
@@ -28,6 +27,7 @@ SPLIT_SEED = 42
 LEFT_WINDOW_DAYS = 15
 
 # DataLoader defaults (can be overridden by pest config via apply_pest_config).
+# NOTE: temporarily reduced for stride=1 experiments to avoid OOM.
 BATCH_TRAIN = 64
 BATCH_EVAL = 128
 NUM_WORKERS = 4

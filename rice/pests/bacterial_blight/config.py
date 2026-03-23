@@ -3,7 +3,6 @@ from rice.configs.base import PATH_DAILY, YEAR_MAX
 
 PATH_OBS = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_흰잎마름병.csv")
 PEST_SLUG = "bacterial_blight"
-GDD_DIR = None
 
 COUNT_COL = "obs_value"
 THRESHOLD = 0.0
@@ -11,6 +10,7 @@ PEST_COL = "pest"
 TARGET_PEST = "흰잎마름병"
 LABEL_COL = "label_event"
 APPLY_PEST_FILTER = False
+YEAR_MIN = 2002
 
 SEASON_START_DOY = 1
 SEASON_END_DOY = 365

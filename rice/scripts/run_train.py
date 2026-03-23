@@ -14,7 +14,13 @@ from torch.utils.data import WeightedRandomSampler
 
 from rice.configs import config as C
 from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
-from rice.scripts.common import make_loader, parse_seed_candidates
+from rice.scripts.common import (
+    make_loader,
+    parse_seed_candidates,
+    parse_tags,
+    init_wandb_run,
+    finish_wandb_run,
+)
 from rice.src.data_pipeline import (
     load_daily_preprocessed,
     load_obs,
@@ -43,6 +49,7 @@ from rice.src.train_eval import run_epoch_weighted, eval_nll_model, eval_metrics
 DEBUG_LOADER_SETTINGS = False
 DEBUG_PICKLE_DATASET = True
 DEBUG_SAMPLE_CHECK = True
+WANDB_ENTITY_DEFAULT = "gilyoung7-seoul-national-university"
 
 def _split_stats(samples: list[dict]) -> dict:
     sites = {s["site_id"] for s in samples}
@@ -174,6 +181,13 @@ def main(
     stage2_nowcast_tstar_start: int | None,
     stage2_nowcast_only_pre_event: int,
     stage2_nowcast_event_time_proxy: str,
+    use_wandb: bool,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+    wandb_group: str | None,
+    wandb_run_name: str | None,
+    wandb_tags: str | None,
+    wandb_job_type: str | None,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -194,11 +208,32 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
+    wandb_run = init_wandb_run(
+        use_wandb=use_wandb,
+        project=wandb_project,
+        entity=wandb_entity,
+        run_name=wandb_run_name,
+        group=wandb_group,
+        job_type=wandb_job_type,
+        tags=parse_tags(wandb_tags) + [f"pest:{pest}", "script:run_train"],
+        config={
+            "pest": pest,
+            "run": run,
+            "split_seed": split_seed,
+            "stage2_nowcast": bool(stage2_nowcast),
+            "stage2_nowcast_window": int(stage2_nowcast_window),
+            "stage2_nowcast_stride": int(stage2_nowcast_stride),
+            "stage2_nowcast_tstar_start": None if stage2_nowcast_tstar_start is None else int(stage2_nowcast_tstar_start),
+            "stage2_nowcast_only_pre_event": int(stage2_nowcast_only_pre_event),
+            "stage2_nowcast_event_time_proxy": stage2_nowcast_event_time_proxy,
+        },
+    )
+
     # =========================
     # 1) DAILY: load + GDD merge + rolling
     # =========================
     t0 = time.perf_counter()
-    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
+    daily = load_daily_preprocessed(C.PATH_DAILY)
     print(f"[time] load_daily+gdd+roll={time.perf_counter()-t0:.2f}s")
 
     # =========================
@@ -332,7 +367,7 @@ def main(
         print(
             f"[stage2_nowcast] window={stage2_nowcast_window} stride={stage2_nowcast_stride} "
             f"tstar_start={stage2_nowcast_tstar_start} only_pre_event={bool(stage2_nowcast_only_pre_event)} "
-            f"event_time_proxy={stage2_nowcast_event_time_proxy} | "
+            f"event_time_proxy={stage2_nowcast_event_time_proxy} label_mode=orig | "
             f"samples train={len(train_s)} val={len(val_s)} test={len(test_s)}"
         )
         def _bucket_counts(ss: list[dict]) -> dict[str, int]:
@@ -490,7 +525,7 @@ def main(
         pat = 0
 
         for epoch in range(1, C.MAX_EPOCHS + 1):
-            tr, tr_base, tr_mass, tr_late = run_epoch_weighted(
+            tr, tr_base, tr_mass, tr_late, tr_right_frac = run_epoch_weighted(
                 model,
                 opt,
                 train_loader,
@@ -521,8 +556,29 @@ def main(
                 va = float("inf")
             print(
                 f"[seed {SEED}] epoch {epoch:02d} | train_total {tr:.4f} | train_base {tr_base:.4f} "
-                f"| train_mass {tr_mass:.4f} | train_late {tr_late:.4f} | val_nll {va:.4f} | val_iou80 {va_iou:.4f}"
+                f"| train_mass {tr_mass:.4f} | train_late {tr_late:.4f} | train_right_frac {tr_right_frac:.4f} "
+                f"| val_nll {va:.4f} | val_iou80 {va_iou:.4f}"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "seed": int(SEED),
+                        "epoch": int(epoch),
+                        "train/loss": float(tr),
+                        "train/total_loss": float(tr),
+                        "train/base_loss": float(tr_base),
+                        "train/mass_loss": float(tr_mass),
+                        "train/late_loss": float(tr_late),
+                        "train/late_loss_mean": float(tr_late),
+                        "train/right_frac": float(tr_right_frac),
+                        "train/lr": float(opt.param_groups[0]["lr"]),
+                        "val/loss": float(va),
+                        "val/nll": float(va),
+                        "val/iou80_interval_only": float(va_iou),
+                    },
+                    step=int(epoch),
+                )
+                pass
 
             improved_iou = va_iou > (best_val_iou + C.MIN_DELTA)
             tie_iou_better_nll = (abs(va_iou - best_val_iou) <= C.MIN_DELTA) and (va < best_val - C.MIN_DELTA)
@@ -553,6 +609,15 @@ def main(
             f"[seed {SEED}] DONE | best_epoch={best_epoch} | "
             f"best_val_iou80={best_val_iou:.4f} | best_val_nll={best_val:.4f}\n"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "seed": int(SEED),
+                    "best/best_epoch": int(best_epoch),
+                    "best/best_val_nll": float(best_val),
+                    "best/best_val_iou80": float(best_val_iou),
+                }
+            )
 
     # =========================
     # 10) Save checkpoint bundle
@@ -575,6 +640,7 @@ def main(
         "stage2_nowcast_tstar_start": None if stage2_nowcast_tstar_start is None else int(stage2_nowcast_tstar_start),
         "stage2_nowcast_only_pre_event": int(stage2_nowcast_only_pre_event),
         "stage2_nowcast_event_time_proxy": stage2_nowcast_event_time_proxy,
+        "stage2_nowcast_label_mode": "orig",
         "norm_mean": x_mean,
         "norm_std": x_std,
         "trained_states": trained_states,
@@ -583,6 +649,17 @@ def main(
     out_path_resolved = resolve_out_path(run, out_root, out_path)
     torch.save(bundle, out_path_resolved)
     print("saved:", out_path_resolved)
+    if wandb_run is not None:
+        best_val_nlls = np.asarray([float(x["best_val_nll"]) for x in trained_states], dtype=float)
+        best_val_iou80s = np.asarray([float(x["best_val_iou80"]) for x in trained_states], dtype=float)
+        wandb_run.summary["best_val_nll_mean"] = float(best_val_nlls.mean())
+        wandb_run.summary["best_val_nll_std"] = float(best_val_nlls.std(ddof=1) if best_val_nlls.size > 1 else 0.0)
+        wandb_run.summary["best_val_iou80_mean"] = float(best_val_iou80s.mean())
+        wandb_run.summary["best_val_iou80_std"] = float(best_val_iou80s.std(ddof=1) if best_val_iou80s.size > 1 else 0.0)
+        wandb_run.summary["checkpoint_path"] = str(out_path_resolved)
+        wandb_run.summary["n_train_seeds"] = int(len(trained_states))
+        wandb_run.save(str(out_path_resolved), policy="now")
+    finish_wandb_run(wandb_run)
 
 
 if __name__ == "__main__":
@@ -622,6 +699,13 @@ if __name__ == "__main__":
     p.add_argument("--nowcast_tstar_start", dest="stage2_nowcast_tstar_start", type=int)
     p.add_argument("--nowcast_only_pre_event", dest="stage2_nowcast_only_pre_event", type=int)
     p.add_argument("--nowcast_event_time_proxy", dest="stage2_nowcast_event_time_proxy", type=str, choices=["r", "mid"])
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default="agro-rice")
+    p.add_argument("--wandb_entity", type=str, default=WANDB_ENTITY_DEFAULT)
+    p.add_argument("--wandb_group", type=str, default=None)
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--wandb_tags", type=str, default=None)
+    p.add_argument("--wandb_job_type", type=str, default="train")
     args = p.parse_args()
     main(
         args.pest,
@@ -653,4 +737,11 @@ if __name__ == "__main__":
         args.stage2_nowcast_tstar_start,
         args.stage2_nowcast_only_pre_event,
         args.stage2_nowcast_event_time_proxy,
+        args.use_wandb,
+        args.wandb_project,
+        args.wandb_entity,
+        args.wandb_group,
+        args.wandb_run_name,
+        args.wandb_tags,
+        args.wandb_job_type,
     )

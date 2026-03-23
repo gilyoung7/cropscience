@@ -53,7 +53,7 @@ def main(
     ensure_output_dirs(out_root)
 
     # 1) Build samples with same preprocessing path as train/eval.
-    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
+    daily = load_daily_preprocessed(C.PATH_DAILY)
     obs = load_obs(C.PATH_OBS)
     obs2 = aggregate_obs_daily_max(obs)
     labels = build_interval_labels_from_doy(

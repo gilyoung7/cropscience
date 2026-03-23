@@ -22,7 +22,7 @@ from rice.src.backward import backward_elimination
 
 
 def rebuild_train_df_season():
-    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
+    daily = load_daily_preprocessed(C.PATH_DAILY)
 
     obs = load_obs(C.PATH_OBS)
     obs2 = aggregate_obs_daily_max(obs)

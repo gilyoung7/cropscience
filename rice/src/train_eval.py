@@ -92,6 +92,7 @@ def run_epoch_weighted(
     base_total = 0.0
     mass_total = 0.0
     late_total = 0.0
+    mr_total = 0.0
     logged = False
     bad_batches = 0
     for X, L, R, ctype in loader:
@@ -109,10 +110,14 @@ def run_epoch_weighted(
         loss = base_loss
         mass_loss_tensor = None
         late_loss_tensor = None
+        mr = (ctype == 1)
+        mr_total += float(mr.float().sum().item())
 
         if train and log_mass and not logged:
             mi = (ctype == CTYPE_INTERVAL)
+            mr = (ctype == 1)
             mi_frac = float(mi.float().mean().item())
+            mr_frac = float(mr.float().mean().item())
             if mi.any():
                 _, _, logS = hazard_to_pmf_cdf_logS(hazard)
                 idxL = (torch.clamp(L, 1, Tend) - 1).long()
@@ -137,14 +142,34 @@ def run_epoch_weighted(
                 mass_loss_requires_grad = False
                 mass_loss_grad_fn = "None"
                 logS_requires_grad = False
+            # late-loss diagnostics (right-censored only)
+            late_mean = float("nan")
+            late_min = float("nan")
+            late_max = float("nan")
+            late_loss_val = 0.0
+            if mr.any() and (lambda_right_late > 0) and (right_late_tau is not None):
+                pmf, _, logS_l = hazard_to_pmf_cdf_logS(hazard)
+                t = torch.arange(1, Tend + 1, device=hazard.device, dtype=pmf.dtype).view(1, -1)
+                exp_doy = (pmf * t).sum(dim=1) + torch.exp(logS_l[:, -1]) * float(Tend)
+                late_margin = torch.relu(exp_doy[mr] - float(right_late_tau))
+                if late_margin.numel() > 0:
+                    late_mean = float(late_margin.mean().item())
+                    late_min = float(late_margin.min().item())
+                    late_max = float(late_margin.max().item())
+                    late_loss_val = float(late_mean)
             prefix = f"[mass] epoch {epoch_idx:02d} " if epoch_idx is not None else "[mass] "
             print(
                 prefix
-                + f"mi_frac={mi_frac:.4f} mass_mean={mass_mean:.6f} "
+                + f"mi_frac={mi_frac:.4f} mr_frac={mr_frac:.4f} mass_mean={mass_mean:.6f} "
                 + f"mass_min={mass_min:.6f} mass_max={mass_max:.6f} "
                 + f"mass_loss={mass_loss_val:.6f} lambda_mass={lambda_mass} "
                 + f"mass_loss_requires_grad={mass_loss_requires_grad} "
                 + f"mass_loss_grad_fn={mass_loss_grad_fn}"
+            )
+            print(
+                prefix
+                + f"late_loss_mean={late_loss_val:.6f} late_min={late_min:.6f} late_max={late_max:.6f} "
+                + f"lambda_right_late={lambda_right_late} right_late_tau={right_late_tau}"
             )
             if epoch_idx == 1:
                 print(
@@ -215,7 +240,8 @@ def run_epoch_weighted(
         base_avg = base_total / max(n, 1)
         mass_avg = mass_total / max(n, 1)
         late_avg = late_total / max(n, 1)
-        return total_avg, base_avg, mass_avg, late_avg
+        right_frac = mr_total / max(n, 1)
+        return total_avg, base_avg, mass_avg, late_avg, right_frac
     return total_avg
 
 
@@ -257,18 +283,22 @@ def quantile_from_cdf_1d(cdf_1d, q, Tend):
     return int(np.searchsorted(cdf_1d, q) + 1)  # 1..T
 
 
-def shortest_mass_interval_1d(pmf_1d, target_mass, Tend):
+def shortest_mass_interval_1d(pmf_1d, target_mass, Tend, normalize: bool = True):
     """
     Find shortest contiguous [L,R] (1-indexed, inclusive) with mass >= target_mass.
     Tie-breaker: earlier L (smaller start index).
-    Fallback: [1, Tend] when total mass < target_mass or no valid window.
+    Fallback: [1, Tend] when total mass <= 0 or no valid window.
+    If normalize=True, pmf is renormalized to sum to 1 (conditional on event in horizon).
     """
     p = np.asarray(pmf_1d, dtype=float)
     p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
     p = np.clip(p, 0.0, None)
     total_mass = float(p.sum())
-    if total_mass < float(target_mass):
+    if total_mass <= 0.0:
         return 1, int(Tend), True
+    if normalize:
+        p = p / total_mass
+        total_mass = 1.0
 
     a = 0
     cum = 0.0

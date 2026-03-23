@@ -3,7 +3,6 @@ from rice.configs.base import PATH_DAILY, YEAR_MAX
 
 PATH_OBS = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_<pest_name>.csv")
 PEST_SLUG = "<pest_slug>"
-GDD_DIR = None
 
 COUNT_COL = "obs_value"
 THRESHOLD = 0.0

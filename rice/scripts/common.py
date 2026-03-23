@@ -47,3 +47,44 @@ def parse_seed_candidates(raw: str | None) -> list[int] | None:
         start_s, end_s = raw.split(":", 1)
         return list(range(int(start_s), int(end_s)))
     return [int(x) for x in raw.split(",") if x.strip()]
+
+
+def parse_tags(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def init_wandb_run(
+    use_wandb: bool,
+    project: str | None,
+    entity: str | None,
+    run_name: str | None,
+    group: str | None,
+    job_type: str | None,
+    tags: list[str] | None,
+    config: dict | None,
+):
+    if not use_wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as e:
+        raise RuntimeError(
+            "W&B logging requested but `wandb` is not installed. "
+            "Install with `pip install wandb`."
+        ) from e
+    return wandb.init(
+        project=project,
+        entity=entity,
+        name=run_name,
+        group=group,
+        job_type=job_type,
+        tags=tags or None,
+        config=config or None,
+    )
+
+
+def finish_wandb_run(wandb_run):
+    if wandb_run is not None:
+        wandb_run.finish()

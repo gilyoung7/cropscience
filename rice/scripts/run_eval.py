@@ -9,7 +9,13 @@ import torch
 
 from rice.configs import config as C
 from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
-from rice.scripts.common import make_loader, parse_seed_candidates
+from rice.scripts.common import (
+    make_loader,
+    parse_seed_candidates,
+    parse_tags,
+    init_wandb_run,
+    finish_wandb_run,
+)
 from rice.src.data_pipeline import (
     load_daily_preprocessed,
     load_obs,
@@ -33,7 +39,16 @@ from rice.src.dataset import (
 )
 from rice.src.ckpt_schema import validate_ckpt_meta
 from rice.src.model import HazardTransformer
-from rice.src.train_eval import eval_nll_model, eval_metrics_with_overlap
+from rice.src.train_eval import (
+    CTYPE_INTERVAL,
+    eval_nll_model,
+    eval_metrics_with_overlap,
+    hazard_to_pmf_cdf_logS,
+    quantile_from_cdf_1d,
+    shortest_mass_interval_1d,
+)
+
+WANDB_ENTITY_DEFAULT = "gilyoung7-seoul-national-university"
 
 def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool = False):
     """
@@ -41,7 +56,7 @@ def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool =
     Norm stats are recomputed from train split.
     """
     # DAILY
-    daily = load_daily_preprocessed(C.PATH_DAILY, C.GDD_DIR)
+    daily = load_daily_preprocessed(C.PATH_DAILY)
 
     # OBS
     obs = load_obs(C.PATH_OBS)
@@ -92,6 +107,312 @@ def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool =
 def mean_std(arr):
     arr = np.asarray(arr, dtype=float)
     return float(arr.mean()), float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+
+
+@torch.no_grad()
+def collect_interval_width_rows(
+    model,
+    loader,
+    source_samples: list[dict],
+    Tend: int,
+    device,
+    alpha: float = 0.2,
+    pi_method: str = "shortest",
+    sample_id_prefix: str = "",
+    seed: int | None = None,
+):
+    q_lo = alpha / 2
+    q_hi = 1 - alpha / 2
+    target_mass = 1.0 - float(alpha)
+    rows: list[dict] = []
+    sample_idx = 0
+
+    model.eval()
+    for X, L, R, ctype in loader:
+        X = X.to(device, non_blocking=True)
+        hazard = model(X)
+        pmf, cdf, _ = hazard_to_pmf_cdf_logS(hazard)
+
+        L_np = L.cpu().numpy().astype(int)
+        R_np = R.cpu().numpy().astype(int)
+        ctype_np = ctype.cpu().numpy().astype(int)
+        cdf_np = cdf.cpu().numpy()
+        pmf_np = pmf.cpu().numpy()
+
+        for b in range(len(L_np)):
+            if int(ctype_np[b]) != int(CTYPE_INTERVAL):
+                continue
+            if pi_method == "shortest":
+                pL, pR, _ = shortest_mass_interval_1d(pmf_np[b], target_mass=target_mass, Tend=Tend)
+            elif pi_method == "quantile":
+                pL = quantile_from_cdf_1d(cdf_np[b], q_lo, Tend)
+                pR = quantile_from_cdf_1d(cdf_np[b], q_hi, Tend)
+            else:
+                raise ValueError(f"Unknown pi_method: {pi_method}. expected 'shortest' or 'quantile'")
+
+            pL = max(1, min(int(pL), int(Tend)))
+            pR = max(1, min(int(pR), int(Tend)))
+            if pL > pR:
+                pL, pR = pR, pL
+
+            true_l = int(L_np[b])
+            true_r = int(R_np[b])
+            pred_width = int(pR - pL)
+            true_width = int(true_r - true_l)
+            pred_mid = float((pL + pR) / 2.0)
+            true_mid = float((true_l + true_r) / 2.0)
+            abs_mid_error = float(abs(pred_mid - true_mid))
+            overlap_left = max(pL, true_l)
+            overlap_right = min(pR, true_r)
+            overlap_len = int(max(0, overlap_right - overlap_left))
+            union_left = min(pL, true_l)
+            union_right = max(pR, true_r)
+            union_len = float(max(0, union_right - union_left))
+            if union_len > 0:
+                overlap_ratio = float(overlap_len / union_len)
+            else:
+                overlap_ratio = 1.0 if (pL == true_l and pR == true_r) else 0.0
+
+            sidx = sample_idx + b
+            sample_meta = source_samples[sidx] if sidx < len(source_samples) else {}
+            site = sample_meta.get("site_id")
+            year = sample_meta.get("year")
+
+            if site is not None and year is not None:
+                sample_id = f"{site}-{int(year)}"
+            else:
+                sample_id = f"{int(sidx)}"
+
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "sample_idx": int(sidx),
+                    "seed": None if seed is None else int(seed),
+                    "site": None if site is None else str(site),
+                    "year": None if year is None else int(year),
+                    "pred_l": int(pL),
+                    "pred_r": int(pR),
+                    "true_l": int(true_l),
+                    "true_r": int(true_r),
+                    "pred_width": int(pred_width),
+                    "true_width": int(true_width),
+                    "pred_mid": float(pred_mid),
+                    "true_mid": float(true_mid),
+                    "abs_mid_error": float(abs_mid_error),
+                    "overlap_len": int(overlap_len),
+                    "overlap_ratio": float(overlap_ratio),
+                    "pmf": pmf_np[b].astype(float).tolist(),
+                }
+            )
+        sample_idx += len(L_np)
+    return rows
+
+
+def log_interval_width_diagnostics_to_wandb(wandb_run, rows: list[dict]):
+    if wandb_run is None or not rows:
+        return
+    import wandb
+    import matplotlib.pyplot as plt
+
+    pred_width = np.asarray([r["pred_width"] for r in rows], dtype=float)
+    true_width = np.asarray([r["true_width"] for r in rows], dtype=float)
+    abs_mid_error = np.asarray([r["abs_mid_error"] for r in rows], dtype=float)
+
+    wandb_run.summary["mean_pred_interval_width"] = float(np.mean(pred_width))
+    wandb_run.summary["median_pred_interval_width"] = float(np.median(pred_width))
+    wandb_run.summary["mean_true_interval_width"] = float(np.mean(true_width))
+    wandb_run.summary["median_true_interval_width"] = float(np.median(true_width))
+    wandb_run.summary["mean_abs_mid_error"] = float(np.mean(abs_mid_error))
+
+    table_cols = [
+        "sample_id",
+        "sample_idx",
+        "seed",
+        "site",
+        "year",
+        "pred_l",
+        "pred_r",
+        "true_l",
+        "true_r",
+        "pred_width",
+        "true_width",
+        "pred_mid",
+        "true_mid",
+        "abs_mid_error",
+    ]
+    table_data = [[r[c] for c in table_cols] for r in rows]
+    table = wandb.Table(columns=table_cols, data=table_data)
+    wandb_run.log({"eval/interval_width_table": table})
+
+    def _label_for_row(r: dict) -> str:
+        site = r.get("site")
+        year = r.get("year")
+        if site is not None and year is not None:
+            return f"{site}-{year}"
+        return str(r.get("sample_id"))
+
+    grouped: dict[str, dict] = {}
+    for r in rows:
+        skey = str(r["sample_id"])
+        g = grouped.setdefault(
+            skey,
+            {
+                "sample_id": skey,
+                "sample_idx": int(r.get("sample_idx", -1)),
+                "site": r.get("site"),
+                "year": r.get("year"),
+                "true_l": int(r["true_l"]),
+                "true_r": int(r["true_r"]),
+                "rows_by_seed": {},
+            },
+        )
+        g["rows_by_seed"][int(r["seed"])] = r
+
+    if not grouped:
+        return
+
+    seeds = sorted({int(r["seed"]) for r in rows if r.get("seed") is not None})
+    if not seeds:
+        return
+
+    sample_stats = []
+    for skey, g in grouped.items():
+        seed_rows = list(g["rows_by_seed"].values())
+        ov = np.asarray([float(x["overlap_ratio"]) for x in seed_rows], dtype=float)
+        ae = np.asarray([float(x["abs_mid_error"]) for x in seed_rows], dtype=float)
+        sample_stats.append(
+            {
+                "sample_id": str(skey),
+                "min_overlap_ratio": float(np.min(ov)),
+                "mean_overlap_ratio": float(np.mean(ov)),
+                "max_overlap_ratio": float(np.max(ov)),
+                "mean_abs_mid_error": float(np.mean(ae)),
+            }
+        )
+
+    def _sample_label(g: dict) -> str:
+        if g.get("site") is not None and g.get("year") is not None:
+            return f"{g['site']}-{g['year']}"
+        return f"sample_{g['sample_id']}"
+
+    def _plot_interval_comparison_by_sample_ids(selected_sample_ids: list[str], title: str):
+        if not selected_sample_ids:
+            return None
+        n = len(selected_sample_ids)
+        fig_h = max(6.0, min(18.0, 0.35 * n + 1.5))
+        fig, ax = plt.subplots(figsize=(12, fig_h))
+
+        colors = plt.cm.get_cmap("tab10", max(len(seeds), 3))
+        offsets = np.linspace(-0.20, 0.20, num=len(seeds)) if len(seeds) > 1 else np.array([0.0])
+
+        yticks = []
+        ylabels = []
+        for i, skey in enumerate(selected_sample_ids):
+            g = grouped[skey]
+            y = i + 1
+            y_true = y - 0.30
+            true_mid = (int(g["true_l"]) + int(g["true_r"])) / 2.0
+            ax.hlines(y_true, xmin=g["true_l"], xmax=g["true_r"], color="black", linewidth=2.5)
+            ax.plot(true_mid, y_true, "o", color="black", markersize=3)
+
+            for j, sd in enumerate(seeds):
+                rr = g["rows_by_seed"].get(int(sd))
+                if rr is None:
+                    continue
+                y_pred = y + float(offsets[j])
+                c = colors(j)
+                ax.hlines(y_pred, xmin=rr["pred_l"], xmax=rr["pred_r"], color=c, linewidth=2)
+                ax.plot(rr["pred_mid"], y_pred, "o", color=c, markersize=3)
+
+            yticks.append(y)
+            ylabels.append(_sample_label(g))
+
+        ax.set_xlabel("timestep")
+        ax.set_ylabel("sample")
+        ax.set_title(f"{title} | seeds={seeds}")
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels, fontsize=7)
+        ax.grid(axis="x", alpha=0.25)
+        ax.invert_yaxis()
+
+        from matplotlib.lines import Line2D
+        handles = [Line2D([0], [0], color="black", lw=2.5, label="true interval")]
+        for j, sd in enumerate(seeds):
+            handles.append(Line2D([0], [0], color=colors(j), lw=2, label=f"pred seed {sd}"))
+        ax.legend(
+            handles=handles,
+            loc="best",
+        )
+        fig.tight_layout()
+        return fig
+
+    def _plot_pmf_by_sample_ids(selected_sample_ids: list[str], title: str, max_samples: int = 5):
+        if not selected_sample_ids:
+            return None
+        picked = selected_sample_ids[:max_samples]
+        n = len(picked)
+        fig, axes = plt.subplots(n, 1, figsize=(12, max(2.5 * n, 4.0)), sharex=True)
+        if n == 1:
+            axes = [axes]
+        colors = plt.cm.get_cmap("tab10", max(len(seeds), 3))
+
+        for i, skey in enumerate(picked):
+            g = grouped[skey]
+            ax = axes[i]
+            ax.axvspan(g["true_l"], g["true_r"], color="gray", alpha=0.20, label="true interval")
+            for j, sd in enumerate(seeds):
+                rr = g["rows_by_seed"].get(int(sd))
+                if rr is None:
+                    continue
+                pmf = np.asarray(rr.get("pmf", []), dtype=float)
+                if pmf.size == 0:
+                    continue
+                x = np.arange(1, pmf.size + 1)
+                ax.plot(x, pmf, color=colors(j), lw=1.2, label=f"seed {sd}")
+            ax.set_ylabel("pmf")
+            ax.set_title(_sample_label(g))
+            ax.grid(axis="x", alpha=0.2)
+            if i == 0:
+                ax.legend(loc="upper right", fontsize=8)
+        axes[-1].set_xlabel("timestep")
+        fig.suptitle(f"{title} | seeds={seeds}", y=0.98)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.subplots_adjust(top=0.90)
+        return fig
+
+    for k_target in (50, 5):
+        k = min(k_target, len(sample_stats))
+        if k <= 0:
+            continue
+
+        top = sorted(
+            sample_stats,
+            key=lambda x: (float(x["min_overlap_ratio"]), -float(x["mean_abs_mid_error"])),
+            reverse=True,
+        )[:k]
+        top_ids = [str(x["sample_id"]) for x in top]
+        fig_top = _plot_interval_comparison_by_sample_ids(top_ids, f"Sample Interval Comparison (Top-{k} min_overlap)")
+        if fig_top is not None:
+            wandb_run.log({f"eval/sample_interval_comparison_top{k}": wandb.Image(fig_top)})
+            plt.close(fig_top)
+        fig_top_pmf = _plot_pmf_by_sample_ids(top_ids, f"Sample PMF Comparison (Top-{k} min_overlap)")
+        if fig_top_pmf is not None:
+            wandb_run.log({f"eval/sample_pmf_comparison_top{min(k,5)}": wandb.Image(fig_top_pmf)})
+            plt.close(fig_top_pmf)
+
+        worst = sorted(
+            sample_stats,
+            key=lambda x: (float(x["min_overlap_ratio"]), float(x["mean_abs_mid_error"])),
+        )[:k]
+        worst_ids = [str(x["sample_id"]) for x in worst]
+        fig_worst = _plot_interval_comparison_by_sample_ids(worst_ids, f"Sample Interval Comparison (Worst-{k} min_overlap)")
+        if fig_worst is not None:
+            wandb_run.log({f"eval/sample_interval_comparison_worst{k}": wandb.Image(fig_worst)})
+            plt.close(fig_worst)
+        fig_worst_pmf = _plot_pmf_by_sample_ids(worst_ids, f"Sample PMF Comparison (Worst-{k} min_overlap)")
+        if fig_worst_pmf is not None:
+            wandb_run.log({f"eval/sample_pmf_comparison_worst{min(k,5)}": wandb.Image(fig_worst_pmf)})
+            plt.close(fig_worst_pmf)
 
 
 def resolve_ckpt_path(run: int, out_root: str, ckpt_path: str | None) -> Path:
@@ -155,6 +476,13 @@ def main(
     stage2_nowcast_tstar_start: int | None,
     stage2_nowcast_only_pre_event: int,
     stage2_nowcast_event_time_proxy: str,
+    use_wandb: bool,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+    wandb_group: str | None,
+    wandb_run_name: str | None,
+    wandb_tags: str | None,
+    wandb_job_type: str | None,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -163,6 +491,26 @@ def main(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+    wandb_run = init_wandb_run(
+        use_wandb=use_wandb,
+        project=wandb_project,
+        entity=wandb_entity,
+        run_name=wandb_run_name,
+        group=wandb_group,
+        job_type=wandb_job_type,
+        tags=parse_tags(wandb_tags) + [f"pest:{pest}", "script:run_eval"],
+        config={
+            "pest": pest,
+            "run": run,
+            "split_seed": split_seed,
+            "stage2_nowcast": bool(stage2_nowcast),
+            "stage2_nowcast_window": int(stage2_nowcast_window),
+            "stage2_nowcast_stride": int(stage2_nowcast_stride),
+            "stage2_nowcast_tstar_start": None if stage2_nowcast_tstar_start is None else int(stage2_nowcast_tstar_start),
+            "stage2_nowcast_only_pre_event": int(stage2_nowcast_only_pre_event),
+            "stage2_nowcast_event_time_proxy": stage2_nowcast_event_time_proxy,
+        },
+    )
 
     ckpt_path_resolved = resolve_ckpt_path(run, out_root, ckpt_path)
     print(f"Using checkpoint: {ckpt_path_resolved}")
@@ -248,7 +596,7 @@ def main(
         print(
             f"[stage2_nowcast] window={stage2_nowcast_window} stride={stage2_nowcast_stride} "
             f"tstar_start={stage2_nowcast_tstar_start} only_pre_event={bool(stage2_nowcast_only_pre_event)} "
-            f"event_time_proxy={stage2_nowcast_event_time_proxy} | "
+            f"event_time_proxy={stage2_nowcast_event_time_proxy} label_mode=orig | "
             f"samples train={len(train_s)} val={len(val_s)} test={len(test_s)}"
         )
         def _bucket_counts(ss: list[dict]) -> dict[str, int]:
@@ -287,6 +635,7 @@ def main(
 
     records = []
     by_tstar_rows = []
+    interval_width_rows = []
     for d in trained_states:
         seed = int(d["seed"])
         if seeds is not None and seed not in seeds:
@@ -337,6 +686,35 @@ def main(
             "TEST_N_int": int(test_stats["N_interval_samples"]),
         }
         records.append(rec)
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "seed": int(seed),
+                    "eval/val_nll": float(val_nll),
+                    "eval/test_nll": float(test_nll),
+                    "eval/test_iou80_interval_only": float(rec["TEST_IoU80(interval_only)"]),
+                    "eval/test_prec80_interval_only": float(rec["TEST_Prec80(interval_only)"]),
+                    "eval/test_rec80_interval_only": float(rec["TEST_Rec80(interval_only)"]),
+                    "eval/test_mae_int_interval_only": float(rec["TEST_MAE_int(interval_only)"]),
+                    "eval/test_mass_int_interval_only": float(rec["TEST_Mass_int(interval_only)"]),
+                    "eval/test_n_interval": int(rec["TEST_N_int"]),
+                    "eval/best_epoch": int(rec["best_epoch"]),
+                    "eval/best_val_nll_from_ckpt": float(rec["best_val_nll"]),
+                }
+            )
+            interval_width_rows.extend(
+                collect_interval_width_rows(
+                    model=model,
+                    loader=test_loader,
+                    source_samples=test_s,
+                    Tend=T,
+                    device=device,
+                    alpha=0.2,
+                    pi_method=getattr(C, "PI_METHOD", "shortest"),
+                    sample_id_prefix=f"seed{seed}_",
+                    seed=seed,
+                )
+            )
 
         if stage2_nowcast:
             for split_name, split_samples in (("val", val_s), ("test", test_s)):
@@ -393,17 +771,32 @@ def main(
     for col in cols:
         m, sd = mean_std(df[col].to_numpy())
         print(f"{col:>26s}: {m:.4f} ± {sd:.4f}")
+        if wandb_run is not None:
+            key = col.replace("(", "").replace(")", "").replace("%", "").replace(" ", "_")
+            wandb_run.summary[f"{key}_mean"] = float(m)
+            wandb_run.summary[f"{key}_std"] = float(sd)
     print("\nTEST interval-only N:", sorted(df["TEST_N_int"].unique().tolist()))
+    if wandb_run is not None:
+        wandb_run.summary["n_eval_seeds"] = int(len(df))
+        wandb_run.summary["test_n_int_unique"] = ",".join(map(str, sorted(df["TEST_N_int"].unique().tolist())))
+        log_interval_width_diagnostics_to_wandb(wandb_run, interval_width_rows)
 
     out_csv_resolved = resolve_out_csv(run, out_root, out_csv)
     if out_csv_resolved:
         df.to_csv(out_csv_resolved, index=False)
         print("saved:", out_csv_resolved)
+        if wandb_run is not None:
+            wandb_run.summary["eval_csv_path"] = str(out_csv_resolved)
+            wandb_run.save(str(out_csv_resolved), policy="now")
         if stage2_nowcast and by_tstar_rows:
             by_tstar_df = pd.DataFrame(by_tstar_rows).sort_values(["seed", "split", "tstar"]).reset_index(drop=True)
             by_tstar_out = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_by_tstar.csv"))
             by_tstar_df.to_csv(by_tstar_out, index=False)
             print("saved:", by_tstar_out)
+            if wandb_run is not None:
+                wandb_run.summary["eval_by_tstar_csv_path"] = str(by_tstar_out)
+                wandb_run.save(str(by_tstar_out), policy="now")
+    finish_wandb_run(wandb_run)
 
 
 if __name__ == "__main__":
@@ -435,6 +828,13 @@ if __name__ == "__main__":
     p.add_argument("--nowcast_tstar_start", dest="stage2_nowcast_tstar_start", type=int)
     p.add_argument("--nowcast_only_pre_event", dest="stage2_nowcast_only_pre_event", type=int)
     p.add_argument("--nowcast_event_time_proxy", dest="stage2_nowcast_event_time_proxy", type=str, choices=["r", "mid"])
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default="agro-rice")
+    p.add_argument("--wandb_entity", type=str, default=WANDB_ENTITY_DEFAULT)
+    p.add_argument("--wandb_group", type=str, default=None)
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--wandb_tags", type=str, default=None)
+    p.add_argument("--wandb_job_type", type=str, default="eval")
     args = p.parse_args()
     main(
         args.pest,
@@ -458,4 +858,11 @@ if __name__ == "__main__":
         args.stage2_nowcast_tstar_start,
         args.stage2_nowcast_only_pre_event,
         args.stage2_nowcast_event_time_proxy,
+        args.use_wandb,
+        args.wandb_project,
+        args.wandb_entity,
+        args.wandb_group,
+        args.wandb_run_name,
+        args.wandb_tags,
+        args.wandb_job_type,
     )

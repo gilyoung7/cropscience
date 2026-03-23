@@ -11,7 +11,7 @@ import torch
 
 from rice.configs import config as C
 from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
-from rice.scripts.common import make_loader, parse_seed_candidates
+from rice.scripts.common import make_loader, parse_seed_candidates, parse_tags, init_wandb_run, finish_wandb_run
 from rice.scripts.run_eval import build_samples_for_run
 from rice.src.dataset import (
     split_by_site,
@@ -29,6 +29,9 @@ from rice.scripts.run_event_train import (
     build_nowcast_samples,
     make_event_labels,
 )
+
+WANDB_ENTITY_DEFAULT = "gilyoung7-seoul-national-university"
+WANDB_PROJECT_DEFAULT = "agro-rice"
 
 
 def auc_roc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -176,6 +179,16 @@ def fp_rate_at_tau(y_true: np.ndarray, p: np.ndarray, tau: float) -> float:
     return float(fp / int(neg.sum()))
 
 
+def recall_at_tau(y_true: np.ndarray, p: np.ndarray, tau: float) -> float:
+    y = np.asarray(y_true, dtype=int)
+    pred = (p >= float(tau)).astype(int)
+    pos = (y == 1)
+    if int(pos.sum()) == 0:
+        return float("nan")
+    tp = int(((pred == 1) & pos).sum())
+    return float(tp / int(pos.sum()))
+
+
 def metrics_by_tstar(
     y_true: np.ndarray,
     p_raw: np.ndarray,
@@ -216,6 +229,118 @@ def metrics_by_tstar(
             }
         )
     return rows
+
+
+def compute_t_alert_start(
+    y_true: np.ndarray,
+    p_cal: np.ndarray,
+    tstar: np.ndarray,
+    tau: float,
+    pr_auc_min: float = 0.70,
+    fp_rate_max: float = 0.03,
+    recall_min: float = 0.55,
+    consecutive: int = 3,
+) -> int | None:
+    uniq = np.unique(tstar)
+    if uniq.size == 0:
+        return None
+    cond = []
+    for t in uniq:
+        m = (tstar == t)
+        y_t = y_true[m]
+        p_t = p_cal[m]
+        if y_t.size == 0:
+            cond.append(False)
+            continue
+        pr_auc = pr_auc_binary(y_t, p_t)
+        fp_rate = fp_rate_at_tau(y_t, p_t, tau)
+        rec = recall_at_tau(y_t, p_t, tau)
+        ok = (pr_auc >= pr_auc_min) and (fp_rate <= fp_rate_max) and (rec >= recall_min)
+        cond.append(ok)
+    cond = np.array(cond, dtype=bool)
+    if cond.size < consecutive:
+        return None
+    for i in range(cond.size - consecutive + 1):
+        if cond[i:i + consecutive].all():
+            return int(uniq[i])
+    return None
+
+
+def build_alert_rows(
+    samples: list[dict],
+    probs: np.ndarray,
+    tau: float,
+    split_name: str,
+    seed: int,
+    t_alert_start: int | None,
+) -> list[list]:
+    """
+    Build per-(site,year) rows with true interval [L,R] and earliest alert tstar.
+    """
+    rows_by_key = {}
+    for s, p in zip(samples, probs):
+        site = str(s.get("site_id", ""))
+        year = int(s.get("year", -1))
+        key = f"{site}-{year}"
+        rec = rows_by_key.get(key)
+        if rec is None:
+            rec = {
+                "sample_id": key,
+                "site": site,
+                "year": year,
+                "true_L": s.get("L"),
+                "true_R": s.get("R"),
+                "alert_tstar": None,
+            }
+            rows_by_key[key] = rec
+        tstar = int(s.get("tstar", -1))
+        if t_alert_start is not None and tstar < int(t_alert_start):
+            continue
+        if p >= float(tau):
+            tstar = int(s.get("tstar", -1))
+            if rec["alert_tstar"] is None or tstar < int(rec["alert_tstar"]):
+                rec["alert_tstar"] = tstar
+
+    rows = []
+    for rec in rows_by_key.values():
+        rows.append(
+            [
+                split_name,
+                int(seed),
+                rec["sample_id"],
+                rec["site"],
+                rec["year"],
+                rec["true_L"],
+                rec["true_R"],
+                rec["alert_tstar"],
+            ]
+        )
+    return rows
+
+
+def plot_alert_rows(rows: list[list], title: str, Tend: int):
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return None
+    n = min(len(rows), 25)
+    rows = rows[:n]
+    fig_h = max(2.0, 1.1 * n)
+    fig, axes = plt.subplots(n, 1, figsize=(10, fig_h), sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ax, r in zip(axes, rows):
+        # columns: split, seed, sample_id, site, year, true_L, true_R, alert_tstar
+        true_L, true_R, alert = r[5], r[6], r[7]
+        ax.hlines(0, true_L, true_R, color="black", lw=6, alpha=0.25, label="true interval")
+        if alert is not None:
+            ax.axvline(int(alert), color="tab:red", lw=1.2, ls="--", label="early warning t*")
+        ax.set_yticks([])
+        ax.set_xlim(1, Tend)
+        ax.set_title(str(r[2]))
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
 
 
 @torch.no_grad()
@@ -269,6 +394,13 @@ def main(
     tau_mode: str,
     tau_target_precision: float,
     tau_target_recall: float,
+    use_wandb: bool,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+    wandb_group: str | None,
+    wandb_run_name: str | None,
+    wandb_tags: str | None,
+    wandb_job_type: str | None,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -277,6 +409,24 @@ def main(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+
+    wandb_run = init_wandb_run(
+        use_wandb=use_wandb,
+        project=wandb_project or WANDB_PROJECT_DEFAULT,
+        entity=wandb_entity or WANDB_ENTITY_DEFAULT,
+        run_name=wandb_run_name,
+        group=wandb_group,
+        job_type=wandb_job_type,
+        tags=parse_tags(wandb_tags) + [f"pest:{pest}", "script:run_event_eval"],
+        config={
+            "pest": pest,
+            "run": run,
+            "split_seed": int(split_seed),
+            "tau_mode": tau_mode,
+            "tau_target_precision": float(tau_target_precision),
+            "tau_target_recall": float(tau_target_recall),
+        },
+    )
 
     ckpt_path_resolved = resolve_ckpt_path(run, out_root, ckpt_path)
     print(f"Using checkpoint: {ckpt_path_resolved}")
@@ -383,6 +533,7 @@ def main(
         elif site_id in split_sites["test"]:
             dropped_by_split["test"] += 1
     tstar_rows = []
+    alert_rows = []
     for d in trained_states:
         seed = int(d["seed"])
         if seeds is not None and seed not in seeds:
@@ -430,6 +581,9 @@ def main(
         if task_mode == "nowcast":
             tstar_rows.extend(metrics_by_tstar(y_val, p_val_raw, p_val_cal, tau, tstar_val, split_name="val", seed=seed))
             tstar_rows.extend(metrics_by_tstar(y_test, p_test_raw, p_test_cal, tau, tstar_test, split_name="test", seed=seed))
+            t_alert_start = compute_t_alert_start(y_val, p_val_cal, tstar_val, tau)
+            alert_rows.extend(build_alert_rows(val_s, p_val_cal, tau, split_name="val", seed=seed, t_alert_start=t_alert_start))
+            alert_rows.extend(build_alert_rows(test_s, p_test_cal, tau, split_name="test", seed=seed, t_alert_start=t_alert_start))
 
         records.append(
             {
@@ -486,6 +640,75 @@ def main(
             }
         )
 
+        if wandb_run is not None:
+            import wandb
+
+            val_pred_rate = float((p_val_cal >= tau).mean())
+            test_pred_rate = float((p_test_cal >= tau).mean())
+            val_prec_tau, val_rec_tau, val_f1_tau = pr_at_tau(y_val, p_val_cal, tau)
+            test_prec_tau, test_rec_tau, test_f1_tau = pr_at_tau(y_test, p_test_cal, tau)
+
+            wandb_run.log(
+                {
+                    "seed": int(seed),
+                    "val/auroc": float(auc_roc_binary(y_val, p_val_cal)),
+                    "val/auprc": float(pr_auc_binary(y_val, p_val_cal)),
+                    "val/precision@tau": float(val_prec_tau),
+                    "val/recall@tau": float(val_rec_tau),
+                    "val/f1@tau": float(val_f1_tau),
+                    "val/pred_pos_rate@tau": float(val_pred_rate),
+                    "val/nll": float(val_nll_cal),
+                    "test/auroc": float(auc_roc_binary(y_test, p_test_cal)),
+                    "test/auprc": float(pr_auc_binary(y_test, p_test_cal)),
+                    "test/precision@tau": float(test_prec_tau),
+                    "test/recall@tau": float(test_rec_tau),
+                    "test/f1@tau": float(test_f1_tau),
+                    "test/pred_pos_rate@tau": float(test_pred_rate),
+                    "test/nll": float(binary_nll(y_test, p_test_cal)),
+                }
+            )
+
+            # PR curve (test, calibrated)
+            try:
+                pr_curve = wandb.plot.pr_curve(
+                    y_true=y_test,
+                    y_probas=p_test_cal,
+                    labels=["neg", "pos"],
+                )
+                wandb_run.log({"test/pr_curve": pr_curve})
+            except Exception:
+                pass
+
+            # Probability histogram (test, calibrated)
+            wandb_run.log({"test/prob_hist": wandb.Histogram(p_test_cal)})
+
+            # Confusion matrix at tau (test)
+            pred_test = (p_test_cal >= float(tau)).astype(int)
+            try:
+                cm = wandb.plot.confusion_matrix(
+                    y_true=y_test,
+                    preds=pred_test,
+                    class_names=["neg", "pos"],
+                )
+                wandb_run.log({"test/confusion_matrix@tau": cm})
+            except Exception:
+                pass
+
+            # Threshold sweep (test, calibrated)
+            taus = np.linspace(0.05, 0.95, 181)
+            sweep_rows = []
+            for t in taus:
+                prec, rec, f1 = pr_at_tau(y_test, p_test_cal, float(t))
+                pred_rate = float((p_test_cal >= float(t)).mean())
+                sweep_rows.append([float(t), float(prec), float(rec), float(f1), pred_rate])
+            sweep_table = wandb.Table(columns=["tau", "precision", "recall", "f1", "pred_pos_rate"], data=sweep_rows)
+            wandb_run.log({"test/threshold_sweep": sweep_table})
+
+            if task_mode == "nowcast" and alert_rows:
+                alert_fig = plot_alert_rows(alert_rows, title="Alert vs True Interval (sample)", Tend=T)
+                if alert_fig is not None:
+                    wandb_run.log({"event/alert_vs_interval": wandb.Image(alert_fig)})
+
     df = pd.DataFrame(records).sort_values("seed").reset_index(drop=True)
     print("\n=== per-seed event eval ===")
     print(df.to_string(index=False))
@@ -522,6 +745,8 @@ def main(
         )
     print("saved:", out_json_resolved)
 
+    finish_wandb_run(wandb_run)
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -542,6 +767,13 @@ if __name__ == "__main__":
     p.add_argument("--tau_mode", type=str, default="f1", choices=["f1", "precision_target", "recall_target"])
     p.add_argument("--tau_target_precision", type=float, default=0.6)
     p.add_argument("--tau_target_recall", type=float, default=0.6)
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default=None)
+    p.add_argument("--wandb_entity", type=str, default=None)
+    p.add_argument("--wandb_group", type=str, default=None)
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--wandb_tags", type=str, default=None)
+    p.add_argument("--wandb_job_type", type=str, default=None)
     args = p.parse_args()
     main(
         pest=args.pest,
@@ -561,4 +793,11 @@ if __name__ == "__main__":
         tau_mode=args.tau_mode,
         tau_target_precision=args.tau_target_precision,
         tau_target_recall=args.tau_target_recall,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_group=args.wandb_group,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=args.wandb_tags,
+        wandb_job_type=args.wandb_job_type,
     )

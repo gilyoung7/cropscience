@@ -310,13 +310,16 @@ def build_stage2_nowcast_samples(
     event_time_proxy: str = "r",
 ) -> list[dict]:
     """
-    Build Stage-2 nowcast samples for "first event after t*" target.
+    Build Stage-2 nowcast samples.
     Output keeps season-length X (masked outside recent window) so hazard axis remains 1..T.
 
     Event-time handling:
       - proxy='r': event_time = R
       - proxy='mid': event_time = floor((L+R)/2)
     Interval ambiguity region L <= t* < R is retained and tracked by `case_bucket`.
+
+    Label handling:
+      - Always keep original interval [L, R] when future event exists.
     """
     out: list[dict] = []
     if not samples:
@@ -354,9 +357,8 @@ def build_stage2_nowcast_samples(
             X_now = _mask_to_recent_window(X, tstar=tstar, window=window)
 
             if has_event and event_time is not None and event_time > tstar:
-                # Convert to a point-like interval at first-future event proxy.
-                R_new = int(event_time)
-                L_new = int(max(1, R_new - 1))
+                L_new = int(s["L"])
+                R_new = int(s["R"])
                 c_new = "interval"
             else:
                 # No future event after t* in season horizon.
