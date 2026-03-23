@@ -392,11 +392,42 @@ def build_stage2_nowcast_samples(
 
 def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     """
-    Train samples only -> mean/std for each feature dim
+    Train samples only -> mean/std for each feature dim.
+    Streaming reduction to avoid materializing gigantic (N,T,D) arrays.
     """
-    X_all = np.concatenate([s["X"][None, :, :] for s in samples], axis=0)  # (N,T,D)
-    mean = X_all.reshape(-1, X_all.shape[-1]).mean(axis=0)
-    std = X_all.reshape(-1, X_all.shape[-1]).std(axis=0)
+    # Optional memory logging (no extra deps)
+    import os
+    import resource
+
+    mem_log = os.environ.get("RICE_MEM_LOG", "0") not in ("0", "", "false", "False")
+    mem_every = int(os.environ.get("RICE_MEM_LOG_EVERY", "5000"))
+
+    def _rss_gb() -> float:
+        # ru_maxrss is KB on Linux
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+
+    sum_ = None
+    sumsq = None
+    count = 0
+
+    for i, s in enumerate(samples):
+        x = np.asarray(s["X"], dtype=np.float32)
+        x2d = x.reshape(-1, x.shape[-1]).astype(np.float64, copy=False)
+        if sum_ is None:
+            sum_ = np.zeros(x2d.shape[1], dtype=np.float64)
+            sumsq = np.zeros(x2d.shape[1], dtype=np.float64)
+        sum_ += x2d.sum(axis=0)
+        sumsq += np.square(x2d).sum(axis=0)
+        count += x2d.shape[0]
+        if mem_log and (i % mem_every == 0):
+            print(f"[mem] compute_norm_stats i={i} rss={_rss_gb():.2f} GB")
+
+    if sum_ is None or count == 0:
+        raise ValueError("compute_norm_stats: empty samples")
+
+    mean = sum_ / count
+    var = np.maximum(sumsq / count - np.square(mean), 0.0)
+    std = np.sqrt(var)
     std = np.where(std < 1e-6, 1.0, std)
     # keep missing indicators as 0/1 (no normalization)
     # missing indicators are appended after each base feature -> odd indices.
