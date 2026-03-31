@@ -447,6 +447,14 @@ class IntervalEventDataset(Dataset):
         self.samples = samples
         self.mean = mean
         self.std = std
+        # Precompute missing-indicator template to avoid full zero-fill per sample.
+        if samples:
+            X0 = np.asarray(samples[0]["X"], dtype=np.float32)
+            self._miss_template = np.zeros_like(X0, dtype=np.float32)
+            if X0.shape[1] > 1:
+                self._miss_template[:, 1::2] = 1.0
+        else:
+            self._miss_template = None
 
     def __len__(self):
         return len(self.samples)
@@ -455,7 +463,20 @@ class IntervalEventDataset(Dataset):
         s = self.samples[idx]
         X_base = s["X"]
         if "tstar" in s and "window" in s:
-            X = _mask_to_recent_window(X_base, tstar=int(s["tstar"]), window=int(s["window"]))
+            # Reuse template to avoid full zero-fill cost each sample.
+            if self._miss_template is None:
+                X = _mask_to_recent_window(X_base, tstar=int(s["tstar"]), window=int(s["window"]))
+            else:
+                X = self._miss_template.copy()
+                T = X_base.shape[0]
+                tstar = int(s["tstar"])
+                window = int(s["window"])
+                start = max(1, tstar - window + 1)
+                end = min(T, tstar)
+                if end >= start:
+                    i0 = start - 1
+                    i1 = end
+                    X[i0:i1, :] = X_base[i0:i1, :]
         else:
             X = X_base
         X = (X - self.mean) / self.std
