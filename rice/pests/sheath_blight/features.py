@@ -24,6 +24,8 @@ def get_feature_cols(run: int) -> list[str]:
         cols = base + pheno + roll + meta
     elif run == 4:
         cols = roll + meta + pheno
+    elif run == 5:
+        cols = [c for c in (roll + meta + pheno) if c != "rad_7d_sum"]
     else:
-        raise ValueError("run must be 0..4")
+        raise ValueError("run must be 0..5")
     return list(dict.fromkeys(cols))

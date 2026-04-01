@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 
 from rice.configs import config as C
-from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
+from rice.src.pest_resolver import resolve_pest, default_stage1_out_root, ensure_output_dirs
 from rice.scripts.common import make_loader, parse_seed_candidates
 from rice.scripts.run_eval import (
     build_samples_for_run,
@@ -177,7 +177,7 @@ def main(
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
-        out_root = default_out_root(pest)
+        out_root = default_stage1_out_root(pest)
     ensure_output_dirs(out_root)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

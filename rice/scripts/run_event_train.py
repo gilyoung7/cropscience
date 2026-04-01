@@ -13,7 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from torch.utils.data import Dataset
 
 from rice.configs import config as C
-from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
+from rice.src.pest_resolver import resolve_pest, default_stage1_out_root, ensure_output_dirs
 from rice.scripts.common import make_loader, parse_seed_candidates, parse_tags, init_wandb_run, finish_wandb_run
 from rice.scripts.run_eval import build_samples_for_run
 from rice.src.dataset import (
@@ -346,7 +346,7 @@ def main(
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
-        out_root = default_out_root(pest)
+        out_root = default_stage1_out_root(pest)
     ensure_output_dirs(out_root)
 
     if lr is not None:

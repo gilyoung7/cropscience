@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from rice.configs import config as C
-from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
+from rice.src.pest_resolver import resolve_pest, default_stage1_out_root, ensure_output_dirs
 from rice.scripts.common import make_loader, parse_seed_candidates, parse_tags, init_wandb_run, finish_wandb_run
 from rice.scripts.run_eval import build_samples_for_run
 from rice.src.dataset import (
@@ -32,6 +32,59 @@ from rice.scripts.run_event_train import (
 
 WANDB_ENTITY_DEFAULT = "gilyoung7-seoul-national-university"
 WANDB_PROJECT_DEFAULT = "agro-rice"
+ALERT_ROW_COLUMNS = ["split", "seed", "sample_id", "site", "year", "true_L", "true_R", "alert_tstar"]
+ALERT_OUTPUT_COLUMNS = ALERT_ROW_COLUMNS + ["is_event", "alerted", "lead_time"]
+ALERT_SUMMARY_COLUMNS = [
+    "split",
+    "seed",
+    "n_site_year",
+    "n_event",
+    "n_alerted",
+    "alert_rate",
+    "true_event_alert_rate",
+    "false_alert_rate",
+    "specificity",
+    "alert_precision",
+    "alert_recall",
+    "alert_f1",
+    "lead_time_mean",
+    "lead_time_median",
+    "t_alert_start",
+    "tau_selected",
+]
+PROB_OUTPUT_COLUMNS = [
+    "split",
+    "seed",
+    "sample_id",
+    "site",
+    "year",
+    "tstar",
+    "y_event",
+    "true_L",
+    "true_R",
+    "p_raw",
+    "p_cal",
+]
+GATE_POLICY_SUMMARY_COLUMNS = [
+    "split",
+    "seed",
+    "gate_policy_name",
+    "gate_consecutive_k",
+    "gate_smooth_window",
+    "gate_use_t_alert_start",
+    "tau_selected",
+    "tau_alert_fallback_mode",
+    "alert_rate",
+    "alert_precision",
+    "alert_recall",
+    "alert_f1",
+    "false_alert_rate",
+    "specificity",
+    "lead_time_mean",
+    "lead_time_median",
+    "t_alert_start",
+    "selected",
+]
 
 
 def auc_roc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -273,6 +326,8 @@ def build_alert_rows(
     split_name: str,
     seed: int,
     t_alert_start: int | None,
+    consecutive_k: int = 1,
+    smooth_window: int = 1,
 ) -> list[list]:
     """
     Build per-(site,year) rows with true interval [L,R] and earliest alert tstar.
@@ -290,19 +345,37 @@ def build_alert_rows(
                 "year": year,
                 "true_L": s.get("L"),
                 "true_R": s.get("R"),
-                "alert_tstar": None,
+                "items": [],
             }
             rows_by_key[key] = rec
-        tstar = int(s.get("tstar", -1))
-        if t_alert_start is not None and tstar < int(t_alert_start):
-            continue
-        if p >= float(tau):
-            tstar = int(s.get("tstar", -1))
-            if rec["alert_tstar"] is None or tstar < int(rec["alert_tstar"]):
-                rec["alert_tstar"] = tstar
+        rec["items"].append((int(s.get("tstar", -1)), float(p)))
 
     rows = []
     for rec in rows_by_key.values():
+        items = sorted(rec["items"], key=lambda x: x[0])
+        tstars = np.asarray([t for t, _ in items], dtype=int)
+        pvals = np.asarray([p for _, p in items], dtype=float)
+        if int(smooth_window) > 1 and pvals.size > 0:
+            smooth = np.empty_like(pvals, dtype=float)
+            for i in range(pvals.size):
+                lo = max(0, i - int(smooth_window) + 1)
+                smooth[i] = float(np.mean(pvals[lo:i + 1]))
+        else:
+            smooth = pvals
+
+        alert_tstar = None
+        streak = 0
+        for tstar, p_now in zip(tstars, smooth):
+            if t_alert_start is not None and int(tstar) < int(t_alert_start):
+                streak = 0
+                continue
+            if float(p_now) >= float(tau):
+                streak += 1
+                if streak >= int(consecutive_k):
+                    alert_tstar = int(tstar)
+                    break
+            else:
+                streak = 0
         rows.append(
             [
                 split_name,
@@ -312,10 +385,243 @@ def build_alert_rows(
                 rec["year"],
                 rec["true_L"],
                 rec["true_R"],
-                rec["alert_tstar"],
+                alert_tstar,
             ]
         )
     return rows
+
+
+def build_gate_policy_name(consecutive_k: int, smooth_window: int, use_t_alert_start: bool) -> str:
+    gate_tag = "gate" if bool(use_t_alert_start) else "nogate"
+    return f"k{int(consecutive_k)}_ma{int(smooth_window)}_{gate_tag}"
+
+
+def iter_gate_policy_candidates(
+    consecutive_ks: list[int],
+    smooth_windows: list[int],
+    use_t_alert_start_options: list[bool],
+) -> list[dict]:
+    out = []
+    for k in consecutive_ks:
+        for ma in smooth_windows:
+            for use_gate in use_t_alert_start_options:
+                out.append(
+                    {
+                        "gate_policy_name": build_gate_policy_name(k, ma, use_gate),
+                        "gate_consecutive_k": int(k),
+                        "gate_smooth_window": int(ma),
+                        "gate_use_t_alert_start": bool(use_gate),
+                    }
+                )
+    return out
+
+
+def alert_rows_to_frame(rows: list[list]) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=ALERT_ROW_COLUMNS)
+    if df.empty:
+        return pd.DataFrame(columns=ALERT_OUTPUT_COLUMNS)
+
+    for col in ("seed", "year", "true_L", "true_R", "alert_tstar"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["is_event"] = (df["true_L"].notna() & df["true_R"].notna()).astype(int)
+    df["alerted"] = df["alert_tstar"].notna().astype(int)
+    df["lead_time"] = np.nan
+    m = (df["is_event"] == 1) & (df["alerted"] == 1)
+    if bool(m.any()):
+        df.loc[m, "lead_time"] = df.loc[m, "true_L"] - df.loc[m, "alert_tstar"]
+
+    for col in ("seed", "year", "true_L", "true_R", "alert_tstar"):
+        df[col] = df[col].astype("Int64")
+    return df[ALERT_OUTPUT_COLUMNS]
+
+
+def summarize_alert_rows(
+    rows: list[list],
+    split_name: str,
+    seed: int,
+    t_alert_start: int | None,
+    tau_selected: float,
+) -> dict:
+    df = alert_rows_to_frame(rows)
+    n_site_year = int(len(df))
+    n_event = int(df["is_event"].sum()) if not df.empty else 0
+    n_alerted = int(df["alerted"].sum()) if not df.empty else 0
+    n_non_event = max(n_site_year - n_event, 0)
+    n_true_alert = int(((df["is_event"] == 1) & (df["alerted"] == 1)).sum()) if not df.empty else 0
+    n_false_alert = int(((df["is_event"] == 0) & (df["alerted"] == 1)).sum()) if not df.empty else 0
+
+    alert_precision = n_true_alert / n_alerted if n_alerted > 0 else 0.0
+    alert_recall = n_true_alert / n_event if n_event > 0 else 0.0
+    alert_f1 = (
+        (2 * alert_precision * alert_recall) / (alert_precision + alert_recall)
+        if (alert_precision + alert_recall) > 0
+        else 0.0
+    )
+    alert_rate = n_alerted / n_site_year if n_site_year > 0 else 0.0
+    true_event_alert_rate = n_true_alert / n_event if n_event > 0 else 0.0
+    false_alert_rate = n_false_alert / n_non_event if n_non_event > 0 else float("nan")
+    specificity = 1.0 - false_alert_rate if np.isfinite(false_alert_rate) else float("nan")
+
+    lead = df.loc[(df["is_event"] == 1) & (df["alerted"] == 1), "lead_time"].to_numpy(dtype=float)
+    lead = lead[np.isfinite(lead)]
+    lead_time_mean = float(np.mean(lead)) if lead.size > 0 else float("nan")
+    lead_time_median = float(np.median(lead)) if lead.size > 0 else float("nan")
+
+    return {
+        "split": split_name,
+        "seed": int(seed),
+        "n_site_year": int(n_site_year),
+        "n_event": int(n_event),
+        "n_alerted": int(n_alerted),
+        "alert_rate": float(alert_rate),
+        "true_event_alert_rate": float(true_event_alert_rate),
+        "false_alert_rate": float(false_alert_rate),
+        "specificity": float(specificity),
+        "alert_precision": float(alert_precision),
+        "alert_recall": float(alert_recall),
+        "alert_f1": float(alert_f1),
+        "lead_time_mean": float(lead_time_mean),
+        "lead_time_median": float(lead_time_median),
+        "t_alert_start": None if t_alert_start is None else int(t_alert_start),
+        "tau_selected": float(tau_selected),
+    }
+
+
+def select_best_alert_metric_row(
+    rows: list[dict],
+    *,
+    target_recall: float | None,
+    max_false_alert_rate: float | None,
+    policy: str,
+) -> dict:
+    recall_feasible = rows
+    if target_recall is not None:
+        recall_feasible = [r for r in rows if float(r["alert_recall"]) >= float(target_recall)]
+
+    feasible = recall_feasible
+    if max_false_alert_rate is not None:
+        feasible = [
+            r
+            for r in recall_feasible
+            if np.isfinite(r["false_alert_rate"]) and float(r["false_alert_rate"]) <= float(max_false_alert_rate)
+        ]
+
+    fallback_mode = "strict"
+    if not feasible:
+        if recall_feasible:
+            feasible = recall_feasible
+            fallback_mode = "recall_only"
+        else:
+            feasible = rows
+            fallback_mode = "best_available"
+
+    def score_key(r: dict) -> tuple[float, float, float, float]:
+        false_alert_rate = -float(r["false_alert_rate"]) if np.isfinite(r["false_alert_rate"]) else float("-inf")
+        specificity = float(r["specificity"]) if np.isfinite(r["specificity"]) else float("-inf")
+        if fallback_mode == "best_available":
+            if policy == "min_false_alert_rate":
+                return (
+                    float(r["alert_recall"]),
+                    false_alert_rate,
+                    float(r["alert_f1"]),
+                    float(r.get("tau_selected", 0.0)),
+                )
+            if policy == "false_alert_rate_then_f1":
+                return (
+                    float(r["alert_recall"]),
+                    false_alert_rate,
+                    float(r["alert_f1"]),
+                    float(r.get("tau_selected", 0.0)),
+                )
+            return (
+                float(r["alert_recall"]),
+                float(r["alert_f1"]),
+                false_alert_rate,
+                float(r.get("tau_selected", 0.0)),
+            )
+        if policy == "min_false_alert_rate":
+            return (
+                false_alert_rate,
+                float(r["alert_f1"]),
+                float(r["alert_precision"]),
+                float(r.get("tau_selected", 0.0)),
+            )
+        if policy == "false_alert_rate_then_f1":
+            return (
+                false_alert_rate,
+                float(r["alert_f1"]),
+                float(r["alert_precision"]),
+                float(r.get("tau_selected", 0.0)),
+            )
+        if policy == "f1_then_false_alert_rate":
+            return (
+                float(r["alert_f1"]),
+                false_alert_rate,
+                float(r["alert_precision"]),
+                float(r.get("tau_selected", 0.0)),
+            )
+        return (
+            float(r["alert_f1"]),
+            specificity,
+            float(r["alert_precision"]),
+            float(r.get("tau_selected", 0.0)),
+        )
+
+    best = dict(max(feasible, key=score_key))
+    best["tau_alert_fallback_mode"] = fallback_mode
+    return best
+
+
+def best_tau_by_alert_site_year(
+    samples: list[dict],
+    probs: np.ndarray,
+    *,
+    split_name: str,
+    seed: int,
+    y_true: np.ndarray,
+    tstar: np.ndarray,
+    gate_consecutive_k: int,
+    gate_smooth_window: int,
+    gate_use_t_alert_start: bool,
+    target_recall: float | None,
+    max_false_alert_rate: float | None,
+    policy: str,
+) -> dict:
+    taus = np.linspace(0.05, 0.95, 181)
+    rows = []
+    for tau in taus:
+        t_alert_start = None
+        if gate_use_t_alert_start:
+            t_alert_start = compute_t_alert_start(y_true, probs, tstar, float(tau))
+        alert_rows = build_alert_rows(
+            samples,
+            probs,
+            float(tau),
+            split_name=split_name,
+            seed=seed,
+            t_alert_start=t_alert_start,
+            consecutive_k=gate_consecutive_k,
+            smooth_window=gate_smooth_window,
+        )
+        summary = summarize_alert_rows(
+            alert_rows,
+            split_name=split_name,
+            seed=seed,
+            t_alert_start=t_alert_start,
+            tau_selected=float(tau),
+        )
+        summary["gate_consecutive_k"] = int(gate_consecutive_k)
+        summary["gate_smooth_window"] = int(gate_smooth_window)
+        summary["gate_use_t_alert_start"] = bool(gate_use_t_alert_start)
+        summary["gate_policy_name"] = build_gate_policy_name(gate_consecutive_k, gate_smooth_window, gate_use_t_alert_start)
+        rows.append(summary)
+
+    return select_best_alert_metric_row(
+        rows,
+        target_recall=target_recall,
+        max_false_alert_rate=max_false_alert_rate,
+        policy=policy,
+    )
 
 
 def plot_alert_rows(rows: list[list], title: str, Tend: int):
@@ -376,6 +682,100 @@ def resolve_out_csv(run: int, out_root: str, out_csv: str | None) -> str:
     return str(out_dir / f"event_eval_run{run}.csv")
 
 
+def save_by_tstar_rows(out_csv_resolved: str, tstar_rows: list[dict]) -> str | None:
+    if not tstar_rows:
+        return None
+    tstar_df = pd.DataFrame(tstar_rows).sort_values(["split", "tstar"]).reset_index(drop=True)
+    tstar_out = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_by_tstar.csv"))
+    tstar_df.to_csv(tstar_out, index=False)
+    print("saved:", tstar_out)
+    return tstar_out
+
+
+def save_alert_outputs(out_csv_resolved: str, alert_rows: list[list], alert_summary_rows: list[dict]) -> tuple[str | None, str | None]:
+    alerts_out = None
+    alerts_summary_out = None
+
+    if alert_rows:
+        alerts_df = alert_rows_to_frame(alert_rows)
+        alerts_out = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_alerts.csv"))
+        alerts_df.to_csv(alerts_out, index=False)
+        print("saved:", alerts_out)
+
+    if alert_summary_rows:
+        alert_summary_df = pd.DataFrame(alert_summary_rows, columns=ALERT_SUMMARY_COLUMNS).sort_values(
+            ["split", "seed"]
+        ).reset_index(drop=True)
+        alerts_summary_out = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_alerts_summary.csv"))
+        alert_summary_df.to_csv(alerts_summary_out, index=False)
+        print("saved:", alerts_summary_out)
+
+    return alerts_out, alerts_summary_out
+
+
+def build_probability_rows(
+    samples: list[dict],
+    p_raw: np.ndarray,
+    p_cal: np.ndarray,
+    *,
+    split_name: str,
+    seed: int,
+) -> list[dict]:
+    rows = []
+    for s, pr, pc in zip(samples, p_raw, p_cal):
+        site = str(s.get("site_id", ""))
+        year = int(s.get("year", -1))
+        tstar = s.get("tstar")
+        sample_id = f"{site}-{year}"
+        rows.append(
+            {
+                "split": split_name,
+                "seed": int(seed),
+                "sample_id": sample_id,
+                "site": site,
+                "year": year,
+                "tstar": None if tstar is None else int(tstar),
+                "y_event": int(s.get("y_event", 0)),
+                "true_L": s.get("L"),
+                "true_R": s.get("R"),
+                "p_raw": float(pr),
+                "p_cal": float(pc),
+            }
+        )
+    return rows
+
+
+def save_probability_outputs(out_csv_resolved: str, prob_rows: list[dict]) -> str | None:
+    if not prob_rows:
+        return None
+    probs_df = pd.DataFrame(prob_rows, columns=PROB_OUTPUT_COLUMNS)
+    out_path = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_probs.csv"))
+    probs_df.to_csv(out_path, index=False)
+    print("saved:", out_path)
+    return out_path
+
+
+def save_gate_policy_outputs(out_csv_resolved: str, gate_policy_rows: list[dict]) -> str | None:
+    if not gate_policy_rows:
+        return None
+    gate_policy_df = pd.DataFrame(gate_policy_rows, columns=GATE_POLICY_SUMMARY_COLUMNS).sort_values(
+        ["split", "seed", "selected", "gate_policy_name"],
+        ascending=[True, True, False, True],
+    ).reset_index(drop=True)
+    out_path = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_gate_policy_val.csv"))
+    gate_policy_df.to_csv(out_path, index=False)
+    print("saved:", out_path)
+    return out_path
+
+
+def save_meta_json(out_csv_resolved: str, payload: dict) -> str:
+    out_json_resolved = str(Path(out_csv_resolved).with_suffix(".meta.json"))
+    with open(out_json_resolved, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print("saved:", out_json_resolved)
+    return out_json_resolved
+
+
 def main(
     pest: str,
     ckpt_path: str | None,
@@ -391,9 +791,20 @@ def main(
     auto_split_topk: int,
     split_seed_from_topk_idx: int | None,
     split_seeds_json: str | None,
+    gate_policy_search: bool,
+    gate_consecutive_k: int,
+    gate_smooth_window: int,
+    gate_use_t_alert_start: int,
+    gate_search_consecutive_ks: list[int] | None,
+    gate_search_smooth_windows: list[int] | None,
+    gate_search_use_t_alert_start_options: list[int] | None,
+    tau_select_level: str,
     tau_mode: str,
     tau_target_precision: float,
     tau_target_recall: float,
+    tau_alert_target_recall: float | None,
+    tau_alert_max_false_alert_rate: float | None,
+    tau_alert_policy: str,
     use_wandb: bool,
     wandb_project: str | None,
     wandb_entity: str | None,
@@ -404,7 +815,7 @@ def main(
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
-        out_root = default_out_root(pest)
+        out_root = default_stage1_out_root(pest)
     ensure_output_dirs(out_root)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -422,9 +833,17 @@ def main(
             "pest": pest,
             "run": run,
             "split_seed": int(split_seed),
+            "gate_policy_search": bool(gate_policy_search),
+            "gate_consecutive_k": int(gate_consecutive_k),
+            "gate_smooth_window": int(gate_smooth_window),
+            "gate_use_t_alert_start": int(gate_use_t_alert_start),
+            "tau_select_level": tau_select_level,
             "tau_mode": tau_mode,
             "tau_target_precision": float(tau_target_precision),
             "tau_target_recall": float(tau_target_recall),
+            "tau_alert_target_recall": None if tau_alert_target_recall is None else float(tau_alert_target_recall),
+            "tau_alert_max_false_alert_rate": None if tau_alert_max_false_alert_rate is None else float(tau_alert_max_false_alert_rate),
+            "tau_alert_policy": tau_alert_policy,
         },
     )
 
@@ -515,6 +934,12 @@ def main(
     d_in = int(test_ds[0][0].shape[-1])
     model_T = int(ckpt.get("T", T))
     print(f"RUN={run} | D_in={d_in} | T={model_T} | task_mode={task_mode} | val_n={len(val_s)} test_n={len(test_s)}")
+    if tau_select_level == "alert_site_year" and task_mode != "nowcast":
+        raise ValueError("tau_select_level=alert_site_year requires task_mode=nowcast")
+    if int(gate_consecutive_k) < 1:
+        raise ValueError("--gate_consecutive_k must be >= 1")
+    if int(gate_smooth_window) < 1:
+        raise ValueError("--gate_smooth_window must be >= 1")
 
     model_kind = str(ckpt.get("event_model", "transformer"))
     records = []
@@ -534,6 +959,9 @@ def main(
             dropped_by_split["test"] += 1
     tstar_rows = []
     alert_rows = []
+    alert_summary_rows = []
+    prob_rows = []
+    gate_policy_rows = []
     for d in trained_states:
         seed = int(d["seed"])
         if seeds is not None and seed not in seeds:
@@ -568,22 +996,158 @@ def main(
         p_val_cal = apply_temperature(p_val_raw, t_best)
         p_test_cal = apply_temperature(p_test_raw, t_best)
 
-        tau, val_f1, val_prec, val_rec = best_tau_by_target(
-            y_val,
-            p_val_cal,
-            mode=tau_mode,
-            target_precision=tau_target_precision,
-            target_recall=tau_target_recall,
-        )
+        t_alert_start = None
+        gate_policy_name = build_gate_policy_name(int(gate_consecutive_k), int(gate_smooth_window), bool(gate_use_t_alert_start))
+        gate_consecutive_k_selected = int(gate_consecutive_k)
+        gate_smooth_window_selected = int(gate_smooth_window)
+        gate_use_t_alert_start_selected = bool(gate_use_t_alert_start)
+        if tau_select_level == "alert_site_year":
+            if gate_policy_search:
+                candidate_rows = []
+                candidates = iter_gate_policy_candidates(
+                    gate_search_consecutive_ks or [1, 2, 3],
+                    gate_search_smooth_windows or [1, 3],
+                    [bool(x) for x in (gate_search_use_t_alert_start_options or [0, 1])],
+                )
+                for cand in candidates:
+                    picked = best_tau_by_alert_site_year(
+                        val_s,
+                        p_val_cal,
+                        split_name="val",
+                        seed=seed,
+                        y_true=y_val,
+                        tstar=tstar_val,
+                        gate_consecutive_k=int(cand["gate_consecutive_k"]),
+                        gate_smooth_window=int(cand["gate_smooth_window"]),
+                        gate_use_t_alert_start=bool(cand["gate_use_t_alert_start"]),
+                        target_recall=tau_alert_target_recall,
+                        max_false_alert_rate=tau_alert_max_false_alert_rate,
+                        policy=tau_alert_policy,
+                    )
+                    candidate_rows.append(picked)
+                selected_policy = select_best_alert_metric_row(
+                    candidate_rows,
+                    target_recall=tau_alert_target_recall,
+                    max_false_alert_rate=tau_alert_max_false_alert_rate,
+                    policy="false_alert_rate_then_f1",
+                )
+                for row in candidate_rows:
+                    gate_policy_rows.append(
+                        {
+                            "split": "val",
+                            "seed": int(seed),
+                            "gate_policy_name": row["gate_policy_name"],
+                            "gate_consecutive_k": int(row["gate_consecutive_k"]),
+                            "gate_smooth_window": int(row["gate_smooth_window"]),
+                            "gate_use_t_alert_start": bool(row["gate_use_t_alert_start"]),
+                            "tau_selected": float(row["tau_selected"]),
+                            "tau_alert_fallback_mode": str(row.get("tau_alert_fallback_mode", "")),
+                            "alert_rate": float(row["alert_rate"]),
+                            "alert_precision": float(row["alert_precision"]),
+                            "alert_recall": float(row["alert_recall"]),
+                            "alert_f1": float(row["alert_f1"]),
+                            "false_alert_rate": float(row["false_alert_rate"]),
+                            "specificity": float(row["specificity"]),
+                            "lead_time_mean": float(row["lead_time_mean"]),
+                            "lead_time_median": float(row["lead_time_median"]),
+                            "t_alert_start": row.get("t_alert_start"),
+                            "selected": int(row["gate_policy_name"] == selected_policy["gate_policy_name"]),
+                        }
+                    )
+                tau_pick = selected_policy
+            else:
+                tau_pick = best_tau_by_alert_site_year(
+                    val_s,
+                    p_val_cal,
+                    split_name="val",
+                    seed=seed,
+                    y_true=y_val,
+                    tstar=tstar_val,
+                    gate_consecutive_k=int(gate_consecutive_k),
+                    gate_smooth_window=int(gate_smooth_window),
+                    gate_use_t_alert_start=bool(gate_use_t_alert_start),
+                    target_recall=tau_alert_target_recall,
+                    max_false_alert_rate=tau_alert_max_false_alert_rate,
+                    policy=tau_alert_policy,
+                )
+            tau = float(tau_pick["tau_selected"])
+            tau_alert_fallback_mode = str(tau_pick.get("tau_alert_fallback_mode", "strict"))
+            t_alert_start = tau_pick.get("t_alert_start")
+            gate_policy_name = str(tau_pick.get("gate_policy_name", gate_policy_name))
+            gate_consecutive_k_selected = int(tau_pick.get("gate_consecutive_k", gate_consecutive_k))
+            gate_smooth_window_selected = int(tau_pick.get("gate_smooth_window", gate_smooth_window))
+            gate_use_t_alert_start_selected = bool(tau_pick.get("gate_use_t_alert_start", bool(gate_use_t_alert_start)))
+        else:
+            tau, _, _, _ = best_tau_by_target(
+                y_val,
+                p_val_cal,
+                mode=tau_mode,
+                target_precision=tau_target_precision,
+                target_recall=tau_target_recall,
+            )
+            tau_alert_fallback_mode = None
+
+        val_prec, val_rec, val_f1 = pr_at_tau(y_val, p_val_cal, tau)
         test_prec, test_rec, test_f1 = pr_at_tau(y_test, p_test_cal, tau)
         val_fp = fp_rate_at_tau(y_val, p_val_cal, tau)
         test_fp = fp_rate_at_tau(y_test, p_test_cal, tau)
+        prob_rows.extend(build_probability_rows(val_s, p_val_raw, p_val_cal, split_name="val", seed=seed))
+        prob_rows.extend(build_probability_rows(test_s, p_test_raw, p_test_cal, split_name="test", seed=seed))
+        test_alert_summary = {
+            "alert_rate": float("nan"),
+            "alert_precision": float("nan"),
+            "alert_recall": float("nan"),
+            "alert_f1": float("nan"),
+            "false_alert_rate": float("nan"),
+            "specificity": float("nan"),
+            "lead_time_mean": float("nan"),
+            "lead_time_median": float("nan"),
+            "t_alert_start": None,
+        }
         if task_mode == "nowcast":
             tstar_rows.extend(metrics_by_tstar(y_val, p_val_raw, p_val_cal, tau, tstar_val, split_name="val", seed=seed))
             tstar_rows.extend(metrics_by_tstar(y_test, p_test_raw, p_test_cal, tau, tstar_test, split_name="test", seed=seed))
-            t_alert_start = compute_t_alert_start(y_val, p_val_cal, tstar_val, tau)
-            alert_rows.extend(build_alert_rows(val_s, p_val_cal, tau, split_name="val", seed=seed, t_alert_start=t_alert_start))
-            alert_rows.extend(build_alert_rows(test_s, p_test_cal, tau, split_name="test", seed=seed, t_alert_start=t_alert_start))
+            if tau_select_level == "alert_site_year" and gate_use_t_alert_start_selected:
+                t_alert_start = compute_t_alert_start(y_val, p_val_cal, tstar_val, tau)
+
+            val_alert_rows = build_alert_rows(
+                val_s,
+                p_val_cal,
+                tau,
+                split_name="val",
+                seed=seed,
+                t_alert_start=t_alert_start,
+                consecutive_k=gate_consecutive_k_selected,
+                smooth_window=gate_smooth_window_selected,
+            )
+            test_alert_rows = build_alert_rows(
+                test_s,
+                p_test_cal,
+                tau,
+                split_name="test",
+                seed=seed,
+                t_alert_start=t_alert_start,
+                consecutive_k=gate_consecutive_k_selected,
+                smooth_window=gate_smooth_window_selected,
+            )
+            alert_rows.extend(val_alert_rows)
+            alert_rows.extend(test_alert_rows)
+
+            val_alert_summary = summarize_alert_rows(
+                val_alert_rows,
+                split_name="val",
+                seed=seed,
+                t_alert_start=t_alert_start,
+                tau_selected=tau,
+            )
+            test_alert_summary = summarize_alert_rows(
+                test_alert_rows,
+                split_name="test",
+                seed=seed,
+                t_alert_start=t_alert_start,
+                tau_selected=tau,
+            )
+            alert_summary_rows.extend([val_alert_summary, test_alert_summary])
 
         records.append(
             {
@@ -591,9 +1155,22 @@ def main(
                 "best_epoch": int(d["best_epoch"]),
                 "best_val_bce": float(d.get("best_val_bce", np.nan)),
                 "temperature": float(t_best),
+                "gate_policy_name": gate_policy_name,
+                "gate_consecutive_k": int(gate_consecutive_k_selected),
+                "gate_smooth_window": int(gate_smooth_window_selected),
+                "gate_use_t_alert_start": int(gate_use_t_alert_start_selected),
+                "tau_select_level": tau_select_level,
                 "tau_mode": tau_mode,
                 "tau_target_precision": float(tau_target_precision),
                 "tau_target_recall": float(tau_target_recall),
+                "tau_alert_target_recall": (
+                    float(tau_alert_target_recall) if tau_alert_target_recall is not None else float("nan")
+                ),
+                "tau_alert_max_false_alert_rate": (
+                    float(tau_alert_max_false_alert_rate) if tau_alert_max_false_alert_rate is not None else float("nan")
+                ),
+                "tau_alert_policy": tau_alert_policy,
+                "tau_alert_fallback_mode": tau_alert_fallback_mode,
                 "tau_selected": float(tau),
                 "val_auc_raw": float(auc_roc_binary(y_val, p_val_raw)),
                 "val_auc_cal": float(auc_roc_binary(y_val, p_val_cal)),
@@ -627,6 +1204,14 @@ def main(
                 "test_nonevent_mean_p_raw": float(np.mean(p_test_raw[y_test == 0])) if (y_test == 0).any() else float("nan"),
                 "test_event_mean_p_cal": float(np.mean(p_test_cal[y_test == 1])) if (y_test == 1).any() else float("nan"),
                 "test_nonevent_mean_p_cal": float(np.mean(p_test_cal[y_test == 0])) if (y_test == 0).any() else float("nan"),
+                "test_alert_rate": float(test_alert_summary["alert_rate"]),
+                "test_alert_precision": float(test_alert_summary["alert_precision"]),
+                "test_alert_recall": float(test_alert_summary["alert_recall"]),
+                "test_alert_f1": float(test_alert_summary["alert_f1"]),
+                "test_false_alert_rate": float(test_alert_summary["false_alert_rate"]),
+                "test_lead_time_mean": float(test_alert_summary["lead_time_mean"]),
+                "test_lead_time_median": float(test_alert_summary["lead_time_median"]),
+                "test_t_alert_start": test_alert_summary["t_alert_start"],
                 "drop_ratio_len_mismatch_overall": float(debug_stats.get("drop_ratio_len_mismatch", float("nan"))),
                 "drop_ratio_len_mismatch_train": float(
                     dropped_by_split["train"] / max(dropped_by_split["train"] + len(train_s), 1)
@@ -717,33 +1302,37 @@ def main(
     df.to_csv(out_csv_resolved, index=False)
     print("saved:", out_csv_resolved)
     if task_mode == "nowcast":
-        tstar_df = pd.DataFrame(tstar_rows)
-        if not tstar_df.empty:
-            tstar_df = tstar_df.sort_values(["split", "tstar"]).reset_index(drop=True)
-            tstar_out = str(Path(out_csv_resolved).with_name(Path(out_csv_resolved).stem + "_by_tstar.csv"))
-            tstar_df.to_csv(tstar_out, index=False)
-            print("saved:", tstar_out)
-    out_json_resolved = str(Path(out_csv_resolved).with_suffix(".meta.json"))
-    with open(out_json_resolved, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "task_mode": task_mode,
-                "nowcast_window": nowcast_window,
-                "nowcast_stride": nowcast_stride,
-                "nowcast_tstar_start": nowcast_tstar_start,
-                "nowcast_only_pre_event": nowcast_only_pre_event,
-                "nowcast_event_time_proxy": nowcast_event_time_proxy,
-                "tau_mode": tau_mode,
-                "tau_target_precision": float(tau_target_precision),
-                "tau_target_recall": float(tau_target_recall),
-                "split_seed": int(split_seed),
-                "n_records": int(len(df)),
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-    print("saved:", out_json_resolved)
+        save_by_tstar_rows(out_csv_resolved, tstar_rows)
+        save_alert_outputs(out_csv_resolved, alert_rows, alert_summary_rows)
+        save_probability_outputs(out_csv_resolved, prob_rows)
+        save_gate_policy_outputs(out_csv_resolved, gate_policy_rows)
+    save_meta_json(
+        out_csv_resolved,
+        {
+            "task_mode": task_mode,
+            "nowcast_window": nowcast_window,
+            "nowcast_stride": nowcast_stride,
+            "nowcast_tstar_start": nowcast_tstar_start,
+            "nowcast_only_pre_event": nowcast_only_pre_event,
+            "nowcast_event_time_proxy": nowcast_event_time_proxy,
+            "gate_policy_search": bool(gate_policy_search),
+            "gate_consecutive_k": int(gate_consecutive_k),
+            "gate_smooth_window": int(gate_smooth_window),
+            "gate_use_t_alert_start": int(gate_use_t_alert_start),
+            "gate_search_consecutive_ks": gate_search_consecutive_ks,
+            "gate_search_smooth_windows": gate_search_smooth_windows,
+            "gate_search_use_t_alert_start_options": gate_search_use_t_alert_start_options,
+            "tau_select_level": tau_select_level,
+            "tau_mode": tau_mode,
+            "tau_target_precision": float(tau_target_precision),
+            "tau_target_recall": float(tau_target_recall),
+            "tau_alert_target_recall": None if tau_alert_target_recall is None else float(tau_alert_target_recall),
+            "tau_alert_max_false_alert_rate": None if tau_alert_max_false_alert_rate is None else float(tau_alert_max_false_alert_rate),
+            "tau_alert_policy": tau_alert_policy,
+            "split_seed": int(split_seed),
+            "n_records": int(len(df)),
+        },
+    )
 
     finish_wandb_run(wandb_run)
 
@@ -764,9 +1353,20 @@ if __name__ == "__main__":
     p.add_argument("--seed_candidates", type=str, default=None)
     p.add_argument("--target_test_interval", type=int, default=None)
     p.add_argument("--tol_test_interval", type=int, default=None)
+    p.add_argument("--gate_policy_search", action="store_true")
+    p.add_argument("--gate_consecutive_k", type=int, default=1)
+    p.add_argument("--gate_smooth_window", type=int, default=1)
+    p.add_argument("--gate_use_t_alert_start", type=int, default=0)
+    p.add_argument("--gate_search_consecutive_ks", type=int, nargs="*", default=None)
+    p.add_argument("--gate_search_smooth_windows", type=int, nargs="*", default=None)
+    p.add_argument("--gate_search_use_t_alert_start_options", type=int, nargs="*", default=None)
+    p.add_argument("--tau_select_level", type=str, default="pooled", choices=["pooled", "alert_site_year"])
     p.add_argument("--tau_mode", type=str, default="f1", choices=["f1", "precision_target", "recall_target"])
     p.add_argument("--tau_target_precision", type=float, default=0.6)
     p.add_argument("--tau_target_recall", type=float, default=0.6)
+    p.add_argument("--tau_alert_target_recall", type=float, default=None)
+    p.add_argument("--tau_alert_max_false_alert_rate", type=float, default=None)
+    p.add_argument("--tau_alert_policy", type=str, default="f1_then_false_alert_rate", choices=["f1", "min_false_alert_rate", "f1_then_false_alert_rate"])
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -790,9 +1390,20 @@ if __name__ == "__main__":
         auto_split_topk=args.auto_split_topk,
         split_seed_from_topk_idx=args.split_seed_from_topk_idx,
         split_seeds_json=args.split_seeds_json,
+        gate_policy_search=args.gate_policy_search,
+        gate_consecutive_k=args.gate_consecutive_k,
+        gate_smooth_window=args.gate_smooth_window,
+        gate_use_t_alert_start=args.gate_use_t_alert_start,
+        gate_search_consecutive_ks=args.gate_search_consecutive_ks,
+        gate_search_smooth_windows=args.gate_search_smooth_windows,
+        gate_search_use_t_alert_start_options=args.gate_search_use_t_alert_start_options,
+        tau_select_level=args.tau_select_level,
         tau_mode=args.tau_mode,
         tau_target_precision=args.tau_target_precision,
         tau_target_recall=args.tau_target_recall,
+        tau_alert_target_recall=args.tau_alert_target_recall,
+        tau_alert_max_false_alert_rate=args.tau_alert_max_false_alert_rate,
+        tau_alert_policy=args.tau_alert_policy,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,

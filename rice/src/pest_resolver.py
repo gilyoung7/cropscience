@@ -50,6 +50,10 @@ def default_out_root(pest_slug: str) -> str:
     return str(RICE_ROOT / "outputs" / pest_slug)
 
 
+def default_stage1_out_root(pest_slug: str) -> str:
+    return str(RICE_ROOT / "outputs_stage1" / pest_slug)
+
+
 def ensure_output_dirs(out_root: str):
     root = Path(out_root)
     for name in ("ckpt", "logs", "eval", "pi", "sfs", "backward", "splits"):
