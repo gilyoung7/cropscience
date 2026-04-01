@@ -354,8 +354,6 @@ def build_stage2_nowcast_samples(
             if only_pre_event and has_event and event_time is not None and tstar >= event_time:
                 continue
 
-            X_now = _mask_to_recent_window(X, tstar=tstar, window=window)
-
             if has_event and event_time is not None and event_time > tstar:
                 L_new = int(s["L"])
                 R_new = int(s["R"])
@@ -370,11 +368,13 @@ def build_stage2_nowcast_samples(
                 {
                     "site_id": s["site_id"],
                     "year": int(s["year"]),
-                    "X": X_now.astype(np.float32, copy=False),
+                    # store base X only; do masking on-the-fly in __getitem__
+                    "X": X,
                     "L": L_new,
                     "R": R_new,
                     "censor_type": c_new,
                     "tstar": int(tstar),
+                    "window": int(window),
                     "event_time": int(event_time) if event_time is not None else None,
                     "orig_L": int(s["L"]),
                     "orig_R": int(s["R"]),
@@ -392,11 +392,46 @@ def build_stage2_nowcast_samples(
 
 def compute_norm_stats(samples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     """
-    Train samples only -> mean/std for each feature dim
+    Train samples only -> mean/std for each feature dim.
+    Streaming reduction to avoid materializing gigantic (N,T,D) arrays.
     """
-    X_all = np.concatenate([s["X"][None, :, :] for s in samples], axis=0)  # (N,T,D)
-    mean = X_all.reshape(-1, X_all.shape[-1]).mean(axis=0)
-    std = X_all.reshape(-1, X_all.shape[-1]).std(axis=0)
+    # Optional memory logging (no extra deps)
+    import os
+    import resource
+
+    mem_log = os.environ.get("RICE_MEM_LOG", "0") not in ("0", "", "false", "False")
+    mem_every = int(os.environ.get("RICE_MEM_LOG_EVERY", "5000"))
+
+    def _rss_gb() -> float:
+        # ru_maxrss is KB on Linux
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+
+    sum_ = None
+    sumsq = None
+    count = 0
+
+    for i, s in enumerate(samples):
+        x_base = np.asarray(s["X"], dtype=np.float32)
+        if "tstar" in s and "window" in s:
+            x = _mask_to_recent_window(x_base, tstar=int(s["tstar"]), window=int(s["window"]))
+        else:
+            x = x_base
+        x2d = x.reshape(-1, x.shape[-1]).astype(np.float64, copy=False)
+        if sum_ is None:
+            sum_ = np.zeros(x2d.shape[1], dtype=np.float64)
+            sumsq = np.zeros(x2d.shape[1], dtype=np.float64)
+        sum_ += x2d.sum(axis=0)
+        sumsq += np.square(x2d).sum(axis=0)
+        count += x2d.shape[0]
+        if mem_log and (i % mem_every == 0):
+            print(f"[mem] compute_norm_stats i={i} rss={_rss_gb():.2f} GB")
+
+    if sum_ is None or count == 0:
+        raise ValueError("compute_norm_stats: empty samples")
+
+    mean = sum_ / count
+    var = np.maximum(sumsq / count - np.square(mean), 0.0)
+    std = np.sqrt(var)
     std = np.where(std < 1e-6, 1.0, std)
     # keep missing indicators as 0/1 (no normalization)
     # missing indicators are appended after each base feature -> odd indices.
@@ -412,13 +447,39 @@ class IntervalEventDataset(Dataset):
         self.samples = samples
         self.mean = mean
         self.std = std
+        # Precompute missing-indicator template to avoid full zero-fill per sample.
+        if samples:
+            X0 = np.asarray(samples[0]["X"], dtype=np.float32)
+            self._miss_template = np.zeros_like(X0, dtype=np.float32)
+            if X0.shape[1] > 1:
+                self._miss_template[:, 1::2] = 1.0
+        else:
+            self._miss_template = None
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        X = (s["X"] - self.mean) / self.std
+        X_base = s["X"]
+        if "tstar" in s and "window" in s:
+            # Reuse template to avoid full zero-fill cost each sample.
+            if self._miss_template is None:
+                X = _mask_to_recent_window(X_base, tstar=int(s["tstar"]), window=int(s["window"]))
+            else:
+                X = self._miss_template.copy()
+                T = X_base.shape[0]
+                tstar = int(s["tstar"])
+                window = int(s["window"])
+                start = max(1, tstar - window + 1)
+                end = min(T, tstar)
+                if end >= start:
+                    i0 = start - 1
+                    i1 = end
+                    X[i0:i1, :] = X_base[i0:i1, :]
+        else:
+            X = X_base
+        X = (X - self.mean) / self.std
         X = torch.from_numpy(X).float()  # (T,D)
         L = torch.tensor(int(s["L"]), dtype=torch.long)
         R = torch.tensor(int(s["R"]), dtype=torch.long)

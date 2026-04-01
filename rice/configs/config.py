@@ -28,7 +28,7 @@ LEFT_WINDOW_DAYS = 15
 
 # DataLoader defaults (can be overridden by pest config via apply_pest_config).
 # NOTE: temporarily reduced for stride=1 experiments to avoid OOM.
-BATCH_TRAIN = 64
+BATCH_TRAIN = 256
 BATCH_EVAL = 128
 NUM_WORKERS = 4
 PIN_MEMORY = True
