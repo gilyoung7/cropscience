@@ -221,10 +221,15 @@ class EventBinaryDataset(Dataset):
         return X, y
 
 
-def build_tabular_from_samples(samples: list[dict]) -> np.ndarray:
+def build_tabular_from_samples(
+    samples: list[dict],
+    add_tstar_position_feature: bool = False,
+) -> np.ndarray:
     """
     Build fixed-size tabular features from (T, D) sequences.
     Per channel stats: mean, std, min, max, first, last, slope.
+
+    Optionally append a small nowcast-position feature block using the current t*.
     """
     feats = []
     for s in samples:
@@ -242,8 +247,37 @@ def build_tabular_from_samples(samples: list[dict]) -> np.ndarray:
         slope = ((x - mean) * t_center[:, None]).sum(axis=0) / t_var
 
         f = np.concatenate([mean, std, xmin, xmax, xfirst, xlast, slope], axis=0)
+        if add_tstar_position_feature:
+            season_length = int(s.get("season_length", s["X"].shape[0]))
+            season_length = max(season_length, 1)
+            tstar = int(s.get("tstar", season_length))
+            tstar_rel = float(tstar) / float(season_length)
+            f = np.concatenate([f, np.asarray([tstar_rel], dtype=np.float32)], axis=0)
         feats.append(f)
     return np.stack(feats, axis=0).astype(np.float32) if feats else np.zeros((0, 0), dtype=np.float32)
+
+
+def build_nowcast_sample_weights(
+    samples: list[dict],
+    *,
+    mode: str,
+    min_weight: float,
+) -> np.ndarray:
+    if mode == "none" or not samples:
+        return np.ones((len(samples),), dtype=np.float32)
+    if mode != "linear":
+        raise ValueError("--early_tstar_weight_mode must be one of: none, linear")
+    if not (0.0 < float(min_weight) <= 1.0):
+        raise ValueError("--early_tstar_weight_min must be in (0, 1]")
+
+    tstars = np.asarray([int(s.get("tstar", 0)) for s in samples], dtype=np.float32)
+    lo = float(tstars.min())
+    hi = float(tstars.max())
+    if hi <= lo:
+        return np.ones((len(samples),), dtype=np.float32)
+    rel = (tstars - lo) / (hi - lo)
+    w = float(min_weight) + (1.0 - float(min_weight)) * rel
+    return w.astype(np.float32)
 
 
 def make_event_labels(samples: list[dict]) -> np.ndarray:
@@ -259,6 +293,8 @@ def build_nowcast_samples(
     tstar_start: int | None = None,
     only_pre_event: bool = True,
     event_time_proxy: str = "r",
+    label_mode: str = "eventually",
+    label_horizon: int | None = None,
 ) -> list[dict]:
     out = []
     if not samples:
@@ -267,6 +303,10 @@ def build_nowcast_samples(
         raise ValueError("--nowcast_window must be >= 1")
     if stride <= 0:
         raise ValueError("--nowcast_stride must be >= 1")
+    if label_mode not in ("eventually", "within_h"):
+        raise ValueError("--nowcast_label_mode must be one of: eventually, within_h")
+    if label_mode == "within_h" and (label_horizon is None or int(label_horizon) <= 0):
+        raise ValueError("--nowcast_label_horizon must be >= 1 when --nowcast_label_mode=within_h")
 
     T = int(samples[0]["X"].shape[0])
     t0 = int(window if tstar_start is None else tstar_start)
@@ -290,7 +330,11 @@ def build_nowcast_samples(
         for tstar in range(t0, T + 1, stride):
             if only_pre_event and has_event and event_time is not None and tstar >= event_time:
                 continue
-            y_event = 1 if (has_event and event_time is not None and event_time > tstar) else 0
+            if label_mode == "eventually":
+                y_event = 1 if (has_event and event_time is not None and event_time > tstar) else 0
+            else:
+                delta = (int(event_time) - int(tstar)) if (has_event and event_time is not None) else None
+                y_event = 1 if (delta is not None and 0 < delta <= int(label_horizon)) else 0
             xw = x[(tstar - window):tstar, :]
             out.append(
                 {
@@ -303,6 +347,9 @@ def build_nowcast_samples(
                     "L": int(L_time) if has_event else None,
                     "R": int(R_time) if has_event else None,
                     "base_censor_type": ctype,
+                    "label_mode": str(label_mode),
+                    "label_horizon": None if label_horizon is None else int(label_horizon),
+                    "season_length": int(T),
                 }
             )
     return out
@@ -336,6 +383,14 @@ def main(
     nowcast_tstar_start: int | None,
     nowcast_only_pre_event: int,
     nowcast_event_time_proxy: str,
+    nowcast_label_mode: str,
+    nowcast_label_horizon: int | None,
+    add_tstar_position_feature: bool,
+    early_tstar_weight_mode: str,
+    early_tstar_weight_min: float,
+    xgb_max_depth: int | None,
+    xgb_min_child_weight: float | None,
+    xgb_gamma: float | None,
     use_wandb: bool,
     wandb_project: str | None,
     wandb_entity: str | None,
@@ -378,6 +433,14 @@ def main(
             "nowcast_tstar_start": None if nowcast_tstar_start is None else int(nowcast_tstar_start),
             "nowcast_only_pre_event": int(nowcast_only_pre_event),
             "nowcast_event_time_proxy": nowcast_event_time_proxy,
+            "nowcast_label_mode": nowcast_label_mode,
+            "nowcast_label_horizon": None if nowcast_label_horizon is None else int(nowcast_label_horizon),
+            "add_tstar_position_feature": bool(add_tstar_position_feature),
+            "early_tstar_weight_mode": early_tstar_weight_mode,
+            "early_tstar_weight_min": float(early_tstar_weight_min),
+            "xgb_max_depth": None if xgb_max_depth is None else int(xgb_max_depth),
+            "xgb_min_child_weight": None if xgb_min_child_weight is None else float(xgb_min_child_weight),
+            "xgb_gamma": None if xgb_gamma is None else float(xgb_gamma),
             "lr": float(C.LR),
             "weight_decay": float(C.WEIGHT_DECAY),
             "dropout": float(C.DROPOUT),
@@ -427,6 +490,8 @@ def main(
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
             event_time_proxy=nowcast_event_time_proxy,
+            label_mode=nowcast_label_mode,
+            label_horizon=nowcast_label_horizon,
         )
         val_s = build_nowcast_samples(
             val_s,
@@ -435,6 +500,8 @@ def main(
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
             event_time_proxy=nowcast_event_time_proxy,
+            label_mode=nowcast_label_mode,
+            label_horizon=nowcast_label_horizon,
         )
         test_s = build_nowcast_samples(
             test_s,
@@ -443,11 +510,16 @@ def main(
             tstar_start=nowcast_tstar_start,
             only_pre_event=bool(nowcast_only_pre_event),
             event_time_proxy=nowcast_event_time_proxy,
+            label_mode=nowcast_label_mode,
+            label_horizon=nowcast_label_horizon,
         )
         print(
             f"[nowcast] window={nowcast_window} stride={nowcast_stride} "
             f"tstar_start={nowcast_tstar_start} only_pre_event={bool(nowcast_only_pre_event)} "
-            f"event_time_proxy={nowcast_event_time_proxy} | "
+            f"event_time_proxy={nowcast_event_time_proxy} "
+            f"label_mode={nowcast_label_mode} label_horizon={nowcast_label_horizon} "
+            f"add_tstar_position_feature={bool(add_tstar_position_feature)} "
+            f"early_tstar_weight_mode={early_tstar_weight_mode} early_tstar_weight_min={float(early_tstar_weight_min):.3f} | "
             f"samples train={len(train_s)} val={len(val_s)} test={len(test_s)}"
         )
 
@@ -548,10 +620,15 @@ def main(
             )
             print(f"[seed {SEED}] DONE | best_epoch={best_epoch} | best_val_bce={best_val:.4f}")
         else:
-            X_tr = build_tabular_from_samples(train_s)
-            X_va = build_tabular_from_samples(val_s)
+            X_tr = build_tabular_from_samples(train_s, add_tstar_position_feature=bool(add_tstar_position_feature))
+            X_va = build_tabular_from_samples(val_s, add_tstar_position_feature=bool(add_tstar_position_feature))
             y_tr = make_event_labels(train_s)
             y_va = make_event_labels(val_s)
+            w_tr = build_nowcast_sample_weights(
+                train_s,
+                mode=early_tstar_weight_mode if task_mode == "nowcast" else "none",
+                min_weight=float(early_tstar_weight_min),
+            )
             tab_feature_dim = int(X_tr.shape[1]) if X_tr.size > 0 else 0
 
             if model == "logreg":
@@ -562,7 +639,7 @@ def main(
                     random_state=SEED,
                     solver="lbfgs",
                 )
-                clf.fit(X_tr, y_tr)
+                clf.fit(X_tr, y_tr, sample_weight=w_tr)
             elif model == "lgbm":
                 try:
                     from lightgbm import LGBMClassifier
@@ -577,24 +654,29 @@ def main(
                     random_state=SEED,
                     class_weight={0: 1.0, 1: float(event_pos_weight)},
                 )
-                clf.fit(X_tr, y_tr)
+                clf.fit(X_tr, y_tr, sample_weight=w_tr)
             elif model == "xgb":
                 try:
                     from xgboost import XGBClassifier
                 except Exception as e:
                     raise ImportError("xgboost is not installed. Install it to use --model xgb.") from e
+                xgb_max_depth_eff = 5 if xgb_max_depth is None else int(xgb_max_depth)
+                xgb_min_child_weight_eff = 1.0 if xgb_min_child_weight is None else float(xgb_min_child_weight)
+                xgb_gamma_eff = 0.0 if xgb_gamma is None else float(xgb_gamma)
                 clf = XGBClassifier(
                     n_estimators=400,
-                    max_depth=5,
+                    max_depth=xgb_max_depth_eff,
                     learning_rate=0.05,
                     subsample=0.9,
                     colsample_bytree=0.9,
                     reg_lambda=1.0,
+                    min_child_weight=xgb_min_child_weight_eff,
+                    gamma=xgb_gamma_eff,
                     random_state=SEED,
                     eval_metric="logloss",
                     scale_pos_weight=float(event_pos_weight),
                 )
-                clf.fit(X_tr, y_tr)
+                clf.fit(X_tr, y_tr, sample_weight=w_tr)
             else:
                 raise ValueError(f"unsupported --model: {model}")
 
@@ -655,6 +737,14 @@ def main(
         "nowcast_tstar_start": None if nowcast_tstar_start is None else int(nowcast_tstar_start),
         "nowcast_only_pre_event": int(nowcast_only_pre_event),
         "nowcast_event_time_proxy": nowcast_event_time_proxy,
+        "nowcast_label_mode": nowcast_label_mode,
+        "nowcast_label_horizon": None if nowcast_label_horizon is None else int(nowcast_label_horizon),
+        "add_tstar_position_feature": bool(add_tstar_position_feature),
+        "early_tstar_weight_mode": early_tstar_weight_mode,
+        "early_tstar_weight_min": float(early_tstar_weight_min),
+        "xgb_max_depth": None if xgb_max_depth is None else int(xgb_max_depth),
+        "xgb_min_child_weight": None if xgb_min_child_weight is None else float(xgb_min_child_weight),
+        "xgb_gamma": None if xgb_gamma is None else float(xgb_gamma),
         "norm_mean": x_mean,
         "norm_std": x_std,
         "tab_feature_dim": tab_feature_dim,
@@ -698,6 +788,14 @@ if __name__ == "__main__":
     p.add_argument("--nowcast_tstar_start", type=int, default=None)
     p.add_argument("--nowcast_only_pre_event", type=int, default=1)
     p.add_argument("--nowcast_event_time_proxy", type=str, default="r", choices=["r", "mid"])
+    p.add_argument("--nowcast_label_mode", type=str, default="eventually", choices=["eventually", "within_h"])
+    p.add_argument("--nowcast_label_horizon", type=int, default=None)
+    p.add_argument("--add_tstar_position_feature", action="store_true")
+    p.add_argument("--early_tstar_weight_mode", type=str, default="none", choices=["none", "linear"])
+    p.add_argument("--early_tstar_weight_min", type=float, default=0.3)
+    p.add_argument("--xgb_max_depth", type=int, default=None)
+    p.add_argument("--xgb_min_child_weight", type=float, default=None)
+    p.add_argument("--xgb_gamma", type=float, default=None)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -734,6 +832,14 @@ if __name__ == "__main__":
         nowcast_tstar_start=args.nowcast_tstar_start,
         nowcast_only_pre_event=args.nowcast_only_pre_event,
         nowcast_event_time_proxy=args.nowcast_event_time_proxy,
+        nowcast_label_mode=args.nowcast_label_mode,
+        nowcast_label_horizon=args.nowcast_label_horizon,
+        add_tstar_position_feature=args.add_tstar_position_feature,
+        early_tstar_weight_mode=args.early_tstar_weight_mode,
+        early_tstar_weight_min=args.early_tstar_weight_min,
+        xgb_max_depth=args.xgb_max_depth,
+        xgb_min_child_weight=args.xgb_min_child_weight,
+        xgb_gamma=args.xgb_gamma,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
