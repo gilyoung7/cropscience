@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from rice.configs import config as C
+from contextlib import nullcontext
 
 CTYPE_INTERVAL = 0  # interval=0, right=1, left=2
 
@@ -10,7 +11,7 @@ CTYPE_INTERVAL = 0  # interval=0, right=1, left=2
 # -------------------------
 # Loss (interval/right/left censored)
 # -------------------------
-def interval_nll_per_sample(hazard, L, R, ctype, Tend):
+def interval_nll_per_sample(hazard, L, R, ctype, Tend, tstar=None):
     """
     hazard: (B,T) in (0,1)
     L,R,ctype: (B,)
@@ -20,7 +21,13 @@ def interval_nll_per_sample(hazard, L, R, ctype, Tend):
     assert Tcur == Tend
 
     log_surv_terms = torch.log1p(-hazard)          # (B,T)
-    logS = torch.cumsum(log_surv_terms, dim=1)     # log S_t
+    logS_full = torch.cumsum(log_surv_terms, dim=1)  # log S_t
+    if tstar is None:
+        logS = logS_full
+    else:
+        idx_tstar = (tstar.long().clamp(min=1, max=Tend) - 1).view(-1, 1)
+        logS_at_tstar = logS_full.gather(1, idx_tstar).squeeze(1)
+        logS = logS_full - logS_at_tstar.view(-1, 1)
 
     L = torch.clamp(L, 1, Tend)
     R = torch.clamp(R, 1, Tend)
@@ -73,6 +80,814 @@ def weighted_loss_from_ctype(nll_vec, ctype):
     return (w * nll_vec).mean()
 
 
+def _class_weights_from_ctype(ctype):
+    w = torch.ones_like(ctype, dtype=torch.float32)
+    w = torch.where(ctype == 0, w.new_tensor(C.W_INTERVAL), w)
+    w = torch.where(ctype == 1, w.new_tensor(C.W_RIGHT), w)
+    w = torch.where(ctype == 2, w.new_tensor(C.W_LEFT), w)
+    return w
+
+
+def _early_tstar_weights(tstar_f, Tend, min_weight: float):
+    if min_weight >= 1.0:
+        return torch.ones_like(tstar_f, dtype=torch.float32)
+    denom = max(int(Tend) - 1, 1)
+    rel = (tstar_f.float() - 1.0) / float(denom)
+    w = float(min_weight) + (1.0 - float(min_weight)) * rel
+    return torch.clamp(w, min=float(min_weight), max=1.0)
+
+
+def _lead_window_weights(
+    L_f,
+    ctype_f,
+    tstar_f,
+    *,
+    enabled: bool,
+    target_lead_min: int,
+    target_lead_max: int,
+    support_lead_min: int,
+    support_lead_max: int,
+    min_weight: float,
+):
+    if not enabled:
+        return torch.ones_like(tstar_f, dtype=torch.float32)
+    if not (int(support_lead_min) <= int(target_lead_min) <= int(target_lead_max) <= int(support_lead_max)):
+        raise ValueError("lead weighting requires support_min <= target_min <= target_max <= support_max")
+
+    w = torch.ones_like(tstar_f, dtype=torch.float32)
+    mi = ctype_f == CTYPE_INTERVAL
+    if not mi.any():
+        return w
+
+    lead = (L_f.float() + 1.0) - tstar_f.float()
+    ww = torch.full_like(lead, float(min_weight), dtype=torch.float32)
+    target = (lead >= float(target_lead_min)) & (lead <= float(target_lead_max))
+    ww = torch.where(target, ww.new_tensor(1.0), ww)
+
+    left = (lead >= float(support_lead_min)) & (lead < float(target_lead_min))
+    if int(target_lead_min) > int(support_lead_min):
+        rel = (lead - float(support_lead_min)) / float(int(target_lead_min) - int(support_lead_min))
+        ww = torch.where(left, float(min_weight) + (1.0 - float(min_weight)) * rel, ww)
+
+    right = (lead > float(target_lead_max)) & (lead <= float(support_lead_max))
+    if int(support_lead_max) > int(target_lead_max):
+        rel = (float(support_lead_max) - lead) / float(int(support_lead_max) - int(target_lead_max))
+        ww = torch.where(right, float(min_weight) + (1.0 - float(min_weight)) * rel, ww)
+
+    w = torch.where(mi, torch.clamp(ww, min=float(min_weight), max=1.0), w)
+    return w
+
+
+def _lead_loss_mode_weights(
+    L_f,
+    ctype_f,
+    tstar_f,
+    *,
+    mode: str,
+    lead_min: int,
+    lead_max: int,
+    mid_lead_min: int,
+    mid_lead_max: int,
+    late_exclude_days: int,
+    weight_1_14: float = 0.0,
+    weight_15_29: float = 0.7,
+    weight_30_60: float = 1.5,
+    weight_61_75: float = 1.0,
+    weight_gt75: float = 0.25,
+):
+    """
+    Additional Stage-2 event-row loss weighting by lead.
+
+    This does not remove t* rows from the grouped sequence. It only changes the
+    flat per-row loss contribution after causal context has been computed.
+    Right-censored rows have no event day, so they keep weight 1.
+    """
+    mode = str(mode).lower()
+    if mode in ("none", "", "off", "false", "0"):
+        return torch.ones_like(tstar_f, dtype=torch.float32)
+    if mode not in {"mask", "weighted"}:
+        raise ValueError(f"Unknown stage2_lead_loss_mode: {mode}")
+    if not (int(lead_min) <= int(mid_lead_min) <= int(mid_lead_max) <= int(lead_max)):
+        raise ValueError("lead loss mode requires lead_min <= mid_lead_min <= mid_lead_max <= lead_max")
+
+    w = torch.ones_like(tstar_f, dtype=torch.float32)
+    mi = ctype_f == CTYPE_INTERVAL
+    if not mi.any():
+        return w
+
+    # Interval-censored event starts at L+1 in the current label convention.
+    lead = (L_f.float() + 1.0) - tstar_f.float()
+    ew = torch.ones_like(lead, dtype=torch.float32)
+    if mode == "mask":
+        ew = ((lead >= float(lead_min)) & (lead <= float(lead_max))).to(torch.float32)
+    else:
+        early = lead > float(lead_max)
+        support_late = (lead >= float(lead_min)) & (lead < float(mid_lead_min))
+        target = (lead >= float(mid_lead_min)) & (lead <= float(mid_lead_max))
+        support_early = (lead > float(mid_lead_max)) & (lead <= float(lead_max))
+        late = lead <= float(late_exclude_days)
+        ew = torch.full_like(lead, float(weight_gt75), dtype=torch.float32)
+        ew = torch.where(early, ew.new_tensor(float(weight_gt75)), ew)
+        ew = torch.where(support_late, ew.new_tensor(float(weight_15_29)), ew)
+        ew = torch.where(target, ew.new_tensor(float(weight_30_60)), ew)
+        ew = torch.where(support_early, ew.new_tensor(float(weight_61_75)), ew)
+        ew = torch.where(late, ew.new_tensor(float(weight_1_14)), ew)
+        ew = torch.where(lead < 1.0, ew.new_tensor(0.0), ew)
+
+    return torch.where(mi, ew, w)
+
+
+def _lead_bucket_counts(L_f, ctype_f, tstar_f, *, late_exclude_days: int, lead_min: int, lead_max: int, mid_lead_min: int, mid_lead_max: int):
+    mi = ctype_f == CTYPE_INTERVAL
+    out = {"lead_1_14": 0, "lead_15_29": 0, "lead_30_60": 0, "lead_61_75": 0, "lead_gt75": 0}
+    if not mi.any():
+        return out
+    lead = ((L_f.float() + 1.0) - tstar_f.float())[mi]
+    out["lead_1_14"] = int(((lead >= 1.0) & (lead <= float(late_exclude_days))).sum().item())
+    out["lead_15_29"] = int(((lead >= float(lead_min)) & (lead < float(mid_lead_min))).sum().item())
+    out["lead_30_60"] = int(((lead >= float(mid_lead_min)) & (lead <= float(mid_lead_max))).sum().item())
+    out["lead_61_75"] = int(((lead > float(mid_lead_max)) & (lead <= float(lead_max))).sum().item())
+    out["lead_gt75"] = int((lead > float(lead_max)).sum().item())
+    return out
+
+
+def conditional_pmf_entropy(hazard_f, tstar_f, Tend: int, eps: float = 1e-12):
+    pmf, _, _ = hazard_to_pmf_cdf_logS(hazard_f, tstar=tstar_f)
+    idx = torch.arange(int(Tend), device=pmf.device).view(1, -1)
+    post_mask = idx >= tstar_f.long().clamp(min=1, max=int(Tend)).view(-1, 1)
+    pmf_post = torch.where(post_mask, pmf, torch.zeros_like(pmf))
+    entropy = -(pmf_post * torch.log(pmf_post.clamp_min(float(eps)))).sum(dim=1)
+    return entropy
+
+
+def pmf_entropy(hazard_f, tstar_f, Tend: int, *, conditional: bool = True, eps: float = 1e-12):
+    if bool(conditional):
+        return conditional_pmf_entropy(hazard_f, tstar_f, Tend=Tend, eps=eps)
+    pmf, _, _ = hazard_to_pmf_cdf_logS(hazard_f, tstar=None)
+    entropy = -(pmf * torch.log(pmf.clamp_min(float(eps)))).sum(dim=1)
+    return entropy
+
+
+def asymmetric_mu_loss(
+    mu,
+    L,
+    R,
+    ctype,
+    *,
+    Tend: int,
+    asym_weight: float = 10.0,
+    right_weight: float = 0.3,
+    target_offset: float = 0.0,
+):
+    """
+    Parametric Gaussian PMF loss (Phase 5+).
+
+    Event rows (ctype==0): target = L + target_offset. By default target=L
+        (the last day before the event window); set target_offset>0 to bias
+        the target into the interval (e.g. +5 to center on the typical event
+        midpoint when R-L≈15).
+        delta = mu - target. Asymmetric MSE: weight `asym_weight` if delta > 0
+        (predicted later than target, hurts EarlyRecall), weight 1.0 if delta <= 0.
+    Right-censored (ctype==1): target = Tend, scaled by `right_weight`.
+    Left-censored (ctype==2): ignored.
+    """
+    mi = ctype == CTYPE_INTERVAL
+    mr = ctype == 1
+    parts: dict = {
+        "mu_event": 0.0,
+        "mu_event_n": 0,
+        "mu_right": 0.0,
+        "mu_right_n": 0,
+        "mu_mean_event": float("nan"),
+        "mu_minus_L_mean": float("nan"),
+        "mu_minus_L_abs_mean": float("nan"),
+        "mu_pos_frac": float("nan"),
+        "mu_minus_target_mean": float("nan"),
+        "target_offset": float(target_offset),
+    }
+    loss = mu.new_tensor(0.0)
+
+    if mi.any():
+        L_e = L[mi].float()
+        target = L_e + float(target_offset)
+        mu_e = mu[mi]
+        delta = mu_e - target
+        weight = torch.where(
+            delta > 0,
+            mu.new_tensor(float(asym_weight)),
+            mu.new_tensor(1.0),
+        )
+        loss_event = (weight * delta * delta).mean()
+        loss = loss + loss_event
+        parts["mu_event"] = float(loss_event.detach().item())
+        parts["mu_event_n"] = int(mi.long().sum().item())
+        parts["mu_mean_event"] = float(mu_e.detach().mean().item())
+        # mu_minus_L_mean is reported against raw L for diagnostic continuity.
+        delta_L = (mu_e - L_e).detach()
+        parts["mu_minus_L_mean"] = float(delta_L.mean().item())
+        parts["mu_minus_L_abs_mean"] = float(delta_L.abs().mean().item())
+        parts["mu_pos_frac"] = float((delta_L > 0).float().mean().item())
+        parts["mu_minus_target_mean"] = float(delta.detach().mean().item())
+
+    if mr.any():
+        target_r = mu.new_tensor(float(Tend))
+        delta_r = mu[mr] - target_r
+        loss_right = (delta_r * delta_r).mean() * float(right_weight)
+        loss = loss + loss_right
+        parts["mu_right"] = float(loss_right.detach().item())
+        parts["mu_right_n"] = int(mr.long().sum().item())
+
+    return loss, parts
+
+
+def expected_time_location_loss(hazard_f, L_f, R_f, ctype_f, Tend: int):
+    mi = ctype_f == CTYPE_INTERVAL
+    if not mi.any():
+        return None, {}
+    pmf, _, _ = hazard_to_pmf_cdf_logS(hazard_f[mi], tstar=None)
+    t = torch.arange(1, int(Tend) + 1, device=hazard_f.device, dtype=pmf.dtype).view(1, -1)
+    exp_t = (pmf * t).sum(dim=1)
+    true_mid = (L_f[mi].float() + R_f[mi].float()) * 0.5
+    err = exp_t - true_mid
+    loss = (err ** 2).mean()
+    stats = {
+        "loc_loss": float(loss.detach().item()),
+        "loc_abs_err_mean": float(err.detach().abs().mean().item()),
+        "loc_err_mean": float(err.detach().mean().item()),
+        "loc_err_std": float(err.detach().std(unbiased=False).item()) if err.numel() > 1 else 0.0,
+        "loc_n": int(err.numel()),
+    }
+    return loss, stats
+
+
+def expected_time_location_loss_with_leads(hazard_f, L_f, R_f, ctype_f, tstar_f, Tend: int):
+    loss, stats = expected_time_location_loss(hazard_f, L_f, R_f, ctype_f, Tend=Tend)
+    mi = ctype_f == CTYPE_INTERVAL
+    if loss is None or not mi.any():
+        return loss, stats
+
+    with torch.no_grad():
+        pmf, _, _ = hazard_to_pmf_cdf_logS(hazard_f[mi], tstar=None)
+        t = torch.arange(1, int(Tend) + 1, device=hazard_f.device, dtype=pmf.dtype).view(1, -1)
+        exp_t = (pmf * t).sum(dim=1)
+        true_mid = (L_f[mi].float() + R_f[mi].float()) * 0.5
+        abs_err = (exp_t - true_mid).abs()
+        lead = (L_f[mi].float() + 1.0) - tstar_f[mi].float()
+        bins = {
+            "1_14": (lead >= 1.0) & (lead <= 14.0),
+            "15_29": (lead >= 15.0) & (lead <= 29.0),
+            "30_60": (lead >= 30.0) & (lead <= 60.0),
+            "61_75": (lead >= 61.0) & (lead <= 75.0),
+            "gt75": lead > 75.0,
+        }
+        for name, mask in bins.items():
+            key = f"loc_abs_err_{name}"
+            nkey = f"loc_n_{name}"
+            if mask.any():
+                stats[key] = float(abs_err[mask].mean().item())
+                stats[nkey] = int(mask.long().sum().item())
+            else:
+                stats[key] = float("nan")
+                stats[nkey] = 0
+    return loss, stats
+
+
+def _grouped_weighted_base_loss(
+    nll_vec,
+    L_f,
+    ctype_f,
+    tstar_f,
+    group_idx_f,
+    B,
+    *,
+    Tend,
+    early_tstar_weight_min: float,
+    site_year_mean_loss: bool,
+    lead_weighting: bool = False,
+    target_lead_min: int = 30,
+    target_lead_max: int = 60,
+    support_lead_min: int = 15,
+    support_lead_max: int = 75,
+    lead_weight_min: float = 0.2,
+    lead_loss_mode: str = "none",
+    lead_loss_min: int = 15,
+    lead_loss_max: int = 75,
+    lead_loss_mid_min: int = 30,
+    lead_loss_mid_max: int = 60,
+    lead_loss_late_exclude_days: int = 14,
+    lead_loss_weight_1_14: float = 0.0,
+    lead_loss_weight_15_29: float = 0.7,
+    lead_loss_weight_30_60: float = 1.5,
+    lead_loss_weight_61_75: float = 1.0,
+    lead_loss_weight_gt75: float = 0.25,
+):
+    cw = _class_weights_from_ctype(ctype_f)
+    tw = _early_tstar_weights(tstar_f, Tend=Tend, min_weight=float(early_tstar_weight_min))
+    lw = _lead_window_weights(
+        L_f,
+        ctype_f,
+        tstar_f,
+        enabled=bool(lead_weighting),
+        target_lead_min=int(target_lead_min),
+        target_lead_max=int(target_lead_max),
+        support_lead_min=int(support_lead_min),
+        support_lead_max=int(support_lead_max),
+        min_weight=float(lead_weight_min),
+    )
+    llw = _lead_loss_mode_weights(
+        L_f,
+        ctype_f,
+        tstar_f,
+        mode=str(lead_loss_mode),
+        lead_min=int(lead_loss_min),
+        lead_max=int(lead_loss_max),
+        mid_lead_min=int(lead_loss_mid_min),
+        mid_lead_max=int(lead_loss_mid_max),
+        late_exclude_days=int(lead_loss_late_exclude_days),
+        weight_1_14=float(lead_loss_weight_1_14),
+        weight_15_29=float(lead_loss_weight_15_29),
+        weight_30_60=float(lead_loss_weight_30_60),
+        weight_61_75=float(lead_loss_weight_61_75),
+        weight_gt75=float(lead_loss_weight_gt75),
+    )
+    w = cw * tw * lw * llw
+
+    if site_year_mean_loss:
+        numer = torch.zeros(B, device=nll_vec.device, dtype=nll_vec.dtype)
+        denom = torch.zeros(B, device=nll_vec.device, dtype=nll_vec.dtype)
+        numer.index_add_(0, group_idx_f, w * nll_vec)
+        denom.index_add_(0, group_idx_f, w)
+        mg = denom > 0
+        if mg.any():
+            return (numer[mg] / denom[mg]).mean()
+        return torch.tensor(0.0, device=nll_vec.device, dtype=nll_vec.dtype)
+
+    # keep baseline-compatible behavior: mean(w * nll), not normalized by mean(w)
+    return (w * nll_vec).mean()
+
+
+def _flatten_grouped_valid(hazard, L, R, ctype, valid_mask):
+    """
+    Convert grouped tensors to flat per-t* tensors using valid_mask.
+    hazard: (B,K,T), L/R/ctype/valid_mask: (B,K)
+    returns:
+      hazard_f: (N,T), L_f/R_f/ctype_f: (N,), n_valid
+    """
+    B, K, T = hazard.shape
+    assert L.shape == (B, K)
+    assert R.shape == (B, K)
+    assert ctype.shape == (B, K)
+    assert valid_mask.shape == (B, K)
+    m = valid_mask.reshape(-1)
+    n_valid = int(m.long().sum().item())
+    if n_valid <= 0:
+        return None, None, None, None, 0
+    hazard_f = hazard.reshape(B * K, T)[m]
+    L_f = L.reshape(B * K)[m]
+    R_f = R.reshape(B * K)[m]
+    ctype_f = ctype.reshape(B * K)[m]
+    return hazard_f, L_f, R_f, ctype_f, n_valid
+
+
+def _resolve_autocast_dtype(amp_dtype: str):
+    s = str(amp_dtype).lower()
+    if s in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if s in ("fp16", "float16", "half"):
+        return torch.float16
+    raise ValueError(f"Unknown amp_dtype: {amp_dtype}. expected one of: bf16, fp16")
+
+
+def _autocast_ctx(device: torch.device, use_amp: bool, amp_dtype: str):
+    if not use_amp or device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=_resolve_autocast_dtype(amp_dtype))
+
+
+def run_epoch_weighted_grouped(
+    model,
+    opt,
+    loader,
+    Tend,
+    device,
+    train=True,
+    lambda_mass: float = 0.0,
+    lambda_right_late: float = 0.0,
+    right_late_tau: float | None = None,
+    early_tstar_weight_min: float = 1.0,
+    site_year_mean_loss: bool = False,
+    lead_weighting: bool = False,
+    target_lead_min: int = 30,
+    target_lead_max: int = 60,
+    support_lead_min: int = 15,
+    support_lead_max: int = 75,
+    lead_weight_min: float = 0.2,
+    mass_lead_weighting: bool = False,
+    lead_loss_mode: str = "none",
+    lead_loss_min: int = 15,
+    lead_loss_max: int = 75,
+    lead_loss_mid_min: int = 30,
+    lead_loss_mid_max: int = 60,
+    lead_loss_late_exclude_days: int = 14,
+    lead_loss_weight_1_14: float = 0.0,
+    lead_loss_weight_15_29: float = 0.7,
+    lead_loss_weight_30_60: float = 1.5,
+    lead_loss_weight_61_75: float = 1.0,
+    lead_loss_weight_gt75: float = 0.25,
+    log_mass: bool = False,
+    entropy_lambda: float = 0.0,
+    entropy_conditional: bool = True,
+    location_lambda: float = 0.0,
+    conditional_survival: bool = True,
+    epoch_idx: int | None = None,
+    return_parts: bool = False,
+    use_amp: bool = False,
+    amp_dtype: str = "bf16",
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    max_batches: int | None = None,
+):
+    model.train(train)
+    total, n = 0.0, 0
+    base_total = 0.0
+    mass_total = 0.0
+    late_total = 0.0
+    entropy_total = 0.0
+    location_total = 0.0
+    mr_total = 0.0
+    logged = False
+    bad_batches = 0
+    lead_count_totals = {"lead_1_14": 0, "lead_15_29": 0, "lead_30_60": 0, "lead_61_75": 0, "lead_gt75": 0}
+    lead_weight_sum = 0.0
+    lead_weight_n = 0
+
+    if early_tstar_weight_min <= 0.0 or early_tstar_weight_min > 1.0:
+        raise ValueError("early_tstar_weight_min must be in (0, 1]")
+
+    for batch_idx, (X, L, R, ctype, tstar, valid_mask) in enumerate(loader):
+        if max_batches is not None and batch_idx >= int(max_batches):
+            break
+        X = X.to(device, non_blocking=True)
+        L = L.to(device, non_blocking=True)
+        R = R.to(device, non_blocking=True)
+        ctype = ctype.to(device, non_blocking=True)
+        tstar = tstar.to(device, non_blocking=True)
+        valid_mask = valid_mask.to(device, non_blocking=True)
+
+        with torch.set_grad_enabled(bool(train)), _autocast_ctx(device, use_amp=use_amp, amp_dtype=amp_dtype):
+            hazard = model(X, tstar=tstar, valid_mask=valid_mask)
+
+            hazard_f, L_f, R_f, ctype_f, n_valid = _flatten_grouped_valid(hazard, L, R, ctype, valid_mask)
+            if n_valid <= 0:
+                continue
+            if not torch.isfinite(hazard_f).all():
+                bad_batches += 1
+                continue
+            flat_idx = torch.arange(valid_mask.numel(), device=valid_mask.device)[valid_mask.reshape(-1)]
+            group_idx_f = torch.div(flat_idx, valid_mask.shape[1], rounding_mode="floor")
+            tstar_f = tstar.reshape(-1)[valid_mask.reshape(-1)]
+
+            if log_mass:
+                batch_lead_counts = _lead_bucket_counts(
+                    L_f,
+                    ctype_f,
+                    tstar_f,
+                    late_exclude_days=int(lead_loss_late_exclude_days),
+                    lead_min=int(lead_loss_min),
+                    lead_max=int(lead_loss_max),
+                    mid_lead_min=int(lead_loss_mid_min),
+                    mid_lead_max=int(lead_loss_mid_max),
+                )
+                for key, value in batch_lead_counts.items():
+                    lead_count_totals[key] += int(value)
+                lead_mode_w_dbg = _lead_loss_mode_weights(
+                    L_f,
+                    ctype_f,
+                    tstar_f,
+                    mode=str(lead_loss_mode),
+                    lead_min=int(lead_loss_min),
+                    lead_max=int(lead_loss_max),
+                    mid_lead_min=int(lead_loss_mid_min),
+                    mid_lead_max=int(lead_loss_mid_max),
+                    late_exclude_days=int(lead_loss_late_exclude_days),
+                    weight_1_14=float(lead_loss_weight_1_14),
+                    weight_15_29=float(lead_loss_weight_15_29),
+                    weight_30_60=float(lead_loss_weight_30_60),
+                    weight_61_75=float(lead_loss_weight_61_75),
+                    weight_gt75=float(lead_loss_weight_gt75),
+                )
+                mi_dbg = ctype_f == CTYPE_INTERVAL
+                if mi_dbg.any():
+                    lead_weight_sum += float(lead_mode_w_dbg[mi_dbg].sum().item())
+                    lead_weight_n += int(mi_dbg.long().sum().item())
+
+            event_mask = ctype_f == CTYPE_INTERVAL
+            if bool(conditional_survival) and event_mask.any():
+                bad = event_mask & (tstar_f >= L_f)
+                assert not bad.any(), f"{int(bad.long().sum().item())} event rows have tstar >= L; dataset filtering broken"
+
+            is_gaussian = str(getattr(model, "pmf_mode", "hazard")) == "gaussian"
+            mu_parts: dict = {}
+            nll_tstar = tstar_f if bool(conditional_survival) else None
+            if is_gaussian:
+                mu_BK = getattr(model, "_last_mu_BK", None)
+                if mu_BK is None:
+                    raise RuntimeError("model.pmf_mode='gaussian' but _last_mu_BK is None after forward")
+                mu_f = mu_BK.reshape(-1)[valid_mask.reshape(-1)]
+                base_loss, mu_parts = asymmetric_mu_loss(
+                    mu_f,
+                    L_f,
+                    R_f,
+                    ctype_f,
+                    Tend=Tend,
+                    asym_weight=float(getattr(model, "asym_weight", 10.0)),
+                    right_weight=float(getattr(model, "right_weight", 0.3)),
+                    target_offset=float(getattr(model, "target_offset", 0.0)),
+                )
+            else:
+                nll_vec = interval_nll_per_sample(hazard_f, L_f, R_f, ctype_f, Tend=Tend, tstar=nll_tstar)
+                base_loss = _grouped_weighted_base_loss(
+                    nll_vec,
+                    L_f,
+                    ctype_f,
+                    tstar_f,
+                    group_idx_f,
+                    B=valid_mask.shape[0],
+                    Tend=Tend,
+                    early_tstar_weight_min=float(early_tstar_weight_min),
+                    site_year_mean_loss=bool(site_year_mean_loss),
+                    lead_weighting=bool(lead_weighting),
+                    target_lead_min=int(target_lead_min),
+                    target_lead_max=int(target_lead_max),
+                    support_lead_min=int(support_lead_min),
+                    support_lead_max=int(support_lead_max),
+                    lead_weight_min=float(lead_weight_min),
+                    lead_loss_mode=str(lead_loss_mode),
+                    lead_loss_min=int(lead_loss_min),
+                    lead_loss_max=int(lead_loss_max),
+                    lead_loss_mid_min=int(lead_loss_mid_min),
+                    lead_loss_mid_max=int(lead_loss_mid_max),
+                    lead_loss_late_exclude_days=int(lead_loss_late_exclude_days),
+                    lead_loss_weight_1_14=float(lead_loss_weight_1_14),
+                    lead_loss_weight_15_29=float(lead_loss_weight_15_29),
+                    lead_loss_weight_30_60=float(lead_loss_weight_30_60),
+                    lead_loss_weight_61_75=float(lead_loss_weight_61_75),
+                    lead_loss_weight_gt75=float(lead_loss_weight_gt75),
+                )
+            loss = base_loss
+            mass_loss_tensor = None
+            late_loss_tensor = None
+            entropy_loss_tensor = None
+            location_loss_tensor = None
+            location_stats = {}
+            mr = (ctype_f == 1)
+            mr_total += float(mr.float().sum().item())
+
+        if log_mass and not logged:
+            mi = (ctype_f == CTYPE_INTERVAL)
+            mr = (ctype_f == 1)
+            mi_frac = float(mi.float().mean().item())
+            mr_frac = float(mr.float().mean().item())
+            if mi.any():
+                _, _, logS = hazard_to_pmf_cdf_logS(hazard_f, tstar=nll_tstar)
+                idxL = (torch.clamp(L_f, 1, Tend) - 1).long()
+                idxR = (torch.clamp(R_f, 1, Tend) - 1).long()
+                logS_L = logS.gather(1, idxL.view(-1, 1)).squeeze(1)
+                logS_R = logS.gather(1, idxR.view(-1, 1)).squeeze(1)
+                mass = (torch.exp(logS_L) - torch.exp(logS_R)).clamp(min=0.0)
+                mass_mi = mass[mi]
+                mass_mean = float(mass_mi.mean().item())
+                mass_min = float(mass_mi.min().item())
+                mass_max = float(mass_mi.max().item())
+                mass_loss_tensor = -mass_mi.mean()
+                mass_loss_val = float(mass_loss_tensor.item())
+            else:
+                mass_mean = float("nan")
+                mass_min = float("nan")
+                mass_max = float("nan")
+                mass_loss_val = 0.0
+
+            late_mean = float("nan")
+            late_min = float("nan")
+            late_max = float("nan")
+            late_loss_val = 0.0
+            if mr.any() and (lambda_right_late > 0) and (right_late_tau is not None):
+                pmf, _, logS_l = hazard_to_pmf_cdf_logS(hazard_f, tstar=nll_tstar)
+                t = torch.arange(1, Tend + 1, device=hazard_f.device, dtype=pmf.dtype).view(1, -1)
+                exp_doy = (pmf * t).sum(dim=1) + torch.exp(logS_l[:, -1]) * float(Tend)
+                late_margin = torch.relu(exp_doy[mr] - float(right_late_tau))
+                if late_margin.numel() > 0:
+                    late_mean = float(late_margin.mean().item())
+                    late_min = float(late_margin.min().item())
+                    late_max = float(late_margin.max().item())
+                    late_loss_val = float(late_mean)
+            prefix = f"[mass] epoch {epoch_idx:02d} " if epoch_idx is not None else "[mass] "
+            print(
+                prefix
+                + f"mi_frac={mi_frac:.4f} mr_frac={mr_frac:.4f} mass_mean={mass_mean:.6f} "
+                + f"mass_min={mass_min:.6f} mass_max={mass_max:.6f} "
+                + f"mass_loss={mass_loss_val:.6f} lambda_mass={lambda_mass} "
+                + f"early_tstar_weight_min={float(early_tstar_weight_min):.3f} "
+                + f"site_year_mean_loss={int(bool(site_year_mean_loss))}"
+            )
+            print(
+                prefix
+                + f"late_loss_mean={late_loss_val:.6f} late_min={late_min:.6f} late_max={late_max:.6f} "
+                + f"lambda_right_late={lambda_right_late} right_late_tau={right_late_tau}"
+            )
+            lead_counts = _lead_bucket_counts(
+                L_f,
+                ctype_f,
+                tstar_f,
+                late_exclude_days=int(lead_loss_late_exclude_days),
+                lead_min=int(lead_loss_min),
+                lead_max=int(lead_loss_max),
+                mid_lead_min=int(lead_loss_mid_min),
+                mid_lead_max=int(lead_loss_mid_max),
+            )
+            lead_mode_w = _lead_loss_mode_weights(
+                L_f,
+                ctype_f,
+                tstar_f,
+                mode=str(lead_loss_mode),
+                lead_min=int(lead_loss_min),
+                lead_max=int(lead_loss_max),
+                mid_lead_min=int(lead_loss_mid_min),
+                mid_lead_max=int(lead_loss_mid_max),
+                late_exclude_days=int(lead_loss_late_exclude_days),
+                weight_1_14=float(lead_loss_weight_1_14),
+                weight_15_29=float(lead_loss_weight_15_29),
+                weight_30_60=float(lead_loss_weight_30_60),
+                weight_61_75=float(lead_loss_weight_61_75),
+                weight_gt75=float(lead_loss_weight_gt75),
+            )
+            mi_for_weight = ctype_f == CTYPE_INTERVAL
+            lead_weight_mean = float(lead_mode_w[mi_for_weight].mean().item()) if mi_for_weight.any() else float("nan")
+            print(
+                prefix
+                + f"lead_loss_mode={lead_loss_mode} "
+                + f"lead_counts={lead_counts} lead_loss_weight_mean={lead_weight_mean:.6f}"
+            )
+            entropy_dbg = pmf_entropy(hazard_f, tstar_f, Tend=Tend, conditional=bool(entropy_conditional))
+            entropy_mean_dbg = float(entropy_dbg.mean().item()) if entropy_dbg.numel() else float("nan")
+            print(
+                prefix
+                + f"entropy_mean={entropy_mean_dbg:.6f} "
+                + f"entropy_lambda={float(entropy_lambda):.6f} "
+                + f"lambda_entropy={float(entropy_lambda) * entropy_mean_dbg:.6f} "
+                + f"entropy_conditional={int(bool(entropy_conditional))}"
+            )
+            loc_dbg, loc_stats_dbg = expected_time_location_loss_with_leads(hazard_f, L_f, R_f, ctype_f, tstar_f, Tend=Tend)
+            loc_mean_dbg = float(loc_stats_dbg.get("loc_loss", float("nan")))
+            print(
+                prefix
+                + f"location_loss={loc_mean_dbg:.6f} "
+                + f"lambda_location={float(location_lambda):.6f} "
+                + f"lambda_location_term={float(location_lambda) * loc_mean_dbg:.6f} "
+                + f"loc_abs_err_mean={float(loc_stats_dbg.get('loc_abs_err_mean', float('nan'))):.6f} "
+                + f"loc_err_mean={float(loc_stats_dbg.get('loc_err_mean', float('nan'))):.6f} "
+                + f"loc_err_std={float(loc_stats_dbg.get('loc_err_std', float('nan'))):.6f} "
+                + f"loc_n={int(loc_stats_dbg.get('loc_n', 0))}"
+            )
+            print(
+                prefix
+                + "location_abs_err_by_lead="
+                + "{"
+                + f"'1_14': {float(loc_stats_dbg.get('loc_abs_err_1_14', float('nan'))):.3f} (n={int(loc_stats_dbg.get('loc_n_1_14', 0))}), "
+                + f"'15_29': {float(loc_stats_dbg.get('loc_abs_err_15_29', float('nan'))):.3f} (n={int(loc_stats_dbg.get('loc_n_15_29', 0))}), "
+                + f"'30_60': {float(loc_stats_dbg.get('loc_abs_err_30_60', float('nan'))):.3f} (n={int(loc_stats_dbg.get('loc_n_30_60', 0))}), "
+                + f"'61_75': {float(loc_stats_dbg.get('loc_abs_err_61_75', float('nan'))):.3f} (n={int(loc_stats_dbg.get('loc_n_61_75', 0))}), "
+                + f"'gt75': {float(loc_stats_dbg.get('loc_abs_err_gt75', float('nan'))):.3f} (n={int(loc_stats_dbg.get('loc_n_gt75', 0))})"
+                + "}"
+            )
+            if is_gaussian and mu_parts:
+                print(
+                    prefix
+                    + f"pmf_mode=gaussian sigma={float(getattr(model, 'gaussian_sigma', 5.0)):.3f} "
+                    + f"asym_w={float(getattr(model, 'asym_weight', 10.0)):.2f} "
+                    + f"right_w={float(getattr(model, 'right_weight', 0.3)):.2f} "
+                    + f"target_offset={float(mu_parts.get('target_offset', 0.0)):.2f} "
+                    + f"mu_event_loss={float(mu_parts.get('mu_event', float('nan'))):.4f} "
+                    + f"mu_event_n={int(mu_parts.get('mu_event_n', 0))} "
+                    + f"mu_right_loss={float(mu_parts.get('mu_right', float('nan'))):.4f} "
+                    + f"mu_right_n={int(mu_parts.get('mu_right_n', 0))} "
+                    + f"mu_mean_event={float(mu_parts.get('mu_mean_event', float('nan'))):.3f} "
+                    + f"mu_minus_L_mean={float(mu_parts.get('mu_minus_L_mean', float('nan'))):.3f} "
+                    + f"mu_minus_L_abs_mean={float(mu_parts.get('mu_minus_L_abs_mean', float('nan'))):.3f} "
+                    + f"mu_minus_target_mean={float(mu_parts.get('mu_minus_target_mean', float('nan'))):.3f} "
+                    + f"mu_pos_frac={float(mu_parts.get('mu_pos_frac', float('nan'))):.3f}"
+                )
+            logged = True
+
+        if (not is_gaussian) and lambda_mass > 0:
+            mi = (ctype_f == CTYPE_INTERVAL)
+            if mi.any():
+                _, _, logS = hazard_to_pmf_cdf_logS(hazard_f, tstar=nll_tstar)
+                idxL = (torch.clamp(L_f, 1, Tend) - 1).long()
+                idxR = (torch.clamp(R_f, 1, Tend) - 1).long()
+                logS_L = logS.gather(1, idxL.view(-1, 1)).squeeze(1)
+                logS_R = logS.gather(1, idxR.view(-1, 1)).squeeze(1)
+                mass = (torch.exp(logS_L) - torch.exp(logS_R)).clamp(min=0.0)
+                if bool(mass_lead_weighting):
+                    mw = _lead_window_weights(
+                        L_f,
+                        ctype_f,
+                        tstar_f,
+                        enabled=True,
+                        target_lead_min=int(target_lead_min),
+                        target_lead_max=int(target_lead_max),
+                        support_lead_min=int(support_lead_min),
+                        support_lead_max=int(support_lead_max),
+                        min_weight=float(lead_weight_min),
+                    )
+                    numer = (mass[mi] * mw[mi]).sum()
+                    denom = mw[mi].sum().clamp_min(1e-8)
+                    mass_loss_tensor = -(numer / denom)
+                else:
+                    mass_loss_tensor = -mass[mi].mean()
+                loss = loss + lambda_mass * mass_loss_tensor
+
+        if (not is_gaussian) and lambda_right_late > 0 and right_late_tau is not None:
+            mr = (ctype_f == 1)
+            if mr.any():
+                pmf, _, logS = hazard_to_pmf_cdf_logS(hazard_f, tstar=nll_tstar)
+                t = torch.arange(1, Tend + 1, device=hazard_f.device, dtype=pmf.dtype).view(1, -1)
+                exp_doy = (pmf * t).sum(dim=1) + torch.exp(logS[:, -1]) * float(Tend)
+                late_margin = torch.relu(exp_doy[mr] - float(right_late_tau))
+                late_loss_tensor = late_margin.mean()
+                loss = loss + lambda_right_late * late_loss_tensor
+
+        if (not is_gaussian) and float(entropy_lambda) > 0.0:
+            entropy_vec = pmf_entropy(hazard_f, tstar_f, Tend=Tend, conditional=bool(entropy_conditional))
+            entropy_loss_tensor = entropy_vec.mean()
+            loss = loss + float(entropy_lambda) * entropy_loss_tensor
+
+        if (not is_gaussian) and float(location_lambda) > 0.0:
+            location_loss_tensor, location_stats = expected_time_location_loss(hazard_f, L_f, R_f, ctype_f, Tend=Tend)
+            if location_loss_tensor is not None:
+                loss = loss + float(location_lambda) * location_loss_tensor
+
+        if not torch.isfinite(loss):
+            bad_batches += 1
+            continue
+
+        if train:
+            opt.zero_grad(set_to_none=True)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+            else:
+                loss.backward()
+            grad_finite = True
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grad_finite = False
+                    break
+            if not grad_finite:
+                bad_batches += 1
+                opt.zero_grad(set_to_none=True)
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), C.GRAD_CLIP_NORM)
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+
+        total += float(loss.item()) * n_valid
+        base_total += float(base_loss.item()) * n_valid
+        if mass_loss_tensor is not None:
+            mass_total += float(mass_loss_tensor.item()) * n_valid
+        if late_loss_tensor is not None:
+            late_total += float(late_loss_tensor.item()) * n_valid
+        if entropy_loss_tensor is not None:
+            entropy_total += float(entropy_loss_tensor.item()) * n_valid
+        if location_loss_tensor is not None:
+            location_total += float(location_loss_tensor.item()) * n_valid
+        n += n_valid
+
+    if bad_batches > 0 and train:
+        print(f"[warn] skipped non-finite batches: {bad_batches}")
+    if log_mass:
+        prefix = f"[lead_loss] epoch {epoch_idx:02d} " if epoch_idx is not None else "[lead_loss] "
+        lead_weight_mean_epoch = lead_weight_sum / lead_weight_n if lead_weight_n > 0 else float("nan")
+        print(
+            prefix
+            + f"mode={lead_loss_mode} lead_counts_epoch={lead_count_totals} "
+            + f"lead_loss_weight_mean_epoch={lead_weight_mean_epoch:.6f}"
+        )
+
+    total_avg = total / n if n > 0 else float("nan")
+    if return_parts:
+        base_avg = base_total / max(n, 1)
+        mass_avg = mass_total / max(n, 1)
+        late_avg = late_total / max(n, 1)
+        entropy_avg = entropy_total / max(n, 1)
+        location_avg = location_total / max(n, 1)
+        right_frac = mr_total / max(n, 1)
+        return total_avg, base_avg, mass_avg, late_avg, entropy_avg, location_avg, right_frac
+    return total_avg
+
+
 def run_epoch_weighted(
     model,
     opt,
@@ -86,6 +901,9 @@ def run_epoch_weighted(
     log_mass: bool = False,
     epoch_idx: int | None = None,
     return_parts: bool = False,
+    use_amp: bool = False,
+    amp_dtype: str = "bf16",
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ):
     model.train(train)
     total, n = 0.0, 0
@@ -101,17 +919,18 @@ def run_epoch_weighted(
         R = R.to(device, non_blocking=True)
         ctype = ctype.to(device, non_blocking=True)
 
-        hazard = model(X)
-        if not torch.isfinite(hazard).all():
-            bad_batches += 1
-            continue
-        nll_vec = interval_nll_per_sample(hazard, L, R, ctype, Tend=Tend)
-        base_loss = weighted_loss_from_ctype(nll_vec, ctype)
-        loss = base_loss
-        mass_loss_tensor = None
-        late_loss_tensor = None
-        mr = (ctype == 1)
-        mr_total += float(mr.float().sum().item())
+        with _autocast_ctx(device, use_amp=use_amp, amp_dtype=amp_dtype):
+            hazard = model(X)
+            if not torch.isfinite(hazard).all():
+                bad_batches += 1
+                continue
+            nll_vec = interval_nll_per_sample(hazard, L, R, ctype, Tend=Tend)
+            base_loss = weighted_loss_from_ctype(nll_vec, ctype)
+            loss = base_loss
+            mass_loss_tensor = None
+            late_loss_tensor = None
+            mr = (ctype == 1)
+            mr_total += float(mr.float().sum().item())
 
         if train and log_mass and not logged:
             mi = (ctype == CTYPE_INTERVAL)
@@ -208,7 +1027,11 @@ def run_epoch_weighted(
 
         if train:
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+            else:
+                loss.backward()
             grad_finite = True
             for p in model.parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -219,7 +1042,11 @@ def run_epoch_weighted(
                 opt.zero_grad(set_to_none=True)
                 continue
             torch.nn.utils.clip_grad_norm_(model.parameters(), C.GRAD_CLIP_NORM)
-            opt.step()
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
 
         total += float(loss.item()) * X.size(0)
         base_total += float(base_loss.item()) * X.size(0)
@@ -255,9 +1082,10 @@ def eval_nll_model(model, loader, Tend, device):
         R = R.to(device, non_blocking=True)
         ctype = ctype.to(device, non_blocking=True)
 
-        hazard = model(X)
-        nll_vec = interval_nll_per_sample(hazard, L, R, ctype, Tend=Tend)
-        loss = weighted_loss_from_ctype(nll_vec, ctype)
+        with _autocast_ctx(device, use_amp=bool(getattr(model, "use_amp_eval", False)), amp_dtype=str(getattr(model, "amp_dtype_eval", "bf16"))):
+            hazard = model(X)
+            nll_vec = interval_nll_per_sample(hazard, L, R, ctype, Tend=Tend)
+            loss = weighted_loss_from_ctype(nll_vec, ctype)
 
         total += float(loss.item()) * X.size(0)
         n += X.size(0)
@@ -265,14 +1093,95 @@ def eval_nll_model(model, loader, Tend, device):
     return total / max(n, 1)
 
 
+@torch.no_grad()
+def eval_nll_model_grouped(model, loader, Tend, device):
+    model.eval()
+    total, n = 0.0, 0
+    early_tstar_weight_min = float(getattr(model, "early_tstar_weight_min", 1.0))
+    site_year_mean_loss = bool(getattr(model, "site_year_mean_loss", False))
+    conditional_survival = bool(getattr(model, "conditional_survival", True))
+    is_gaussian = str(getattr(model, "pmf_mode", "hazard")) == "gaussian"
+    for X, L, R, ctype, tstar, valid_mask in loader:
+        X = X.to(device, non_blocking=True)
+        L = L.to(device, non_blocking=True)
+        R = R.to(device, non_blocking=True)
+        ctype = ctype.to(device, non_blocking=True)
+        tstar = tstar.to(device, non_blocking=True)
+        valid_mask = valid_mask.to(device, non_blocking=True)
+
+        with _autocast_ctx(device, use_amp=bool(getattr(model, "use_amp_eval", False)), amp_dtype=str(getattr(model, "amp_dtype_eval", "bf16"))):
+            hazard = model(X, tstar=tstar, valid_mask=valid_mask)
+            hazard_f, L_f, R_f, ctype_f, n_valid = _flatten_grouped_valid(hazard, L, R, ctype, valid_mask)
+            if n_valid <= 0:
+                continue
+            flat_idx = torch.arange(valid_mask.numel(), device=valid_mask.device)[valid_mask.reshape(-1)]
+            group_idx_f = torch.div(flat_idx, valid_mask.shape[1], rounding_mode="floor")
+            tstar_f = tstar.reshape(-1)[valid_mask.reshape(-1)]
+            event_mask = ctype_f == CTYPE_INTERVAL
+            if conditional_survival and event_mask.any():
+                bad = event_mask & (tstar_f >= L_f)
+                assert not bad.any(), f"{int(bad.long().sum().item())} event rows have tstar >= L; dataset filtering broken"
+            if is_gaussian:
+                mu_BK = getattr(model, "_last_mu_BK", None)
+                if mu_BK is None:
+                    raise RuntimeError("model.pmf_mode='gaussian' but _last_mu_BK is None after forward")
+                mu_f = mu_BK.reshape(-1)[valid_mask.reshape(-1)]
+                loss, _ = asymmetric_mu_loss(
+                    mu_f,
+                    L_f,
+                    R_f,
+                    ctype_f,
+                    Tend=Tend,
+                    asym_weight=float(getattr(model, "asym_weight", 10.0)),
+                    right_weight=float(getattr(model, "right_weight", 0.3)),
+                    target_offset=float(getattr(model, "target_offset", 0.0)),
+                )
+            else:
+                nll_vec = interval_nll_per_sample(
+                    hazard_f,
+                    L_f,
+                    R_f,
+                    ctype_f,
+                    Tend=Tend,
+                    tstar=tstar_f if conditional_survival else None,
+                )
+                loss = _grouped_weighted_base_loss(
+                    nll_vec,
+                    L_f,
+                    ctype_f,
+                    tstar_f,
+                    group_idx_f,
+                    B=valid_mask.shape[0],
+                    Tend=Tend,
+                    early_tstar_weight_min=early_tstar_weight_min,
+                    site_year_mean_loss=site_year_mean_loss,
+                )
+
+        total += float(loss.item()) * n_valid
+        n += n_valid
+    return total / max(n, 1)
+
+
 # -------------------------
 # Metrics
 # -------------------------
-def hazard_to_pmf_cdf_logS(hazard):
+def hazard_to_pmf_cdf_logS(hazard, tstar=None):
     B, T = hazard.shape
-    logS = torch.cumsum(torch.log1p(-hazard), dim=1)  # log S_t
-    S_prev = torch.cat([torch.ones(B, 1, device=hazard.device), torch.exp(logS[:, :-1])], dim=1)
+    logS_full = torch.cumsum(torch.log1p(-hazard), dim=1)  # log S_t
+    if tstar is None:
+        logS = logS_full
+        S_prev = torch.cat([torch.ones(B, 1, device=hazard.device), torch.exp(logS[:, :-1])], dim=1)
+    else:
+        idx_tstar = (tstar.long().clamp(min=1, max=T) - 1).view(-1, 1)
+        logS_at_tstar = logS_full.gather(1, idx_tstar).squeeze(1)
+        logS = logS_full - logS_at_tstar.view(-1, 1)
+        S_prev_full = torch.cat([torch.ones(B, 1, device=hazard.device), torch.exp(logS_full[:, :-1])], dim=1)
+        S_prev = S_prev_full / torch.exp(logS_at_tstar).view(-1, 1).clamp_min(1e-12)
     pmf = S_prev * hazard
+    if tstar is not None:
+        idx = (tstar.long().clamp(min=1, max=T) - 1).view(-1, 1)
+        time_idx = torch.arange(T, device=hazard.device).view(1, -1)
+        pmf = torch.where(time_idx <= idx, torch.zeros_like(pmf), pmf)
     cdf = torch.cumsum(pmf, dim=1).clamp(0, 1)
     return pmf, cdf, logS
 
@@ -341,6 +1250,41 @@ def overlap_metrics(pred_L, pred_R, true_L, true_R):
     recall = inter / true_len
     precision = inter / pred_len
     return iou, recall, precision
+
+
+def early_recall80_site_year(rows: list[dict], key_field: str = "sample_id") -> tuple[float, int, int]:
+    """
+    Site-year early-warning recall for Stage2 gated interval rows.
+
+    A site-year succeeds if any gated t* row satisfies:
+      tstar < true_start and pred_L <= true_mid,
+      where true_start = true_L + 1 and true_mid is the interval midpoint.
+    """
+    by_site_year: dict[str, bool] = {}
+    for i, row in enumerate(rows):
+        key = row.get(key_field)
+        if key is None:
+            site = row.get("site_id")
+            year = row.get("year")
+            key = f"{site}-{int(year)}" if site is not None and year is not None else str(i)
+
+        success = False
+        try:
+            true_start = int(row["true_L"]) + 1
+            true_end = int(row["true_R"])
+            true_mid = (float(true_start) + float(true_end)) / 2.0
+            tstar = int(row["tstar"])
+            pred_L = int(row["pred_L"])
+            success = bool(tstar < true_start and pred_L <= true_mid)
+        except (KeyError, TypeError, ValueError):
+            success = False
+
+        by_site_year[str(key)] = bool(by_site_year.get(str(key), False) or success)
+
+    denom = len(by_site_year)
+    n_success = int(sum(1 for v in by_site_year.values() if v))
+    value = float(n_success / denom) if denom > 0 else float("nan")
+    return value, n_success, denom
 
 
 @torch.no_grad()
@@ -429,6 +1373,105 @@ def eval_metrics_with_overlap(model, loader, Tend, device, alpha=0.2, pi_method:
         "mae_mid_mean_interval_only": float(np.mean(maes_int)) if n_int > 0 else np.nan,
         "mass_in_interval_mean_interval_only": float(np.mean(mass_int)) if n_int > 0 else np.nan,
 
+        "IoU_mean_interval_only(80%)": float(np.mean(ious)) if n_int > 0 else np.nan,
+        "Recall_mean_interval_only(80%)": float(np.mean(recalls)) if n_int > 0 else np.nan,
+        "Precision_mean_interval_only(80%)": float(np.mean(precs)) if n_int > 0 else np.nan,
+        "N_interval_samples": int(n_int),
+        "PI_shortest_fallback_count_interval_only": int(shortest_fallback_count),
+    }
+
+
+@torch.no_grad()
+def eval_metrics_with_overlap_grouped(model, loader, Tend, device, alpha=0.2, pi_method: str = "shortest"):
+    model.eval()
+    q_lo = alpha / 2
+    q_hi = 1 - alpha / 2
+    target_mass = 1.0 - float(alpha)
+
+    hits_all, maes_all, mass_all = [], [], []
+    ious, recalls, precs = [], [], []
+    hits_int, maes_int, mass_int = [], [], []
+    n_int = 0
+    shortest_fallback_count = 0
+    conditional_survival = bool(getattr(model, "conditional_survival", True))
+
+    for X, L, R, ctype, tstar, valid_mask in loader:
+        X = X.to(device, non_blocking=True)
+        L_t = L.to(device, non_blocking=True)
+        R_t = R.to(device, non_blocking=True)
+        ctype_t = ctype.to(device, non_blocking=True)
+        tstar = tstar.to(device, non_blocking=True)
+        valid_mask = valid_mask.to(device, non_blocking=True)
+
+        hazard = model(X, tstar=tstar, valid_mask=valid_mask)
+        hazard_f, L_f, R_f, ctype_f, n_valid = _flatten_grouped_valid(hazard, L_t, R_t, ctype_t, valid_mask)
+        if n_valid <= 0:
+            continue
+
+        ctype_np = ctype_f.cpu().numpy().astype(int)
+        L_np = L_f.cpu().numpy().astype(int)
+        R_np = R_f.cpu().numpy().astype(int)
+
+        tstar_f = tstar.reshape(-1)[valid_mask.reshape(-1)]
+        pmf, cdf, logS = hazard_to_pmf_cdf_logS(hazard_f, tstar=tstar_f if conditional_survival else None)
+
+        cdf_last = cdf[:, -1]
+        arg = (cdf >= 0.5).float().argmax(dim=1) + 1
+        median = torch.where(cdf_last >= 0.5, arg, torch.tensor(Tend, device=cdf.device))
+        median_np = median.cpu().numpy().astype(int)
+
+        hit = ((median_np > L_np) & (median_np <= R_np)).astype(float)
+        mid = np.round((L_np + R_np) / 2.0).astype(int)
+        mae = np.abs(median_np - mid).astype(float)
+
+        hits_all.extend(hit.tolist())
+        maes_all.extend(mae.tolist())
+
+        idxL = (torch.clamp(L_f, 1, Tend) - 1).long()
+        idxR = (torch.clamp(R_f, 1, Tend) - 1).long()
+        logS_L = logS.gather(1, idxL.view(-1, 1)).squeeze(1)
+        logS_R = logS.gather(1, idxR.view(-1, 1)).squeeze(1)
+        mass = (torch.exp(logS_L) - torch.exp(logS_R)).clamp(min=0.0).cpu().numpy()
+        mass_all.extend(mass.tolist())
+
+        cdf_np = cdf.cpu().numpy()
+        pmf_np = pmf.cpu().numpy()
+        for b in range(len(L_np)):
+            if ctype_np[b] != CTYPE_INTERVAL:
+                continue
+            n_int += 1
+            hits_int.append(hit[b])
+            maes_int.append(mae[b])
+            mass_int.append(mass[b])
+
+            if pi_method == "shortest":
+                pL, pR, used_fallback = shortest_mass_interval_1d(pmf_np[b], target_mass=target_mass, Tend=Tend)
+                if used_fallback:
+                    shortest_fallback_count += 1
+            elif pi_method == "quantile":
+                pL = quantile_from_cdf_1d(cdf_np[b], q_lo, Tend)
+                pR = quantile_from_cdf_1d(cdf_np[b], q_hi, Tend)
+            else:
+                raise ValueError(f"Unknown pi_method: {pi_method}. expected 'shortest' or 'quantile'")
+
+            pL = max(1, min(pL, Tend))
+            pR = max(1, min(pR, Tend))
+            if pL > pR:
+                pL, pR = pR, pL
+
+            iou, rec, prec = overlap_metrics(pL, pR, int(L_np[b]), int(R_np[b]))
+            ious.append(iou)
+            recalls.append(rec)
+            precs.append(prec)
+
+    return {
+        "point_cov_mean_all": float(np.mean(hits_all)) if hits_all else np.nan,
+        "mae_mid_mean_all": float(np.mean(maes_all)) if maes_all else np.nan,
+        "mass_in_interval_mean_all": float(np.mean(mass_all)) if mass_all else np.nan,
+        "mass_in_interval_median_all": float(np.median(mass_all)) if mass_all else np.nan,
+        "point_cov_mean_interval_only": float(np.mean(hits_int)) if n_int > 0 else np.nan,
+        "mae_mid_mean_interval_only": float(np.mean(maes_int)) if n_int > 0 else np.nan,
+        "mass_in_interval_mean_interval_only": float(np.mean(mass_int)) if n_int > 0 else np.nan,
         "IoU_mean_interval_only(80%)": float(np.mean(ious)) if n_int > 0 else np.nan,
         "Recall_mean_interval_only(80%)": float(np.mean(recalls)) if n_int > 0 else np.nan,
         "Precision_mean_interval_only(80%)": float(np.mean(precs)) if n_int > 0 else np.nan,

@@ -7,6 +7,7 @@ import torch
 
 from rice.configs import config as C
 from rice.scripts.common import make_loader
+from rice.src.train_eval import early_recall80_site_year
 from rice.scripts.run_viz_interval import (
     EventTransformer,
     HazardTransformer,
@@ -264,14 +265,20 @@ def compute_metrics_for_pest(pest: str, w: int, tau_mode: str):
             ious = []
             recs = []
             precs = []
+            matched_rows = []
             for sid, alert_t in alert.items():
                 r = row_map.get((sid, int(alert_t)))
                 if r is None:
                     continue
+                matched_row = dict(r)
+                matched_row["alert_tstar"] = int(alert_t)
+                matched_rows.append(matched_row)
                 iou, rec, prec = overlap_metrics(r["pred_L"], r["pred_R"], r["true_L"], r["true_R"])
                 ious.append(iou)
                 recs.append(rec)
                 precs.append(prec)
+
+            early_recall80, early_success, early_denom = early_recall80_site_year(matched_rows)
 
             n_total_after = len(alert)
             n_interval_after = 0
@@ -299,6 +306,9 @@ def compute_metrics_for_pest(pest: str, w: int, tau_mode: str):
                     "after_iou": float(np.mean(ious)) if ious else float("nan"),
                     "after_prec": float(np.mean(precs)) if precs else float("nan"),
                     "after_rec": float(np.mean(recs)) if recs else float("nan"),
+                    "after_early_recall80": float(early_recall80),
+                    "after_early_recall80_success": int(early_success),
+                    "after_early_recall80_denom": int(early_denom),
                 }
             )
 
@@ -321,6 +331,9 @@ def main():
         "IoU80",
         "Precision80",
         "Recall80",
+        "EarlyRecall80",
+        "EarlyRecall80_success",
+        "EarlyRecall80_denominator",
         "N_total(site-year)",
         "N_interval(site-year)",
         "Gate%",
@@ -336,6 +349,9 @@ def main():
         after_iou = [r["after_iou"] for r in rows]
         after_prec = [r["after_prec"] for r in rows]
         after_rec = [r["after_rec"] for r in rows]
+        after_early_rec = [r["after_early_recall80"] for r in rows]
+        after_early_success = [r["after_early_recall80_success"] for r in rows]
+        after_early_denom = [r["after_early_recall80_denom"] for r in rows]
         n_total_a = [r["n_total_after"] for r in rows]
         n_int_a = [r["n_interval_after"] for r in rows]
 
@@ -348,6 +364,9 @@ def main():
         a_iou_m, a_iou_s = mean_std(after_iou)
         a_pr_m, a_pr_s = mean_std(after_prec)
         a_re_m, a_re_s = mean_std(after_rec)
+        a_er_m, a_er_s = mean_std(after_early_rec)
+        a_es_m, a_es_s = mean_std(after_early_success)
+        a_ed_m, a_ed_s = mean_std(after_early_denom)
         a_nt_m, a_nt_s = mean_std(n_total_a)
         a_ni_m, a_ni_s = mean_std(n_int_a)
 
@@ -376,6 +395,9 @@ def main():
                         fmt(b_iou_m, b_iou_s),
                         fmt(b_pr_m, b_pr_s),
                         fmt(b_re_m, b_re_s),
+                        "-",
+                        "-",
+                        "-",
                         fmtN(b_nt_m, b_nt_s),
                         fmtN(b_ni_m, b_ni_s),
                         fmtG(100.0, 0.0),
@@ -391,6 +413,9 @@ def main():
                         fmt(a_iou_m, a_iou_s),
                         fmt(a_pr_m, a_pr_s),
                         fmt(a_re_m, a_re_s),
+                        fmt(a_er_m, a_er_s),
+                        fmtN(a_es_m, a_es_s),
+                        fmtN(a_ed_m, a_ed_s),
                         fmtN(a_nt_m, a_nt_s),
                         fmtN(a_ni_m, a_ni_s),
                         fmtG(g_m, g_s),

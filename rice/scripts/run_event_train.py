@@ -18,10 +18,12 @@ from rice.scripts.common import make_loader, parse_seed_candidates, parse_tags, 
 from rice.scripts.run_eval import build_samples_for_run
 from rice.src.dataset import (
     split_by_site,
+    split_samples,
     compute_norm_stats,
     IntervalEventDataset,
     split_seed_search_topk,
     log_split_fingerprint,
+    log_split_sanity,
 )
 from rice.src.ckpt_schema import build_ckpt_meta
 
@@ -361,6 +363,7 @@ def main(
     out_root: str,
     out_path: str | None,
     split_seed: int,
+    split_mode: str,
     seeds: list[int] | None,
     auto_split_seed: bool,
     seed_candidates_raw: str | None,
@@ -391,6 +394,8 @@ def main(
     xgb_max_depth: int | None,
     xgb_min_child_weight: float | None,
     xgb_gamma: float | None,
+    doy_start_override: int | None,
+    doy_end_override: int | None,
     use_wandb: bool,
     wandb_project: str | None,
     wandb_entity: str | None,
@@ -410,6 +415,12 @@ def main(
         C.WEIGHT_DECAY = float(weight_decay)
     if dropout is not None:
         C.DROPOUT = float(dropout)
+    if doy_start_override is not None:
+        C.DOY_START = int(doy_start_override)
+    if doy_end_override is not None:
+        C.DOY_END = int(doy_end_override)
+    if int(C.DOY_START) > int(C.DOY_END):
+        raise ValueError("--doy_start_override must be <= --doy_end_override")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -426,6 +437,7 @@ def main(
             "pest": pest,
             "run": run,
             "split_seed": int(split_seed),
+            "split_mode": str(split_mode),
             "model": model,
             "task_mode": task_mode,
             "nowcast_window": int(nowcast_window),
@@ -441,6 +453,8 @@ def main(
             "xgb_max_depth": None if xgb_max_depth is None else int(xgb_max_depth),
             "xgb_min_child_weight": None if xgb_min_child_weight is None else float(xgb_min_child_weight),
             "xgb_gamma": None if xgb_gamma is None else float(xgb_gamma),
+            "doy_start": int(C.DOY_START),
+            "doy_end": int(C.DOY_END),
             "lr": float(C.LR),
             "weight_decay": float(C.WEIGHT_DECAY),
             "dropout": float(C.DROPOUT),
@@ -456,7 +470,7 @@ def main(
     if split_seeds_json is not None:
         split_seeds_json_path = resolve_split_seeds_json_path(out_root, split_seeds_json)
         split_seed, chosen_idx, chosen, _ = load_split_seed_from_topk(split_seeds_json_path, split_seed_from_topk_idx)
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
         print(f"[split_seed_json] selected seed={split_seed} idx={chosen_idx} file={split_seeds_json_path}")
         print(f"[split_seed_json] counts={chosen.get('counts')}")
     elif auto_split_seed:
@@ -469,6 +483,7 @@ def main(
             target_test_interval=target_test_interval,
             tol_test_interval=tol_test_interval,
             topk=auto_split_topk,
+            split_mode=split_mode,
         )
         topk_list = result["topk"]
         if not topk_list:
@@ -477,10 +492,12 @@ def main(
             split_seed_from_topk_idx = 0
         chosen = topk_list[split_seed_from_topk_idx]
         split_seed = int(chosen["seed"])
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
         print(f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} counts={chosen['counts']}")
     else:
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+
+    log_split_sanity("event_base", train_s, val_s, test_s, split_mode=split_mode)
 
     if task_mode == "nowcast":
         train_s = build_nowcast_samples(
@@ -750,6 +767,7 @@ def main(
         "tab_feature_dim": tab_feature_dim,
         "trained_states": trained_states,
         "split_seed": int(split_seed),
+        "split_mode": str(split_mode),
         "split_counts": {"train": len(train_s), "val": len(val_s), "test": len(test_s)},
         "event_pos_weight": float(event_pos_weight),
     }
@@ -766,6 +784,7 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default=None)
     p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
+    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal"])
     p.add_argument("--seeds", type=int, nargs="*", default=None)
     p.add_argument("--auto_split_seed", action="store_true")
     p.add_argument("--auto_split_topk", type=int, default=1)
@@ -796,6 +815,8 @@ if __name__ == "__main__":
     p.add_argument("--xgb_max_depth", type=int, default=None)
     p.add_argument("--xgb_min_child_weight", type=float, default=None)
     p.add_argument("--xgb_gamma", type=float, default=None)
+    p.add_argument("--doy_start_override", type=int, default=None)
+    p.add_argument("--doy_end_override", type=int, default=None)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -810,6 +831,7 @@ if __name__ == "__main__":
         out_root=args.out_root,
         out_path=args.out,
         split_seed=args.split_seed,
+        split_mode=args.split_mode,
         seeds=args.seeds,
         auto_split_seed=args.auto_split_seed,
         seed_candidates_raw=args.seed_candidates,
@@ -840,6 +862,8 @@ if __name__ == "__main__":
         xgb_max_depth=args.xgb_max_depth,
         xgb_min_child_weight=args.xgb_min_child_weight,
         xgb_gamma=args.xgb_gamma,
+        doy_start_override=args.doy_start_override,
+        doy_end_override=args.doy_end_override,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,

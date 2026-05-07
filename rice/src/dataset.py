@@ -142,6 +142,80 @@ def split_by_site(samples: list[dict], val_frac=0.1, test_frac=0.1, seed=42):
     return train, val, test
 
 
+def split_by_site_year(samples: list[dict], val_frac=0.1, test_frac=0.1, seed=42):
+    """
+    Random split by (site_id, year) pair.
+    The same site-year never crosses splits, but different years from the same
+    site may appear in train/val/test.
+    """
+    rng = np.random.default_rng(seed)
+    pairs = sorted({(str(s["site_id"]), int(s["year"])) for s in samples})
+    rng.shuffle(pairs)
+
+    n = len(pairs)
+    n_test = int(n * test_frac)
+    n_val = int(n * val_frac)
+
+    test_pairs = set(pairs[:n_test])
+    val_pairs = set(pairs[n_test : n_test + n_val])
+    train_pairs = set(pairs[n_test + n_val :])
+
+    def _key(s: dict) -> tuple[str, int]:
+        return str(s["site_id"]), int(s["year"])
+
+    train = [s for s in samples if _key(s) in train_pairs]
+    val = [s for s in samples if _key(s) in val_pairs]
+    test = [s for s in samples if _key(s) in test_pairs]
+    return train, val, test
+
+
+def split_by_temporal(
+    samples: list[dict],
+    train_end_year: int = 2018,
+    val_start_year: int = 2019,
+    val_end_year: int = 2020,
+    test_start_year: int = 2021,
+    test_end_year: int = 2022,
+):
+    """
+    Split by absolute year boundaries. Samples outside the explicit ranges are
+    left out by design so boundary choices stay visible in sanity counts.
+    """
+    train = [s for s in samples if int(s["year"]) <= int(train_end_year)]
+    val = [s for s in samples if int(val_start_year) <= int(s["year"]) <= int(val_end_year)]
+    test = [s for s in samples if int(test_start_year) <= int(s["year"]) <= int(test_end_year)]
+    return train, val, test
+
+
+def split_samples(
+    samples: list[dict],
+    val_frac=0.1,
+    test_frac=0.1,
+    seed=42,
+    split_mode: str = "site",
+    temporal_train_end_year: int = 2018,
+    temporal_val_start_year: int = 2019,
+    temporal_val_end_year: int = 2020,
+    temporal_test_start_year: int = 2021,
+    temporal_test_end_year: int = 2022,
+):
+    mode = str(split_mode).strip().lower()
+    if mode == "site":
+        return split_by_site(samples, val_frac=val_frac, test_frac=test_frac, seed=seed)
+    if mode == "site_year":
+        return split_by_site_year(samples, val_frac=val_frac, test_frac=test_frac, seed=seed)
+    if mode == "temporal":
+        return split_by_temporal(
+            samples,
+            train_end_year=temporal_train_end_year,
+            val_start_year=temporal_val_start_year,
+            val_end_year=temporal_val_end_year,
+            test_start_year=temporal_test_start_year,
+            test_end_year=temporal_test_end_year,
+        )
+    raise ValueError(f"unknown split_mode={split_mode!r}; expected one of: site, site_year, temporal")
+
+
 def split_fingerprint(train: list[dict], val: list[dict], test: list[dict], sample_n: int = 5) -> dict:
     def _sites(samples: list[dict]) -> list[str]:
         return sorted({s["site_id"] for s in samples})
@@ -182,6 +256,98 @@ def log_split_fingerprint(
     )
 
 
+def split_sanity_summary(train: list[dict], val: list[dict], test: list[dict]) -> dict:
+    def _sites(samples_: list[dict]) -> set[str]:
+        return {str(s["site_id"]) for s in samples_}
+
+    def _pairs(samples_: list[dict]) -> set[tuple[str, int]]:
+        return {(str(s["site_id"]), int(s["year"])) for s in samples_}
+
+    def _years(samples_: list[dict]) -> list[int]:
+        return sorted({int(s["year"]) for s in samples_})
+
+    def _counts(samples_: list[dict]) -> dict:
+        counts = censor_type_counts(samples_)
+        total = sum(counts.values())
+        event = counts.get("interval", 0) + counts.get("left", 0)
+        return {
+            "interval": counts.get("interval", 0),
+            "right": counts.get("right", 0),
+            "left": counts.get("left", 0),
+            "event": event,
+            "total": total,
+            "event_ratio": event / total if total else 0.0,
+            "right_ratio": counts.get("right", 0) / total if total else 0.0,
+        }
+
+    train_sites, val_sites, test_sites = _sites(train), _sites(val), _sites(test)
+    train_pairs, val_pairs, test_pairs = _pairs(train), _pairs(val), _pairs(test)
+
+    train_years_by_site: dict[str, set[int]] = {}
+    for s in train:
+        train_years_by_site.setdefault(str(s["site_id"]), set()).add(int(s["year"]))
+
+    test_hist = 0
+    for s in test:
+        years = train_years_by_site.get(str(s["site_id"]), set())
+        if any(y < int(s["year"]) for y in years):
+            test_hist += 1
+
+    def _range(years: list[int]) -> tuple[int | None, int | None]:
+        if not years:
+            return None, None
+        return years[0], years[-1]
+
+    return {
+        "train_sites": len(train_sites),
+        "val_sites": len(val_sites),
+        "test_sites": len(test_sites),
+        "train_pairs": len(train_pairs),
+        "val_pairs": len(val_pairs),
+        "test_pairs": len(test_pairs),
+        "train_test_site_intersection": len(train_sites & test_sites),
+        "train_val_site_intersection": len(train_sites & val_sites),
+        "val_test_site_intersection": len(val_sites & test_sites),
+        "train_test_pair_intersection": len(train_pairs & test_pairs),
+        "train_val_pair_intersection": len(train_pairs & val_pairs),
+        "val_test_pair_intersection": len(val_pairs & test_pairs),
+        "test_rows_with_historical_train_site_year": test_hist,
+        "test_rows_total": len(test),
+        "test_rows_historical_ratio": test_hist / len(test) if test else 0.0,
+        "train_year_range": _range(_years(train)),
+        "val_year_range": _range(_years(val)),
+        "test_year_range": _range(_years(test)),
+        "train_counts": _counts(train),
+        "val_counts": _counts(val),
+        "test_counts": _counts(test),
+    }
+
+
+def log_split_sanity(label: str, train: list[dict], val: list[dict], test: list[dict], split_mode: str):
+    s = split_sanity_summary(train, val, test)
+    print(
+        f"[split_sanity:{label}] mode={split_mode} "
+        f"sites train/val/test={s['train_sites']}/{s['val_sites']}/{s['test_sites']} "
+        f"pairs train/val/test={s['train_pairs']}/{s['val_pairs']}/{s['test_pairs']}"
+    )
+    print(
+        f"[split_sanity:{label}] site_intersections train∩test={s['train_test_site_intersection']} "
+        f"train∩val={s['train_val_site_intersection']} val∩test={s['val_test_site_intersection']} | "
+        f"pair_intersections train∩test={s['train_test_pair_intersection']} "
+        f"train∩val={s['train_val_pair_intersection']} val∩test={s['val_test_pair_intersection']}"
+    )
+    print(
+        f"[split_sanity:{label}] test_historical="
+        f"{s['test_rows_with_historical_train_site_year']}/{s['test_rows_total']} "
+        f"({100.0 * s['test_rows_historical_ratio']:.2f}%) "
+        f"year_ranges train={s['train_year_range']} val={s['val_year_range']} test={s['test_year_range']}"
+    )
+    print(
+        f"[split_sanity:{label}] counts "
+        f"train={s['train_counts']} val={s['val_counts']} test={s['test_counts']}"
+    )
+
+
 def censor_type_counts(samples: list[dict]) -> dict[str, int]:
     counts = {"left": 0, "interval": 0, "right": 0}
     for s in samples:
@@ -206,13 +372,30 @@ def split_seed_search_topk(
     target_test_interval: int | None = None,
     tol_test_interval: int | None = None,
     topk: int = 1,
+    split_mode: str = "site",
+    temporal_train_end_year: int = 2018,
+    temporal_val_start_year: int = 2019,
+    temporal_val_end_year: int = 2020,
+    temporal_test_start_year: int = 2021,
+    temporal_test_end_year: int = 2022,
 ) -> dict:
     overall_counts = censor_type_counts(samples)
     overall_probs = _counts_to_probs(overall_counts)
 
     scored = []
     for seed in seed_candidates:
-        train_s, val_s, test_s = split_by_site(samples, val_frac=val_frac, test_frac=test_frac, seed=seed)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=val_frac,
+            test_frac=test_frac,
+            seed=seed,
+            split_mode=split_mode,
+            temporal_train_end_year=temporal_train_end_year,
+            temporal_val_start_year=temporal_val_start_year,
+            temporal_val_end_year=temporal_val_end_year,
+            temporal_test_start_year=temporal_test_start_year,
+            temporal_test_end_year=temporal_test_end_year,
+        )
 
         train_counts = censor_type_counts(train_s)
         val_counts = censor_type_counts(val_s)
@@ -238,6 +421,7 @@ def split_seed_search_topk(
             {
                 "seed": seed,
                 "score": float(score),
+                "split_mode": str(split_mode),
                 "counts": {
                     "overall": overall_counts,
                     "train": train_counts,
@@ -267,6 +451,7 @@ def split_seed_search(
     seed_candidates: list[int],
     target_test_interval: int | None = None,
     tol_test_interval: int | None = None,
+    split_mode: str = "site",
 ) -> dict:
     result = split_seed_search_topk(
         samples=samples,
@@ -276,6 +461,7 @@ def split_seed_search(
         target_test_interval=target_test_interval,
         tol_test_interval=tol_test_interval,
         topk=1,
+        split_mode=split_mode,
     )
     return {"topk": result["topk"], "used_fallback": result["used_fallback"]}
 
@@ -308,6 +494,7 @@ def build_stage2_nowcast_samples(
     tstar_start: int | None = None,
     only_pre_event: bool = True,
     event_time_proxy: str = "r",
+    require_tstar_before_L: bool = True,
 ) -> list[dict]:
     """
     Build Stage-2 nowcast samples.
@@ -351,6 +538,8 @@ def build_stage2_nowcast_samples(
             event_time = None
 
         for tstar in range(t0, T + 1, stride):
+            if bool(require_tstar_before_L) and has_event and tstar >= int(s["L"]):
+                continue
             if only_pre_event and has_event and event_time is not None and tstar >= event_time:
                 continue
 
@@ -485,3 +674,99 @@ class IntervalEventDataset(Dataset):
         R = torch.tensor(int(s["R"]), dtype=torch.long)
         c = torch.tensor(CTYPE2ID[str(s["censor_type"])], dtype=torch.long)
         return X, L, R, c
+
+
+def group_stage2_samples_by_site_year(samples: list[dict]) -> list[dict]:
+    """
+    Group flat stage-2 nowcast rows by (site_id, year), preserving t* order.
+    Each group item has:
+      {"site_id", "year", "samples": [row0, row1, ... sorted by tstar]}
+    """
+    grouped: dict[tuple[str, int], list[dict]] = {}
+    for s in samples:
+        key = (str(s["site_id"]), int(s["year"]))
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(s)
+
+    out: list[dict] = []
+    for (site_id, year), rows in grouped.items():
+        rows_sorted = sorted(rows, key=lambda x: int(x.get("tstar", 0)))
+        out.append({"site_id": site_id, "year": year, "samples": rows_sorted})
+    return out
+
+
+class GroupedIntervalEventDataset(Dataset):
+    """
+    site-year grouped dataset for hierarchical Stage-2 modeling.
+    __getitem__ returns:
+      X_seq:    (K,T,D)
+      L_seq:    (K,)
+      R_seq:    (K,)
+      c_seq:    (K,)
+      tstar_seq:(K,)
+    where K is the number of t* rows in this site-year.
+    """
+
+    def __init__(self, groups: list[dict], mean: np.ndarray, std: np.ndarray):
+        self.groups = groups
+        self.mean = mean
+        self.std = std
+        self._miss_template_cache: dict[tuple[int, int], np.ndarray] = {}
+
+    def __len__(self):
+        return len(self.groups)
+
+    def _masked_X(self, X_base: np.ndarray, tstar: int, window: int) -> np.ndarray:
+        shape_key = (int(X_base.shape[0]), int(X_base.shape[1]))
+        templ = self._miss_template_cache.get(shape_key)
+        if templ is None:
+            templ = np.zeros_like(X_base, dtype=np.float32)
+            if X_base.shape[1] > 1:
+                templ[:, 1::2] = 1.0
+            self._miss_template_cache[shape_key] = templ
+
+        X = templ.copy()
+        T = int(X_base.shape[0])
+        start = max(1, int(tstar) - int(window) + 1)
+        end = min(T, int(tstar))
+        if end >= start:
+            i0 = start - 1
+            i1 = end
+            X[i0:i1, :] = X_base[i0:i1, :]
+        return X
+
+    def __getitem__(self, idx):
+        g = self.groups[idx]
+        rows = g["samples"]
+        if not rows:
+            raise ValueError("GroupedIntervalEventDataset: empty group encountered")
+
+        X_seq = []
+        L_seq = []
+        R_seq = []
+        c_seq = []
+        tstar_seq = []
+        for s in rows:
+            X_base = np.asarray(s["X"], dtype=np.float32)
+            if "tstar" in s and "window" in s:
+                X = self._masked_X(X_base, tstar=int(s["tstar"]), window=int(s["window"]))
+                tstar_val = int(s["tstar"])
+            else:
+                X = X_base
+                tstar_val = int(X_base.shape[0])
+            X = (X - self.mean) / self.std
+            X_seq.append(X.astype(np.float32, copy=False))
+            L_seq.append(int(s["L"]))
+            R_seq.append(int(s["R"]))
+            c_seq.append(int(CTYPE2ID[str(s["censor_type"])]))
+            tstar_seq.append(tstar_val)
+
+        X_arr = np.stack(X_seq, axis=0)  # (K,T,D)
+        return (
+            torch.from_numpy(X_arr).float(),
+            torch.tensor(L_seq, dtype=torch.long),
+            torch.tensor(R_seq, dtype=torch.long),
+            torch.tensor(c_seq, dtype=torch.long),
+            torch.tensor(tstar_seq, dtype=torch.long),
+        )

@@ -49,6 +49,8 @@ apple/outputs/
 
 # outputs
 rice/outputs/
+rice/outputs_*/
+apple/outputs_*/
 
 # legacy root outputs
 outputs/
@@ -56,3 +58,6 @@ outputs/
 # python cache
 __pycache__/
 *.pyc
+
+# claude local config
+.claude/

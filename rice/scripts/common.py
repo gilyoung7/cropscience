@@ -13,6 +13,7 @@ def make_loader(
     seed: int | None = None,
     sampler=None,
     multiprocessing_context: str | None = None,
+    collate_fn=None,
 ):
     kwargs = dict(
         batch_size=batch_size,
@@ -28,6 +29,8 @@ def make_loader(
     if kwargs["num_workers"] <= 0:
         kwargs.pop("persistent_workers", None)
         kwargs.pop("prefetch_factor", None)
+    if collate_fn is not None:
+        kwargs["collate_fn"] = collate_fn
 
     if sampler is not None:
         kwargs["sampler"] = sampler
@@ -38,6 +41,42 @@ def make_loader(
         gen = torch.Generator().manual_seed(seed)
         return DataLoader(ds, generator=gen, **kwargs)
     return DataLoader(ds, **kwargs)
+
+
+def collate_grouped_stage2(batch):
+    """
+    Batch items:
+      X_seq: (K,T,D), L/R/c/tstar: (K,)
+    Output:
+      X_pad: (B,Kmax,T,D)
+      L/R/c/tstar_pad: (B,Kmax)
+      valid_mask: (B,Kmax) bool
+    """
+    if not batch:
+        raise ValueError("collate_grouped_stage2: empty batch")
+
+    B = len(batch)
+    Kmax = max(int(x[0].shape[0]) for x in batch)
+    T = int(batch[0][0].shape[1])
+    D = int(batch[0][0].shape[2])
+
+    X_pad = torch.zeros((B, Kmax, T, D), dtype=batch[0][0].dtype)
+    L_pad = torch.ones((B, Kmax), dtype=torch.long)
+    R_pad = torch.ones((B, Kmax), dtype=torch.long)
+    c_pad = torch.ones((B, Kmax), dtype=torch.long)
+    tstar_pad = torch.ones((B, Kmax), dtype=torch.long)
+    valid_mask = torch.zeros((B, Kmax), dtype=torch.bool)
+
+    for i, (X_seq, L_seq, R_seq, c_seq, tstar_seq) in enumerate(batch):
+        k = int(X_seq.shape[0])
+        X_pad[i, :k] = X_seq
+        L_pad[i, :k] = L_seq
+        R_pad[i, :k] = R_seq
+        c_pad[i, :k] = c_seq
+        tstar_pad[i, :k] = tstar_seq
+        valid_mask[i, :k] = True
+
+    return X_pad, L_pad, R_pad, c_pad, tstar_pad, valid_mask
 
 
 def parse_seed_candidates(raw: str | None) -> list[int] | None:

@@ -15,10 +15,12 @@ from rice.scripts.common import make_loader, parse_seed_candidates, parse_tags, 
 from rice.scripts.run_eval import build_samples_for_run
 from rice.src.dataset import (
     split_by_site,
+    split_samples,
     compute_norm_stats,
     IntervalEventDataset,
     split_seed_search_topk,
     log_split_fingerprint,
+    log_split_sanity,
 )
 from rice.scripts.run_event_train import (
     EventTransformer,
@@ -433,16 +435,24 @@ def alert_rows_to_frame(rows: list[list]) -> pd.DataFrame:
 
     for col in ("seed", "year", "true_L", "true_R", "alert_tstar"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    doy0 = int(C.DOY_START) - 1
+    df["true_L_abs"] = df["true_L"] + doy0
+    df["true_R_abs"] = df["true_R"] + doy0
+    df["true_start_abs"] = df["true_L_abs"] + 1
+    df["alert_tstar_abs"] = df["alert_tstar"] + doy0
     df["is_event"] = (df["true_L"].notna() & df["true_R"].notna()).astype(int)
     df["alerted"] = df["alert_tstar"].notna().astype(int)
     df["lead_time"] = np.nan
+    df["lead_time_abs"] = np.nan
     m = (df["is_event"] == 1) & (df["alerted"] == 1)
     if bool(m.any()):
         df.loc[m, "lead_time"] = df.loc[m, "true_L"] - df.loc[m, "alert_tstar"]
+        df.loc[m, "lead_time_abs"] = df.loc[m, "true_start_abs"] - df.loc[m, "alert_tstar_abs"]
 
-    for col in ("seed", "year", "true_L", "true_R", "alert_tstar"):
+    for col in ("seed", "year", "true_L", "true_R", "alert_tstar", "true_L_abs", "true_R_abs", "true_start_abs", "alert_tstar_abs"):
         df[col] = df[col].astype("Int64")
-    return df[ALERT_OUTPUT_COLUMNS]
+    cols = ALERT_OUTPUT_COLUMNS + ["true_L_abs", "true_R_abs", "true_start_abs", "alert_tstar_abs", "lead_time_abs"]
+    return df[cols]
 
 
 def summarize_alert_rows(
@@ -472,7 +482,8 @@ def summarize_alert_rows(
     false_alert_rate = n_false_alert / n_non_event if n_non_event > 0 else float("nan")
     specificity = 1.0 - false_alert_rate if np.isfinite(false_alert_rate) else float("nan")
 
-    lead = df.loc[(df["is_event"] == 1) & (df["alerted"] == 1), "lead_time"].to_numpy(dtype=float)
+    lead_col = "lead_time_abs" if "lead_time_abs" in df.columns else "lead_time"
+    lead = df.loc[(df["is_event"] == 1) & (df["alerted"] == 1), lead_col].to_numpy(dtype=float)
     lead = lead[np.isfinite(lead)]
     lead_time_mean = float(np.mean(lead)) if lead.size > 0 else float("nan")
     lead_time_median = float(np.median(lead)) if lead.size > 0 else float("nan")
@@ -987,6 +998,7 @@ def main(
     out_csv: str | None,
     out_root: str,
     split_seed: int,
+    split_mode: str,
     seeds: list[int] | None,
     auto_split_seed: bool,
     seed_candidates_raw: str | None,
@@ -1009,6 +1021,8 @@ def main(
     tau_alert_target_recall: float | None,
     tau_alert_max_false_alert_rate: float | None,
     tau_alert_policy: str,
+    doy_start_override: int | None,
+    doy_end_override: int | None,
     use_wandb: bool,
     wandb_project: str | None,
     wandb_entity: str | None,
@@ -1037,6 +1051,7 @@ def main(
             "pest": pest,
             "run": run,
             "split_seed": int(split_seed),
+            "split_mode": str(split_mode),
             "gate_policy_search": bool(gate_policy_search),
             "gate_consecutive_k": int(gate_consecutive_k),
             "gate_smooth_window": int(gate_smooth_window),
@@ -1056,6 +1071,17 @@ def main(
     ckpt = torch.load(ckpt_path_resolved, map_location="cpu")
     trained_states = ckpt["trained_states"]
     print("loaded ckpt:", ckpt_path_resolved, "| seeds:", [d["seed"] for d in trained_states])
+    split_mode = str(ckpt.get("split_mode", split_mode))
+    print(f"Effective Stage1 Eval Split config: split_mode={split_mode}, split_seed={split_seed}")
+    C.DOY_START = int(ckpt.get("doy_start", C.DOY_START))
+    C.DOY_END = int(ckpt.get("doy_end", C.DOY_END))
+    if doy_start_override is not None:
+        C.DOY_START = int(doy_start_override)
+    if doy_end_override is not None:
+        C.DOY_END = int(doy_end_override)
+    if int(C.DOY_START) > int(C.DOY_END):
+        raise ValueError("--doy_start_override must be <= --doy_end_override")
+    print(f"Effective Stage1 Eval Data config: DOY_START={C.DOY_START}, DOY_END={C.DOY_END}")
 
     _, feature_names_eval, T, samples, debug_stats = build_samples_for_run(run, get_feature_cols, return_debug_stats=True)
     print(f"[features] n={len(feature_names_eval)} head={feature_names_eval[:5]} tail={feature_names_eval[-5:]}")
@@ -1063,7 +1089,7 @@ def main(
     if split_seeds_json is not None:
         split_seeds_json_path = resolve_split_seeds_json_path(out_root, split_seeds_json)
         split_seed, chosen_idx, chosen, _ = load_split_seed_from_topk(split_seeds_json_path, split_seed_from_topk_idx)
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
         print(f"[split_seed_json] selected seed={split_seed} idx={chosen_idx} file={split_seeds_json_path}")
         print(f"[split_seed_json] counts={chosen.get('counts')}")
     elif auto_split_seed:
@@ -1076,6 +1102,7 @@ def main(
             target_test_interval=target_test_interval,
             tol_test_interval=tol_test_interval,
             topk=auto_split_topk,
+            split_mode=split_mode,
         )
         topk_list = result["topk"]
         if not topk_list:
@@ -1084,12 +1111,13 @@ def main(
             split_seed_from_topk_idx = 0
         chosen = topk_list[split_seed_from_topk_idx]
         split_seed = int(chosen["seed"])
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
         print(f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} counts={chosen['counts']}")
     else:
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
 
     log_split_fingerprint("event_eval", train_s, val_s, test_s)
+    log_split_sanity("event_eval", train_s, val_s, test_s, split_mode=split_mode)
 
     task_mode = str(ckpt.get("task_mode", "season_complete"))
     nowcast_window = int(ckpt.get("nowcast_window", 28))
@@ -1630,6 +1658,8 @@ def main(
             "tau_alert_max_false_alert_rate": None if tau_alert_max_false_alert_rate is None else float(tau_alert_max_false_alert_rate),
             "tau_alert_policy": tau_alert_policy,
             "split_seed": int(split_seed),
+            "doy_start": int(C.DOY_START),
+            "doy_end": int(C.DOY_END),
             "n_records": int(len(df)),
         },
     )
@@ -1645,6 +1675,7 @@ if __name__ == "__main__":
     p.add_argument("--out_csv", type=str, default=None)
     p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
+    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal"])
     p.add_argument("--seeds", type=int, nargs="*", default=None)
     p.add_argument("--auto_split_seed", action="store_true")
     p.add_argument("--auto_split_topk", type=int, default=1)
@@ -1667,6 +1698,8 @@ if __name__ == "__main__":
     p.add_argument("--tau_alert_target_recall", type=float, default=None)
     p.add_argument("--tau_alert_max_false_alert_rate", type=float, default=None)
     p.add_argument("--tau_alert_policy", type=str, default="f1_then_false_alert_rate", choices=["f1", "min_false_alert_rate", "f1_then_false_alert_rate"])
+    p.add_argument("--doy_start_override", type=int, default=None)
+    p.add_argument("--doy_end_override", type=int, default=None)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -1682,6 +1715,7 @@ if __name__ == "__main__":
         out_csv=args.out_csv,
         out_root=args.out_root,
         split_seed=args.split_seed,
+        split_mode=args.split_mode,
         seeds=args.seeds,
         auto_split_seed=args.auto_split_seed,
         seed_candidates_raw=args.seed_candidates,
@@ -1704,6 +1738,8 @@ if __name__ == "__main__":
         tau_alert_target_recall=args.tau_alert_target_recall,
         tau_alert_max_false_alert_rate=args.tau_alert_max_false_alert_rate,
         tau_alert_policy=args.tau_alert_policy,
+        doy_start_override=args.doy_start_override,
+        doy_end_override=args.doy_end_override,
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,

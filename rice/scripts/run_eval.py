@@ -11,6 +11,7 @@ from rice.configs import config as C
 from rice.src.pest_resolver import resolve_pest, default_out_root, ensure_output_dirs
 from rice.scripts.common import (
     make_loader,
+    collate_grouped_stage2,
     parse_seed_candidates,
     parse_tags,
     init_wandb_run,
@@ -31,18 +32,24 @@ from rice.src.dataset import (
     slice_season,
     build_samples_season,
     split_by_site,
+    split_samples,
     compute_norm_stats,
     IntervalEventDataset,
+    GroupedIntervalEventDataset,
     log_split_fingerprint,
+    log_split_sanity,
     split_seed_search_topk,
     build_stage2_nowcast_samples,
+    group_stage2_samples_by_site_year,
 )
 from rice.src.ckpt_schema import validate_ckpt_meta
-from rice.src.model import HazardTransformer
+from rice.src.model import HazardTransformer, HierarchicalCausalHazardTransformer
 from rice.src.train_eval import (
     CTYPE_INTERVAL,
     eval_nll_model,
+    eval_nll_model_grouped,
     eval_metrics_with_overlap,
+    eval_metrics_with_overlap_grouped,
     hazard_to_pmf_cdf_logS,
     quantile_from_cdf_1d,
     shortest_mass_interval_1d,
@@ -208,6 +215,117 @@ def collect_interval_width_rows(
     return rows
 
 
+@torch.no_grad()
+def collect_interval_width_rows_grouped(
+    model,
+    loader,
+    source_groups: list[dict],
+    Tend: int,
+    device,
+    alpha: float = 0.2,
+    pi_method: str = "shortest",
+    seed: int | None = None,
+):
+    q_lo = alpha / 2
+    q_hi = 1 - alpha / 2
+    target_mass = 1.0 - float(alpha)
+    rows: list[dict] = []
+    group_idx = 0
+
+    model.eval()
+    for X, L, R, ctype, tstar, valid_mask in loader:
+        X = X.to(device, non_blocking=True)
+        tstar_t = tstar.to(device, non_blocking=True)
+        valid_mask_t = valid_mask.to(device, non_blocking=True)
+        hazard = model(X, tstar=tstar_t, valid_mask=valid_mask_t)
+        B, K, T_h = hazard.shape
+        pmf, cdf, _ = hazard_to_pmf_cdf_logS(hazard.reshape(B * K, T_h))
+        pmf_np = pmf.cpu().numpy().reshape(B, K, T_h)
+        cdf_np = cdf.cpu().numpy().reshape(B, K, T_h)
+
+        L_np = L.cpu().numpy().astype(int)
+        R_np = R.cpu().numpy().astype(int)
+        ctype_np = ctype.cpu().numpy().astype(int)
+        tstar_np = tstar.cpu().numpy().astype(int)
+        valid_np = valid_mask.cpu().numpy().astype(bool)
+
+        for bi in range(B):
+            group = source_groups[group_idx + bi] if (group_idx + bi) < len(source_groups) else {"samples": []}
+            source_rows = group.get("samples", [])
+            for ki in range(K):
+                if not valid_np[bi, ki] or int(ctype_np[bi, ki]) != int(CTYPE_INTERVAL):
+                    continue
+
+                if pi_method == "shortest":
+                    pL, pR, _ = shortest_mass_interval_1d(
+                        pmf_np[bi, ki],
+                        target_mass=target_mass,
+                        Tend=Tend,
+                    )
+                elif pi_method == "quantile":
+                    pL = quantile_from_cdf_1d(cdf_np[bi, ki], q_lo, Tend)
+                    pR = quantile_from_cdf_1d(cdf_np[bi, ki], q_hi, Tend)
+                else:
+                    raise ValueError(f"Unknown pi_method: {pi_method}. expected 'shortest' or 'quantile'")
+
+                pL = max(1, min(int(pL), int(Tend)))
+                pR = max(1, min(int(pR), int(Tend)))
+                if pL > pR:
+                    pL, pR = pR, pL
+
+                true_l = int(L_np[bi, ki])
+                true_r = int(R_np[bi, ki])
+                pred_width = int(pR - pL)
+                true_width = int(true_r - true_l)
+                pred_mid = float((pL + pR) / 2.0)
+                true_mid = float((true_l + true_r) / 2.0)
+                abs_mid_error = float(abs(pred_mid - true_mid))
+                overlap_left = max(pL, true_l)
+                overlap_right = min(pR, true_r)
+                overlap_len = int(max(0, overlap_right - overlap_left))
+                union_left = min(pL, true_l)
+                union_right = max(pR, true_r)
+                union_len = float(max(0, union_right - union_left))
+                if union_len > 0:
+                    overlap_ratio = float(overlap_len / union_len)
+                else:
+                    overlap_ratio = 1.0 if (pL == true_l and pR == true_r) else 0.0
+
+                sample_meta = source_rows[ki] if ki < len(source_rows) else {}
+                site = sample_meta.get("site_id", group.get("site_id"))
+                year = sample_meta.get("year", group.get("year"))
+                tstar_val = int(tstar_np[bi, ki])
+                if site is not None and year is not None:
+                    sample_id = f"{site}-{int(year)}-t{tstar_val}"
+                else:
+                    sample_id = f"{group_idx + bi}-{ki}-t{tstar_val}"
+
+                rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "sample_idx": int(group_idx + bi),
+                        "seed": None if seed is None else int(seed),
+                        "site": None if site is None else str(site),
+                        "year": None if year is None else int(year),
+                        "tstar": int(tstar_val),
+                        "pred_l": int(pL),
+                        "pred_r": int(pR),
+                        "true_l": int(true_l),
+                        "true_r": int(true_r),
+                        "pred_width": int(pred_width),
+                        "true_width": int(true_width),
+                        "pred_mid": float(pred_mid),
+                        "true_mid": float(true_mid),
+                        "abs_mid_error": float(abs_mid_error),
+                        "overlap_len": int(overlap_len),
+                        "overlap_ratio": float(overlap_ratio),
+                        "pmf": pmf_np[bi, ki].astype(float).tolist(),
+                    }
+                )
+        group_idx += B
+    return rows
+
+
 def log_interval_width_diagnostics_to_wandb(wandb_run, rows: list[dict]):
     if wandb_run is None or not rows:
         return
@@ -230,6 +348,7 @@ def log_interval_width_diagnostics_to_wandb(wandb_run, rows: list[dict]):
         "seed",
         "site",
         "year",
+        "tstar",
         "pred_l",
         "pred_r",
         "true_l",
@@ -240,7 +359,7 @@ def log_interval_width_diagnostics_to_wandb(wandb_run, rows: list[dict]):
         "true_mid",
         "abs_mid_error",
     ]
-    table_data = [[r[c] for c in table_cols] for r in rows]
+    table_data = [[r.get(c) for c in table_cols] for r in rows]
     table = wandb.Table(columns=table_cols, data=table_data)
     wandb_run.log({"eval/interval_width_table": table})
 
@@ -261,6 +380,7 @@ def log_interval_width_diagnostics_to_wandb(wandb_run, rows: list[dict]):
                 "sample_idx": int(r.get("sample_idx", -1)),
                 "site": r.get("site"),
                 "year": r.get("year"),
+                "tstar": r.get("tstar"),
                 "true_l": int(r["true_l"]),
                 "true_r": int(r["true_r"]),
                 "rows_by_seed": {},
@@ -292,7 +412,10 @@ def log_interval_width_diagnostics_to_wandb(wandb_run, rows: list[dict]):
 
     def _sample_label(g: dict) -> str:
         if g.get("site") is not None and g.get("year") is not None:
-            return f"{g['site']}-{g['year']}"
+            label = f"{g['site']}-{g['year']}"
+            if g.get("tstar") is not None:
+                label += f" t*={int(g['tstar'])}"
+            return label
         return f"sample_{g['sample_id']}"
 
     def _plot_interval_comparison_by_sample_ids(selected_sample_ids: list[str], title: str):
@@ -462,6 +585,7 @@ def main(
     out_root: str,
     allow_run_mismatch: bool,
     split_seed: int,
+    split_mode: str,
     seeds: list[int] | None,
     auto_split_seed: bool,
     seed_candidates_raw: str | None,
@@ -476,6 +600,12 @@ def main(
     stage2_nowcast_tstar_start: int | None,
     stage2_nowcast_only_pre_event: int,
     stage2_nowcast_event_time_proxy: str,
+    doy_start_override: int | None,
+    doy_end_override: int | None,
+    num_workers_override: int | None,
+    batch_eval_override: int | None,
+    amp: int,
+    amp_dtype: str,
     use_wandb: bool,
     wandb_project: str | None,
     wandb_entity: str | None,
@@ -488,9 +618,24 @@ def main(
     if not out_root:
         out_root = default_out_root(pest)
     ensure_output_dirs(out_root)
+    if num_workers_override is not None:
+        C.NUM_WORKERS = int(num_workers_override)
+    if batch_eval_override is not None:
+        C.BATCH_EVAL = int(batch_eval_override)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+    use_amp = bool(int(amp)) and (device.type == "cuda")
+    if bool(int(amp)) and device.type != "cuda":
+        print("[amp] requested but CUDA is not available; AMP disabled")
+    if amp_dtype not in ("bf16", "fp16"):
+        raise ValueError("--amp_dtype must be one of: bf16, fp16")
+    print(
+        f"Effective Eval DataLoader config: BATCH_EVAL={C.BATCH_EVAL}, "
+        f"NUM_WORKERS={C.NUM_WORKERS}, PIN_MEMORY={C.PIN_MEMORY}, "
+        f"PERSISTENT_WORKERS={C.PERSISTENT_WORKERS}, PREFETCH_FACTOR={C.PREFETCH_FACTOR}"
+    )
+    print(f"[amp] enabled={int(use_amp)} dtype={amp_dtype}")
     wandb_run = init_wandb_run(
         use_wandb=use_wandb,
         project=wandb_project,
@@ -503,12 +648,17 @@ def main(
             "pest": pest,
             "run": run,
             "split_seed": split_seed,
+            "split_mode": split_mode,
             "stage2_nowcast": bool(stage2_nowcast),
             "stage2_nowcast_window": int(stage2_nowcast_window),
             "stage2_nowcast_stride": int(stage2_nowcast_stride),
             "stage2_nowcast_tstar_start": None if stage2_nowcast_tstar_start is None else int(stage2_nowcast_tstar_start),
             "stage2_nowcast_only_pre_event": int(stage2_nowcast_only_pre_event),
             "stage2_nowcast_event_time_proxy": stage2_nowcast_event_time_proxy,
+            "num_workers": int(C.NUM_WORKERS),
+            "batch_eval": int(C.BATCH_EVAL),
+            "amp": int(bool(amp)),
+            "amp_dtype": str(amp_dtype),
         },
     )
 
@@ -517,6 +667,27 @@ def main(
     ckpt = torch.load(ckpt_path_resolved, map_location="cpu")
     trained_states = ckpt["trained_states"]
     print("loaded ckpt:", ckpt_path_resolved, "| seeds:", [d["seed"] for d in trained_states])
+    split_mode = str(ckpt.get("split_mode", split_mode))
+    print(f"Effective Eval Split config: split_mode={split_mode}, split_seed={split_seed}")
+
+    C.DOY_START = int(ckpt.get("doy_start", C.DOY_START))
+    C.DOY_END = int(ckpt.get("doy_end", C.DOY_END))
+    if doy_start_override is not None:
+        C.DOY_START = int(doy_start_override)
+    if doy_end_override is not None:
+        C.DOY_END = int(doy_end_override)
+    if int(C.DOY_START) > int(C.DOY_END):
+        raise ValueError("--doy_start_override must be <= --doy_end_override")
+
+    C.D_MODEL = int(ckpt.get("d_model", C.D_MODEL))
+    C.N_HEAD = int(ckpt.get("n_head", C.N_HEAD))
+    C.N_LAYERS = int(ckpt.get("n_layers", C.N_LAYERS))
+    if int(C.D_MODEL) % int(C.N_HEAD) != 0:
+        raise ValueError(f"D_MODEL ({C.D_MODEL}) must be divisible by N_HEAD ({C.N_HEAD})")
+    print(
+        f"Effective Eval Model/Data config: D_MODEL={C.D_MODEL}, N_HEAD={C.N_HEAD}, N_LAYERS={C.N_LAYERS}, "
+        f"DOY_START={C.DOY_START}, DOY_END={C.DOY_END}"
+    )
 
     feature_cols, feature_names_eval, T, samples = build_samples_for_run(run, get_feature_cols)
     print(f"[features] n={len(feature_names_eval)} head={feature_names_eval[:5]} tail={feature_names_eval[-5:]}")
@@ -525,7 +696,7 @@ def main(
     if split_seeds_json is not None:
         split_seeds_json_path = resolve_split_seeds_json_path(out_root, split_seeds_json)
         split_seed, chosen_idx, chosen, _ = load_split_seed_from_topk(split_seeds_json_path, split_seed_from_topk_idx)
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
         print(f"[split_seed_json] selected seed={split_seed} idx={chosen_idx} file={split_seeds_json_path}")
         print(f"[split_seed_json] counts={chosen.get('counts')}")
     elif auto_split_seed:
@@ -538,6 +709,7 @@ def main(
             target_test_interval=target_test_interval,
             tol_test_interval=tol_test_interval,
             topk=auto_split_topk,
+            split_mode=split_mode,
         )
         topk_list = result["topk"]
         if not topk_list:
@@ -548,7 +720,7 @@ def main(
             raise ValueError(f"--split_seed_from_topk_idx out of range (0..{len(topk_list)-1})")
         chosen = topk_list[split_seed_from_topk_idx]
         split_seed = int(chosen["seed"])
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
         print(
             f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} "
             f"counts={chosen['counts']}"
@@ -559,7 +731,9 @@ def main(
         for i, item in enumerate(topk_list):
             print(f"  [{i}] seed={item['seed']} score={item['score']:.6f} test={item['counts']['test']}")
     else:
-        train_s, val_s, test_s = split_by_site(samples, val_frac=0.1, test_frac=0.1, seed=split_seed)
+        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+
+    log_split_sanity("eval_base", train_s, val_s, test_s, split_mode=split_mode)
 
     stage2_nowcast = bool(ckpt.get("stage2_nowcast", stage2_nowcast))
     if stage2_nowcast:
@@ -568,6 +742,7 @@ def main(
         stage2_nowcast_tstar_start = ckpt.get("stage2_nowcast_tstar_start", stage2_nowcast_tstar_start)
         stage2_nowcast_only_pre_event = int(ckpt.get("stage2_nowcast_only_pre_event", stage2_nowcast_only_pre_event))
         stage2_nowcast_event_time_proxy = str(ckpt.get("stage2_nowcast_event_time_proxy", stage2_nowcast_event_time_proxy))
+        stage2_nowcast_require_tstar_before_L = int(ckpt.get("stage2_nowcast_require_tstar_before_L", 1))
 
         train_s = build_stage2_nowcast_samples(
             train_s,
@@ -576,6 +751,7 @@ def main(
             tstar_start=stage2_nowcast_tstar_start,
             only_pre_event=bool(stage2_nowcast_only_pre_event),
             event_time_proxy=stage2_nowcast_event_time_proxy,
+            require_tstar_before_L=bool(stage2_nowcast_require_tstar_before_L),
         )
         val_s = build_stage2_nowcast_samples(
             val_s,
@@ -584,6 +760,7 @@ def main(
             tstar_start=stage2_nowcast_tstar_start,
             only_pre_event=bool(stage2_nowcast_only_pre_event),
             event_time_proxy=stage2_nowcast_event_time_proxy,
+            require_tstar_before_L=bool(stage2_nowcast_require_tstar_before_L),
         )
         test_s = build_stage2_nowcast_samples(
             test_s,
@@ -592,6 +769,7 @@ def main(
             tstar_start=stage2_nowcast_tstar_start,
             only_pre_event=bool(stage2_nowcast_only_pre_event),
             event_time_proxy=stage2_nowcast_event_time_proxy,
+            require_tstar_before_L=bool(stage2_nowcast_require_tstar_before_L),
         )
         print(
             f"[stage2_nowcast] window={stage2_nowcast_window} stride={stage2_nowcast_stride} "
@@ -611,12 +789,43 @@ def main(
             f"val={_bucket_counts(val_s)} test={_bucket_counts(test_s)}"
         )
 
+    grouped_mode = bool(
+        ckpt.get("stage2_causal_tstar", False)
+        or str(ckpt.get("stage2_model_kind", "flat")) == "hierarchical_causal_tstar"
+    )
+    stage2_tstar_layers = int(ckpt.get("stage2_tstar_layers", 1))
+    stage2_use_tstar_scalar_pos = int(ckpt.get("stage2_use_tstar_scalar_pos", 0))
+    stage2_early_tstar_weight_min = float(ckpt.get("stage2_early_tstar_weight_min", 1.0))
+    stage2_site_year_mean_loss = bool(int(ckpt.get("stage2_site_year_mean_loss", 0)))
+    stage2_conditional_survival = bool(int(ckpt.get("stage2_conditional_survival", 1)))
+    stage2_pmf_mode = str(ckpt.get("stage2_pmf_mode", "hazard"))
+    stage2_pmf_sigma = float(ckpt.get("stage2_pmf_sigma", 5.0))
+    stage2_pmf_mu_max = float(ckpt.get("stage2_pmf_mu_max", 0.0))
+    stage2_pmf_asym_weight = float(ckpt.get("stage2_pmf_asym_weight", 10.0))
+    stage2_pmf_right_weight = float(ckpt.get("stage2_pmf_right_weight", 0.3))
+    stage2_pmf_target_offset = float(ckpt.get("stage2_pmf_target_offset", 0.0))
+    if grouped_mode and (not stage2_nowcast):
+        print("[stage2_causal_tstar] checkpoint requests grouped mode without stage2_nowcast; fallback to flat eval")
+        grouped_mode = False
+
     log_split_fingerprint("eval", train_s, val_s, test_s)
 
     x_mean, x_std = compute_norm_stats(train_s)
-    train_ds = IntervalEventDataset(train_s, x_mean, x_std)
-    val_ds   = IntervalEventDataset(val_s,   x_mean, x_std)
-    test_ds  = IntervalEventDataset(test_s,  x_mean, x_std)
+    if grouped_mode:
+        train_groups = group_stage2_samples_by_site_year(train_s)
+        val_groups = group_stage2_samples_by_site_year(val_s)
+        test_groups = group_stage2_samples_by_site_year(test_s)
+        train_ds = GroupedIntervalEventDataset(train_groups, x_mean, x_std)
+        val_ds = GroupedIntervalEventDataset(val_groups, x_mean, x_std)
+        test_ds = GroupedIntervalEventDataset(test_groups, x_mean, x_std)
+        print(
+            f"[stage2_causal_tstar] grouped eval set sizes: "
+            f"train={len(train_groups)} val={len(val_groups)} test={len(test_groups)}"
+        )
+    else:
+        train_ds = IntervalEventDataset(train_s, x_mean, x_std)
+        val_ds = IntervalEventDataset(val_s, x_mean, x_std)
+        test_ds = IntervalEventDataset(test_s, x_mean, x_std)
     D_in = int(test_ds[0][0].shape[-1])
     print(f"[D_in] computed_from_dataset={D_in}")
     print(f"RUN={run} | D_in={D_in} | T={T}")
@@ -630,8 +839,12 @@ def main(
         allow_run_mismatch=allow_run_mismatch,
     )
 
-    val_loader  = make_loader(val_ds,  C.BATCH_EVAL, shuffle=False)
-    test_loader = make_loader(test_ds, C.BATCH_EVAL, shuffle=False)
+    if grouped_mode:
+        val_loader = make_loader(val_ds, C.BATCH_EVAL, shuffle=False, collate_fn=collate_grouped_stage2)
+        test_loader = make_loader(test_ds, C.BATCH_EVAL, shuffle=False, collate_fn=collate_grouped_stage2)
+    else:
+        val_loader = make_loader(val_ds, C.BATCH_EVAL, shuffle=False)
+        test_loader = make_loader(test_ds, C.BATCH_EVAL, shuffle=False)
 
     records = []
     by_tstar_rows = []
@@ -641,36 +854,85 @@ def main(
         if seeds is not None and seed not in seeds:
             continue
 
-        model = HazardTransformer(
-            d_in=D_in,
-            d_model=C.D_MODEL,
-            nhead=C.N_HEAD,
-            num_layers=C.N_LAYERS,
-            dropout=C.DROPOUT,
-            max_len=C.MAX_LEN,
-        ).to(device)
-        model.load_state_dict(d["state_dict"])
+        if grouped_mode:
+            model = HierarchicalCausalHazardTransformer(
+                d_in=D_in,
+                d_model=C.D_MODEL,
+                nhead=C.N_HEAD,
+                num_layers=C.N_LAYERS,
+                num_tstar_layers=int(stage2_tstar_layers),
+                dropout=C.DROPOUT,
+                max_len=C.MAX_LEN,
+                max_tstar_len=512,
+                use_tstar_scalar_pos=bool(stage2_use_tstar_scalar_pos),
+            ).to(device)
+            model.time_chunk_size = int(ckpt.get("stage2_time_chunk_size", 64))
+            model.early_tstar_weight_min = float(stage2_early_tstar_weight_min)
+            model.site_year_mean_loss = bool(stage2_site_year_mean_loss)
+            model.conditional_survival = bool(stage2_conditional_survival)
+            model.pmf_mode = str(stage2_pmf_mode)
+            model.gaussian_sigma = float(stage2_pmf_sigma)
+            model.gaussian_mu_max = float(stage2_pmf_mu_max)
+            model.asym_weight = float(stage2_pmf_asym_weight)
+            model.right_weight = float(stage2_pmf_right_weight)
+            model.target_offset = float(stage2_pmf_target_offset)
+        else:
+            model = HazardTransformer(
+                d_in=D_in,
+                d_model=C.D_MODEL,
+                nhead=C.N_HEAD,
+                num_layers=C.N_LAYERS,
+                dropout=C.DROPOUT,
+                max_len=C.MAX_LEN,
+            ).to(device)
+        model.use_amp_eval = bool(use_amp)
+        model.amp_dtype_eval = str(amp_dtype)
+        missing, unexpected = model.load_state_dict(d["state_dict"], strict=False)
+        if missing:
+            print(f"[seed {seed}] load_state_dict missing keys ({len(missing)}, kept random init): {missing[:8]}")
+        if unexpected:
+            print(f"[seed {seed}] load_state_dict unexpected keys ({len(unexpected)}, ignored): {unexpected[:8]}")
         model.eval()
 
-        val_nll  = float(eval_nll_model(model, val_loader, Tend=T, device=device))
-        test_nll = float(eval_nll_model(model, test_loader, Tend=T, device=device))
+        if grouped_mode:
+            val_nll = float(eval_nll_model_grouped(model, val_loader, Tend=T, device=device))
+            test_nll = float(eval_nll_model_grouped(model, test_loader, Tend=T, device=device))
+            val_stats = eval_metrics_with_overlap_grouped(
+                model,
+                val_loader,
+                Tend=T,
+                device=device,
+                alpha=0.2,
+                pi_method=getattr(C, "PI_METHOD", "shortest"),
+            )
+            test_stats = eval_metrics_with_overlap_grouped(
+                model,
+                test_loader,
+                Tend=T,
+                device=device,
+                alpha=0.2,
+                pi_method=getattr(C, "PI_METHOD", "shortest"),
+            )
+        else:
+            val_nll = float(eval_nll_model(model, val_loader, Tend=T, device=device))
+            test_nll = float(eval_nll_model(model, test_loader, Tend=T, device=device))
 
-        val_stats = eval_metrics_with_overlap(
-            model,
-            val_loader,
-            Tend=T,
-            device=device,
-            alpha=0.2,
-            pi_method=getattr(C, "PI_METHOD", "shortest"),
-        )
-        test_stats = eval_metrics_with_overlap(
-            model,
-            test_loader,
-            Tend=T,
-            device=device,
-            alpha=0.2,
-            pi_method=getattr(C, "PI_METHOD", "shortest"),
-        )
+            val_stats = eval_metrics_with_overlap(
+                model,
+                val_loader,
+                Tend=T,
+                device=device,
+                alpha=0.2,
+                pi_method=getattr(C, "PI_METHOD", "shortest"),
+            )
+            test_stats = eval_metrics_with_overlap(
+                model,
+                test_loader,
+                Tend=T,
+                device=device,
+                alpha=0.2,
+                pi_method=getattr(C, "PI_METHOD", "shortest"),
+            )
 
         rec = {
             "seed": seed,
@@ -702,21 +964,35 @@ def main(
                     "eval/best_val_nll_from_ckpt": float(rec["best_val_nll"]),
                 }
             )
-            interval_width_rows.extend(
-                collect_interval_width_rows(
-                    model=model,
-                    loader=test_loader,
-                    source_samples=test_s,
-                    Tend=T,
-                    device=device,
-                    alpha=0.2,
-                    pi_method=getattr(C, "PI_METHOD", "shortest"),
-                    sample_id_prefix=f"seed{seed}_",
-                    seed=seed,
+            if not grouped_mode:
+                interval_width_rows.extend(
+                    collect_interval_width_rows(
+                        model=model,
+                        loader=test_loader,
+                        source_samples=test_s,
+                        Tend=T,
+                        device=device,
+                        alpha=0.2,
+                        pi_method=getattr(C, "PI_METHOD", "shortest"),
+                        sample_id_prefix=f"seed{seed}_",
+                        seed=seed,
+                    )
                 )
-            )
+            else:
+                interval_width_rows.extend(
+                    collect_interval_width_rows_grouped(
+                        model=model,
+                        loader=test_loader,
+                        source_groups=test_groups,
+                        Tend=T,
+                        device=device,
+                        alpha=0.2,
+                        pi_method=getattr(C, "PI_METHOD", "shortest"),
+                        seed=seed,
+                    )
+                )
 
-        if stage2_nowcast:
+        if stage2_nowcast and (not grouped_mode):
             for split_name, split_samples in (("val", val_s), ("test", test_s)):
                 tvals = sorted({int(s.get("tstar", -1)) for s in split_samples if "tstar" in s})
                 for tstar in tvals:
@@ -808,6 +1084,7 @@ if __name__ == "__main__":
     p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--allow_run_mismatch", action="store_true")
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
+    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal"])
     p.add_argument("--seeds", type=int, nargs="*", default=None)
     p.add_argument("--auto_split_seed", action="store_true")
     p.add_argument("--auto_split_topk", type=int, default=1)
@@ -822,6 +1099,12 @@ if __name__ == "__main__":
     p.add_argument("--stage2_nowcast_tstar_start", type=int, default=None)
     p.add_argument("--stage2_nowcast_only_pre_event", type=int, default=1)
     p.add_argument("--stage2_nowcast_event_time_proxy", type=str, default="r", choices=["r", "mid"])
+    p.add_argument("--doy_start_override", type=int, default=None)
+    p.add_argument("--doy_end_override", type=int, default=None)
+    p.add_argument("--num_workers_override", type=int, default=None)
+    p.add_argument("--batch_eval_override", type=int, default=None)
+    p.add_argument("--amp", type=int, default=0)
+    p.add_argument("--amp_dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     # Stage-1 style aliases for pipeline consistency.
     p.add_argument("--nowcast_window", dest="stage2_nowcast_window", type=int)
     p.add_argument("--nowcast_stride", dest="stage2_nowcast_stride", type=int)
@@ -844,6 +1127,7 @@ if __name__ == "__main__":
         args.out_root,
         args.allow_run_mismatch,
         args.split_seed,
+        args.split_mode,
         args.seeds,
         args.auto_split_seed,
         args.seed_candidates,
@@ -858,6 +1142,12 @@ if __name__ == "__main__":
         args.stage2_nowcast_tstar_start,
         args.stage2_nowcast_only_pre_event,
         args.stage2_nowcast_event_time_proxy,
+        args.doy_start_override,
+        args.doy_end_override,
+        args.num_workers_override,
+        args.batch_eval_override,
+        args.amp,
+        args.amp_dtype,
         args.use_wandb,
         args.wandb_project,
         args.wandb_entity,
