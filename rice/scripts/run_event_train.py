@@ -191,7 +191,7 @@ def pr_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
     precision = tp / np.maximum(tp + fp, 1)
     recall = np.concatenate([[0.0], recall])
     precision = np.concatenate([[1.0], precision])
-    return float(np.trapz(precision, recall))
+    return float(np.trapezoid(precision, recall))
 
 
 def pr_at_tau(y_true: np.ndarray, p: np.ndarray, tau: float) -> tuple[float, float, float]:
@@ -364,6 +364,9 @@ def main(
     out_path: str | None,
     split_seed: int,
     split_mode: str,
+    val_year: int,
+    test_year_min: int,
+    test_year_max: int,
     seeds: list[int] | None,
     auto_split_seed: bool,
     seed_candidates_raw: str | None,
@@ -470,7 +473,16 @@ def main(
     if split_seeds_json is not None:
         split_seeds_json_path = resolve_split_seeds_json_path(out_root, split_seeds_json)
         split_seed, chosen_idx, chosen, _ = load_split_seed_from_topk(split_seeds_json_path, split_seed_from_topk_idx)
-        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed=split_seed,
+            split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
+        )
         print(f"[split_seed_json] selected seed={split_seed} idx={chosen_idx} file={split_seeds_json_path}")
         print(f"[split_seed_json] counts={chosen.get('counts')}")
     elif auto_split_seed:
@@ -492,10 +504,28 @@ def main(
             split_seed_from_topk_idx = 0
         chosen = topk_list[split_seed_from_topk_idx]
         split_seed = int(chosen["seed"])
-        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed=split_seed,
+            split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
+        )
         print(f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} counts={chosen['counts']}")
     else:
-        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed=split_seed,
+            split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
+        )
 
     log_split_sanity("event_base", train_s, val_s, test_s, split_mode=split_mode)
 
@@ -692,6 +722,8 @@ def main(
                     random_state=SEED,
                     eval_metric="logloss",
                     scale_pos_weight=float(event_pos_weight),
+                    tree_method="hist",
+                    device="cuda",
                 )
                 clf.fit(X_tr, y_tr, sample_weight=w_tr)
             else:
@@ -784,7 +816,13 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default=None)
     p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
-    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal"])
+    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal", "year"])
+    p.add_argument("--val_year", type=int, default=2022,
+                   help="split_mode=year: val = samples whose year == val_year")
+    p.add_argument("--test_year_min", type=int, default=2023,
+                   help="split_mode=year: test = samples whose year in [test_year_min, test_year_max]")
+    p.add_argument("--test_year_max", type=int, default=2024,
+                   help="split_mode=year: test = samples whose year in [test_year_min, test_year_max]")
     p.add_argument("--seeds", type=int, nargs="*", default=None)
     p.add_argument("--auto_split_seed", action="store_true")
     p.add_argument("--auto_split_topk", type=int, default=1)
@@ -832,6 +870,9 @@ if __name__ == "__main__":
         out_path=args.out,
         split_seed=args.split_seed,
         split_mode=args.split_mode,
+        val_year=args.val_year,
+        test_year_min=args.test_year_min,
+        test_year_max=args.test_year_max,
         seeds=args.seeds,
         auto_split_seed=args.auto_split_seed,
         seed_candidates_raw=args.seed_candidates,

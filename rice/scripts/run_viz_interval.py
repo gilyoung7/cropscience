@@ -312,16 +312,83 @@ def plot_interval_rows(rows: list[dict], Tend: int, title: str):
     fig, axes = plt.subplots(n, 1, figsize=(10, fig_h), sharex=True)
     if n == 1:
         axes = [axes]
-    for ax, r in zip(axes, rows):
+    for i, (ax, r) in enumerate(zip(axes, rows)):
         ax.hlines(0, r["true_L"], r["true_R"], color="black", lw=6, alpha=0.25, label="true interval")
         ax.hlines(0, r["pred_L"], r["pred_R"], color="tab:blue", lw=3, label="pred interval")
         ax.plot(r["pred_point"], 0, marker="o", color="tab:blue", ms=5, label="pred point")
         alert = r.get("alert_tstar")
         if alert is not None:
-            ax.axvline(int(alert), color="tab:red", lw=1.2, ls="--", label="early warning t*")
+            ax.axvline(int(alert), color="tab:red", lw=1.2, ls="--", label="alert t* (Stage 1)")
+        # Stage 2 evaluation time = alert_tstar + offset. Marks the window
+        # position used by the model to produce mu (selector-aware variant).
+        s2_t = r.get("stage2_tstar")
+        if s2_t is not None and alert is not None and int(s2_t) != int(alert):
+            ax.axvline(int(s2_t), color="tab:orange", lw=1.2, ls=":", label="Stage 2 eval t* (alert+offset)")
         ax.set_yticks([])
         ax.set_xlim(1, Tend)
         ax.set_title(f"{r['sample_id']} | IoU={r['iou']:.2f}")
+        if i == 0:
+            # Single compact legend on the top row only.
+            ax.legend(loc="upper right", fontsize=7, framealpha=0.85)
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_interval_grid(rows: list[dict], Tend: int, title: str, n_cols: int = 2):
+    """Multi-column PI bar grid for visualizing many samples in one figure.
+
+    Each row shows:
+        black thick line  = true interval [L, R]
+        blue line + dot   = predicted interval [μ−1.96σ, μ+1.96σ] + μ
+        red dashed line   = alert t* (Stage 1)
+        orange dotted     = Stage 2 evaluation t* (alert + selected offset)
+
+    Compared to plot_interval_rows (single column, K=5-10), this lays out
+    K=20-100 rows in n_cols columns so the entire random subsample fits in
+    one wandb image.
+    """
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return None
+    n = len(rows)
+    n_cols = max(1, int(n_cols))
+    n_rows = (n + n_cols - 1) // n_cols
+    fig_h = max(6.0, 0.55 * n_rows)
+    fig_w = 8.0 * n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h),
+                              sharex=True, squeeze=False)
+    for idx in range(n_rows * n_cols):
+        ax = axes[idx // n_cols, idx % n_cols]
+        if idx >= n:
+            ax.axis("off")
+            continue
+        r = rows[idx]
+        ax.hlines(0, r["true_L"], r["true_R"], color="black", lw=4, alpha=0.30)
+        ax.hlines(0, r["pred_L"], r["pred_R"], color="tab:blue", lw=2)
+        ax.plot(r["pred_point"], 0, marker="o", color="tab:blue", ms=3)
+        alert = r.get("alert_tstar")
+        if alert is not None:
+            ax.axvline(int(alert), color="tab:red", lw=0.8, ls="--")
+        s2_t = r.get("stage2_tstar")
+        if s2_t is not None and alert is not None and int(s2_t) != int(alert):
+            ax.axvline(int(s2_t), color="tab:orange", lw=0.8, ls=":")
+        ax.set_yticks([])
+        ax.set_xlim(1, Tend)
+        ax.set_title(f"{r['sample_id']} | IoU={r['iou']:.2f}",
+                      fontsize=7, pad=1)
+    # Shared legend on the top-left axis only (keep clutter low).
+    handles = [
+        plt.Line2D([0], [0], color="black", lw=4, alpha=0.30, label="true [L, R]"),
+        plt.Line2D([0], [0], color="tab:blue", lw=2, marker="o", ms=4,
+                    label="pred [μ ± 1.96σ]"),
+        plt.Line2D([0], [0], color="tab:red", lw=1.0, ls="--", label="alert t* (Stage 1)"),
+        plt.Line2D([0], [0], color="tab:orange", lw=1.0, ls=":",
+                    label="Stage 2 eval t* (alert+offset)"),
+    ]
+    axes[0, 0].legend(handles=handles, loc="upper right",
+                       fontsize=7, framealpha=0.85)
     fig.suptitle(title)
     fig.tight_layout()
     return fig
@@ -532,7 +599,7 @@ def pr_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
     precision = tp / np.maximum(tp + fp, 1)
     recall = np.concatenate([[0.0], recall])
     precision = np.concatenate([[1.0], precision])
-    return float(np.trapz(precision, recall))
+    return float(np.trapezoid(precision, recall))
 
 
 def fp_rate_at_tau(y_true: np.ndarray, p: np.ndarray, tau: float) -> float:
@@ -1029,6 +1096,458 @@ def resolve_stage2_ablate_feature_indices(
     return sorted(set(out))
 
 
+# ============================================================================
+# Selector-aware evaluation (Phase S11/S12-style; bypasses Stage 2 inference)
+# ----------------------------------------------------------------------------
+# Activated by passing --selector_per_sample_csv.  Reads a phase_s3-style
+# per-sample CSV that already has the selector's chosen mu (mu_at_pred_off),
+# builds Gaussian PI = [μ − 1.96σ, μ + 1.96σ], and computes the full metrics
+# suite (gate / interval pass rates, IoU_overall, P_ideal/useful/failed at the
+# operational shift, ME/MAE/RMSE, OLS calibration slope) + visualizations.
+# ============================================================================
+
+SELECTOR_LEAD_BINS = [
+    ("<15", lambda x: x < 15),
+    ("15-30", lambda x: 15 <= x <= 30),
+    ("31-45", lambda x: 31 <= x <= 45),
+    ("46-60", lambda x: 46 <= x <= 60),
+    ("61-90", lambda x: 61 <= x <= 90),
+    ("91-120", lambda x: 91 <= x <= 120),
+    (">120", lambda x: x > 120),
+]
+
+
+def _selector_bin_of_lead(lead: float) -> str:
+    if not np.isfinite(lead):
+        return "NA"
+    for name, fn in SELECTOR_LEAD_BINS:
+        if fn(lead):
+            return name
+    return "NA"
+
+
+def _selector_bucket_label(bucket_lead: float, ideal_lo: float, ideal_hi: float) -> str:
+    if not np.isfinite(bucket_lead):
+        return "NA"
+    if bucket_lead < 0:           return "MISSED"
+    if bucket_lead < 7:           return "TOO_LATE"
+    if bucket_lead < ideal_lo:    return "URGENT"
+    if bucket_lead < ideal_hi:    return "IDEAL"
+    if bucket_lead < 45:          return "ADVANCE"
+    return "TOO_EARLY"
+
+
+def rows_from_selector_csv(df: pd.DataFrame, sigma_fallback: float) -> list[dict]:
+    """Convert phase_s3 per_sample CSV → rows compatible with plot_interval_rows.
+
+    Expected columns: sample_id, L, R, t_star_doy, sigma, mu_at_pred_off,
+    pred_off (optional).  PI = [μ − 1.96σ, μ + 1.96σ]; iou uses overlap_metrics
+    with shift=0 (sample-intrinsic, matching phase_r convention).
+    """
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        mu = r.get("mu_at_pred_off")
+        if mu is None or not np.isfinite(mu):
+            continue
+        sigma_s = float(r.get("sigma", sigma_fallback))
+        L = int(r["L"]); Rg = int(r["R"])
+        HW = 1.96 * sigma_s
+        pL = int(round(float(mu) - HW))
+        pR = int(round(float(mu) + HW))
+        iou, _, _ = overlap_metrics(pL, pR, L, Rg)
+        rows.append({
+            "sample_id": str(r.get("sample_id", "?")),
+            "true_L": L, "true_R": Rg,
+            "pred_L": pL, "pred_R": pR,
+            "pred_point": int(round(float(mu))),
+            "alert_tstar": int(r["t_star_doy"]),
+            "stage2_tstar": int(r["t_star_doy"]) + int(r.get("pred_off", 0) or 0),
+            "pred_off": int(r.get("pred_off", 0) or 0),
+            "sigma": sigma_s,
+            "mu": float(mu),
+            "iou": float(iou),
+        })
+    return rows
+
+
+def compute_selector_metrics_summary(
+    rows: list[dict], n_total: int, shift: float = 46.0,
+    ideal_lo: float = 14.0, ideal_hi: float = 30.0,
+    sigma_eval: float = 5.0, cohort: str = "",
+) -> dict:
+    """Headline metrics: IoU_overall(shift=0), P_ideal/useful/failed(shift),
+    ME/MAE/RMSE on mu vs (L+R)/2, OLS calibration slope/intercept."""
+    n_alerted = len(rows)
+    buckets = {n: 0 for n in ("MISSED", "TOO_LATE", "URGENT", "IDEAL",
+                                "ADVANCE", "TOO_EARLY")}
+    iou_sum = 0.0
+    me_list, abs_err_list, sq_err_list = [], [], []
+    mu_list, mid_list = [], []
+    for r in rows:
+        mu = float(r["mu"]); s = float(r["sigma"])
+        L = float(r["true_L"]); Rg = float(r["true_R"])
+        iou_sum += float(r["iou"])
+        bucket_lead = L - (mu + 1.96 * s - float(shift))
+        buckets[_selector_bucket_label(bucket_lead, ideal_lo, ideal_hi)] += 1
+        mid = (L + Rg) / 2.0
+        delta = mu - mid
+        me_list.append(delta); abs_err_list.append(abs(delta)); sq_err_list.append(delta * delta)
+        mu_list.append(mu); mid_list.append(mid)
+
+    if len(rows) >= 2:
+        beta, alpha = np.polyfit(np.asarray(mid_list), np.asarray(mu_list), 1)
+    else:
+        beta, alpha = float("nan"), float("nan")
+
+    denom = float(n_total) if n_total > 0 else float("nan")
+    out = {
+        "cohort": cohort,
+        "n_total": int(n_total),
+        "n_alerted": int(n_alerted),
+        "gate_pass_rate": n_alerted / denom,
+        "interval_pass_rate": n_alerted / denom,   # = gate_pass when CSV is post-Stage2
+        "IoU_overall_shift0": iou_sum / denom,
+        "shift": float(shift),
+        "ideal_lead_low": float(ideal_lo),
+        "ideal_lead_high": float(ideal_hi),
+        "P_ideal_shift": buckets["IDEAL"] / denom,
+        "P_useful_shift": (buckets["TOO_LATE"] + buckets["URGENT"] + buckets["IDEAL"]) / denom,
+        "P_failed_shift": buckets["MISSED"] / denom,
+        "ME": float(np.mean(me_list)) if me_list else float("nan"),
+        "MAE": float(np.mean(abs_err_list)) if abs_err_list else float("nan"),
+        "RMSE": float(np.sqrt(np.mean(sq_err_list))) if sq_err_list else float("nan"),
+        "calibration_slope": float(beta),
+        "calibration_intercept": float(alpha),
+        "sigma_eval": float(sigma_eval),
+        "pi_method": "gaussian_1.96sigma",
+    }
+    out.update({f"n_{k}_shift{int(shift)}": v for k, v in buckets.items()})
+    return out
+
+
+def compute_selector_lead_bin_metrics(
+    rows: list[dict], n_total: int, shift: float = 46.0,
+    ideal_lo: float = 14.0, ideal_hi: float = 30.0,
+) -> pd.DataFrame:
+    """Per lead bin (lead = L − alert_tstar): n, IoU, ME/MAE/RMSE, P_ideal(shift)."""
+    bin_order = [n for n, _ in SELECTOR_LEAD_BINS] + ["NA"]
+    by_bin: dict[str, list[dict]] = {b: [] for b in bin_order}
+    for r in rows:
+        lead = float(r["true_L"]) - float(r["alert_tstar"])
+        by_bin[_selector_bin_of_lead(lead)].append(r)
+    out_rows = []
+    denom = float(n_total) if n_total > 0 else float("nan")
+    for b in bin_order:
+        rs = by_bin[b]
+        n = len(rs)
+        if n == 0:
+            out_rows.append({"lead_bin": b, "n": 0,
+                              "IoU_mean": float("nan"),
+                              "ME": float("nan"), "MAE": float("nan"),
+                              "RMSE": float("nan"),
+                              "P_ideal_within_bin": float("nan"),
+                              "iou_sum": 0.0, "contrib_to_overall_IoU": 0.0})
+            continue
+        ious = [float(x["iou"]) for x in rs]
+        me   = [float(x["mu"]) - (float(x["true_L"]) + float(x["true_R"])) / 2.0 for x in rs]
+        n_id = 0
+        for x in rs:
+            bl = float(x["true_L"]) - (float(x["mu"]) + 1.96 * float(x["sigma"]) - float(shift))
+            if ideal_lo <= bl < ideal_hi:
+                n_id += 1
+        out_rows.append({
+            "lead_bin": b, "n": n,
+            "IoU_mean": float(np.mean(ious)),
+            "ME": float(np.mean(me)),
+            "MAE": float(np.mean([abs(x) for x in me])),
+            "RMSE": float(np.sqrt(np.mean([x*x for x in me]))),
+            "P_ideal_within_bin": float(n_id) / n,
+            "iou_sum": float(sum(ious)),
+            "contrib_to_overall_IoU": float(sum(ious)) / denom,
+        })
+    return pd.DataFrame(out_rows)
+
+
+def plot_calibration_scatter(
+    rows: list[dict],
+    title: str,
+    color_mode: str = "iou",
+):
+    """μ vs (L+R)/2 scatter; OLS + identity reference; no marginal histograms.
+
+    Two color modes:
+        "iou"     : point color = per-sample IoU (viridis, vmin=0, vmax=1).
+                    Highlights *where* the model gets samples right.
+        "density" : point color = local point density (gaussian KDE).
+                    Reveals stacked points hidden by alpha-blending —
+                    surfaces the cohort distribution that IoU coloring can hide.
+
+    Both variants are scatter-only (no marginal hists) so they tile cleanly
+    side-by-side in wandb / paper figures.
+    """
+    import matplotlib.pyplot as plt
+    if not rows:
+        return None
+    mid = np.asarray([(r["true_L"] + r["true_R"]) / 2.0 for r in rows], dtype=float)
+    mu  = np.asarray([r["mu"] for r in rows], dtype=float)
+
+    if str(color_mode).lower() == "density":
+        try:
+            from scipy.stats import gaussian_kde
+            xy = np.vstack([mid, mu])
+            # Add a tiny isotropic jitter when the data are degenerate
+            # (e.g., μ collapsed onto one DOY) so KDE doesn't blow up.
+            if np.std(mid) < 1e-6 or np.std(mu) < 1e-6:
+                rng = np.random.default_rng(0)
+                xy = xy + rng.normal(0.0, 1e-3, size=xy.shape)
+            density = gaussian_kde(xy)(xy)
+        except Exception:
+            # Fallback: 2D histogram-based density (no scipy required).
+            H, x_e, y_e = np.histogram2d(mid, mu, bins=40)
+            x_idx = np.clip(np.searchsorted(x_e, mid) - 1, 0, H.shape[0] - 1)
+            y_idx = np.clip(np.searchsorted(y_e, mu)  - 1, 0, H.shape[1] - 1)
+            density = H[x_idx, y_idx]
+        c_values = density
+        cmap = "plasma"
+        cbar_label = "point density"
+        vmin = None
+        vmax = None
+    else:
+        c_values = np.asarray([r["iou"] for r in rows], dtype=float)
+        cmap = "viridis"
+        cbar_label = "IoU"
+        vmin = 0.0
+        vmax = 1.0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    sc = ax.scatter(mid, mu, c=c_values, cmap=cmap, s=18, alpha=0.75,
+                     edgecolor="none", vmin=vmin, vmax=vmax)
+    lo = float(min(mid.min(), mu.min())) - 5.0
+    hi = float(max(mid.max(), mu.max())) + 5.0
+    ax.plot([lo, hi], [lo, hi], color="black", lw=1.0, ls=":",
+            label="identity (perfect calibration)")
+    if len(rows) >= 2:
+        beta, alpha_ = np.polyfit(mid, mu, 1)
+        x_line = np.array([lo, hi])
+        ax.plot(x_line, alpha_ + beta * x_line, color="tab:red", lw=1.5,
+                label=f"OLS: μ = {beta:.2f}·mid + {alpha_:.1f}")
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect("equal")
+    ax.set_xlabel("true mid (L+R)/2  [DOY]")
+    ax.set_ylabel("predicted μ  [DOY]")
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.7); cbar.set_label(cbar_label)
+    ax.legend(loc="upper left", fontsize=9, framealpha=0.85)
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_lead_bin_bars(lead_bin_df: pd.DataFrame, title: str):
+    """Two-panel bar chart: IoU mean (top) + MAE mean (bottom) per lead bin."""
+    import matplotlib.pyplot as plt
+    df = lead_bin_df[lead_bin_df["n"] > 0].copy()
+    if df.empty:
+        return None
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    bins = df["lead_bin"].astype(str).tolist()
+    ax_iou, ax_mae = axes
+    ax_iou.bar(bins, df["IoU_mean"].to_numpy(), color="tab:blue", alpha=0.75)
+    for i, n in enumerate(df["n"].to_numpy()):
+        y = float(df["IoU_mean"].iloc[i])
+        ax_iou.text(i, y + 0.005, f"n={int(n)}", ha="center", fontsize=8)
+    ax_iou.set_ylabel("IoU mean")
+    iou_max = float(df["IoU_mean"].max()) if df["IoU_mean"].notna().any() else 0.05
+    ax_iou.set_ylim(0.0, max(0.05, iou_max * 1.2))
+    ax_iou.set_title(title)
+    ax_mae.bar(bins, df["MAE"].to_numpy(), color="tab:red", alpha=0.75)
+    ax_mae.set_ylabel("MAE  [days]")
+    ax_mae.set_xlabel("lead bin  (L − alert_tstar, days)")
+    fig.tight_layout()
+    return fig
+
+
+def run_selector_metrics(
+    *,
+    selector_per_sample_csv: str,
+    out_dir: str | Path,
+    cohort_label: str,
+    n_total: int = 575,
+    sigma_eval: float = 5.0,
+    operational_shift: float = 46.0,
+    ideal_lead_low: float = 14.0,
+    ideal_lead_high: float = 30.0,
+    topk: int = 5,
+    worstk: int = 5,
+    randomk: int = 5,
+    random_grid_n: int = 50,
+    random_grid_n_cols: int = 2,
+    seed: int = 42,
+    Tend: int = 300,
+    wandb_run=None,
+):
+    """Selector-aware evaluation entry point.
+
+    Bypasses Stage 2 inference: reads a phase_s3 per-sample CSV that already
+    has (μ, σ, L, R, t_star_doy, pred_off) per sample, builds Gaussian PI,
+    computes metrics + visualizations, writes CSVs + wandb artifacts.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df_in = pd.read_csv(selector_per_sample_csv)
+    print(f"[selector_eval] {selector_per_sample_csv}  rows={len(df_in)}", flush=True)
+    rows = rows_from_selector_csv(df_in, sigma_fallback=sigma_eval)
+    print(f"[selector_eval] valid rows={len(rows)}  cohort='{cohort_label}'  "
+          f"n_total={n_total}", flush=True)
+
+    summary = compute_selector_metrics_summary(
+        rows, n_total=n_total, shift=operational_shift,
+        ideal_lo=ideal_lead_low, ideal_hi=ideal_lead_high,
+        sigma_eval=sigma_eval, cohort=cohort_label,
+    )
+    summary_df = pd.DataFrame([summary])
+    summary_df.to_csv(out_dir / "metrics_summary.csv", index=False)
+    print("=" * 70, flush=True)
+    print(f"[metrics] IoU_overall(shift=0) = {summary['IoU_overall_shift0']:.4f}", flush=True)
+    print(f"          P_ideal @shift{int(operational_shift)}  = {summary['P_ideal_shift']:.4f}", flush=True)
+    print(f"          P_useful@shift{int(operational_shift)}  = {summary['P_useful_shift']:.4f}", flush=True)
+    print(f"          P_failed@shift{int(operational_shift)}  = {summary['P_failed_shift']:.4f}", flush=True)
+    print(f"          ME = {summary['ME']:+.2f}   MAE = {summary['MAE']:.2f}   "
+          f"RMSE = {summary['RMSE']:.2f}", flush=True)
+    print(f"          calibration_slope = {summary['calibration_slope']:.3f}   "
+          f"intercept = {summary['calibration_intercept']:+.2f}", flush=True)
+    print(f"[csv] {out_dir}/metrics_summary.csv", flush=True)
+
+    lead_df = compute_selector_lead_bin_metrics(
+        rows, n_total=n_total, shift=operational_shift,
+        ideal_lo=ideal_lead_low, ideal_hi=ideal_lead_high,
+    )
+    lead_df.to_csv(out_dir / "metrics_by_lead_bin.csv", index=False)
+    print(f"[csv] {out_dir}/metrics_by_lead_bin.csv", flush=True)
+
+    aug_rows = []
+    for r in rows:
+        mid = (r["true_L"] + r["true_R"]) / 2.0
+        lead = float(r["true_L"]) - float(r["alert_tstar"])
+        bucket_lead = float(r["true_L"]) - (
+            float(r["mu"]) + 1.96 * float(r["sigma"]) - float(operational_shift))
+        aug_rows.append({
+            "sample_id": r["sample_id"],
+            "true_L": r["true_L"], "true_R": r["true_R"],
+            "pred_L": r["pred_L"], "pred_R": r["pred_R"], "mu": r["mu"],
+            "alert_tstar": r["alert_tstar"],
+            "pred_off": r.get("pred_off"),
+            "sigma": r["sigma"],
+            "iou_shift0": r["iou"],
+            "lead_from_alert": lead,
+            "lead_bin": _selector_bin_of_lead(lead),
+            "mu_minus_mid": float(r["mu"]) - mid,
+            "abs_mu_minus_mid": abs(float(r["mu"]) - mid),
+            "bucket_lead_shift": bucket_lead,
+            "bucket_label": _selector_bucket_label(bucket_lead, ideal_lead_low, ideal_lead_high),
+        })
+    per_sample_df = pd.DataFrame(aug_rows)
+    per_sample_df.to_csv(out_dir / "per_sample.csv", index=False)
+    print(f"[csv] {out_dir}/per_sample.csv", flush=True)
+
+    # --- visualizations -----------------------------------------------------
+    # Two calibration scatters (same x/y, no marginal hists, different colors):
+    #   "iou"     — shows where the model is accurate (per-sample IoU).
+    #   "density" — surfaces overlapping points / cohort distribution.
+    fig_cal_iou = plot_calibration_scatter(
+        rows, title=f"[{cohort_label}] μ vs mid — IoU  (n={len(rows)})",
+        color_mode="iou",
+    )
+    fig_cal_density = plot_calibration_scatter(
+        rows, title=f"[{cohort_label}] μ vs mid — density  (n={len(rows)})",
+        color_mode="density",
+    )
+    fig_lb = plot_lead_bin_bars(
+        lead_df, title=f"[{cohort_label}] Lead-bin IoU / MAE")
+
+    rows_sorted = sorted(rows, key=lambda x: x["iou"], reverse=True)
+    top_rows = rows_sorted[:int(topk)]
+    worst_rows = list(reversed(rows_sorted[-int(worstk):])) if rows_sorted else []
+    if rows_sorted:
+        rng = np.random.default_rng(int(seed))
+        idx_small = rng.choice(len(rows_sorted),
+                                size=min(int(randomk), len(rows_sorted)),
+                                replace=False)
+        rand_rows_small = [rows_sorted[int(i)] for i in idx_small]
+        rng_grid = np.random.default_rng(int(seed) + 1)
+        idx_grid = rng_grid.choice(
+            len(rows_sorted),
+            size=min(int(random_grid_n), len(rows_sorted)),
+            replace=False,
+        )
+        rand_rows_grid = [rows_sorted[int(i)] for i in idx_grid]
+    else:
+        rand_rows_small = []
+        rand_rows_grid = []
+    fig_top = plot_interval_rows(top_rows, Tend=Tend,
+                                  title=f"[{cohort_label}] Top-{len(top_rows)} IoU")
+    fig_worst = plot_interval_rows(worst_rows, Tend=Tend,
+                                    title=f"[{cohort_label}] Worst-{len(worst_rows)} IoU")
+    fig_rand = plot_interval_rows(rand_rows_small, Tend=Tend,
+                                   title=f"[{cohort_label}] Random-{len(rand_rows_small)}")
+    # Dense random grid (50 rows × 2 cols by default) — gives a population view
+    # of how typical samples are placed by the selector.
+    fig_rand_grid = plot_interval_grid(
+        rand_rows_grid, Tend=Tend, n_cols=int(random_grid_n_cols),
+        title=f"[{cohort_label}] Random-{len(rand_rows_grid)} grid "
+              f"({int(random_grid_n_cols)}-col)",
+    )
+
+    figures = {
+        "calibration_iou": fig_cal_iou,
+        "calibration_density": fig_cal_density,
+        "lead_bin_bars": fig_lb,
+        "top_interval": fig_top,
+        "worst_interval": fig_worst,
+        "random_interval": fig_rand,
+        "random_interval_grid": fig_rand_grid,
+    }
+    for name, fig in figures.items():
+        if fig is None:
+            continue
+        fp = out_dir / f"viz_{name}.png"
+        fig.savefig(fp, dpi=160, bbox_inches="tight")
+        print(f"[png] {fp}", flush=True)
+
+    # --- wandb upload -------------------------------------------------------
+    if wandb_run is not None:
+        import wandb
+        import matplotlib.pyplot as plt
+        log_payload: dict = {}
+        for name, fig in figures.items():
+            if fig is not None:
+                log_payload[f"viz/{name}"] = wandb.Image(fig)
+        for k in ("IoU_overall_shift0", "P_ideal_shift", "P_useful_shift",
+                  "P_failed_shift", "ME", "MAE", "RMSE",
+                  "calibration_slope", "calibration_intercept",
+                  "gate_pass_rate", "interval_pass_rate", "n_alerted"):
+            log_payload[f"metrics/{k}"] = float(summary[k])
+        log_payload["table/metrics_by_lead_bin"] = wandb.Table(dataframe=lead_df)
+        log_payload["table/per_sample"] = wandb.Table(dataframe=per_sample_df)
+        wandb_run.log(log_payload)
+        for k in ("IoU_overall_shift0", "P_ideal_shift", "P_useful_shift",
+                  "P_failed_shift", "MAE", "calibration_slope", "n_alerted"):
+            wandb_run.summary[f"final/{k}"] = float(summary[k])
+        wandb_run.summary["final/cohort"] = cohort_label
+        wandb_run.summary["final/n_total"] = int(n_total)
+        try:
+            wandb_run.save(str(out_dir / "metrics_summary.csv"), policy="now")
+            wandb_run.save(str(out_dir / "metrics_by_lead_bin.csv"), policy="now")
+            wandb_run.save(str(out_dir / "per_sample.csv"), policy="now")
+        except Exception as e:
+            print(f"[wandb] save() failed (non-fatal): {e}", flush=True)
+        print("[wandb] logged metrics, figures, tables; uploaded CSVs", flush=True)
+        # Close figures to free memory.
+        for fig in figures.values():
+            if fig is not None:
+                plt.close(fig)
+    return summary, lead_df, per_sample_df
+
+
 def main(
     pest: str,
     run: int,
@@ -1038,6 +1557,9 @@ def main(
     out_root: str,
     split_seed: int,
     split_mode: str,
+    val_year: int,
+    test_year_min: int,
+    test_year_max: int,
     seeds: list[int] | None,
     auto_split_seed: bool,
     seed_candidates_raw: str | None,
@@ -1068,6 +1590,19 @@ def main(
     wandb_run_name: str | None,
     wandb_tags: str | None,
     wandb_job_type: str | None,
+    alert_map_csv: str | None = None,
+    # --- Phase S11/S12-style selector-aware eval (added 2026-05) ---
+    selector_per_sample_csv: str | None = None,
+    cohort_label: str = "selector_eval",
+    n_total_test: int = 575,
+    sigma_eval: float = 5.0,
+    operational_shift: float = 46.0,
+    ideal_lead_low: float = 14.0,
+    ideal_lead_high: float = 30.0,
+    selector_out_dir: str | None = None,
+    selector_Tend: int = 300,
+    selector_random_grid_n: int = 50,
+    selector_random_grid_cols: int = 2,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -1076,6 +1611,53 @@ def main(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+
+    # If a selector per-sample CSV is provided, bypass Stage 2 inference and
+    # run the lightweight metrics + viz suite directly off the CSV.  This
+    # supports the Phase S11/S12 best = "2-sided baseline + selector (C_old)"
+    # cohort where μ per sample was already chosen by the v3_mu_only logreg
+    # OOF in phase_s3.
+    if selector_per_sample_csv:
+        wandb_run_sel = init_wandb_run(
+            use_wandb=use_wandb,
+            project=wandb_project or WANDB_PROJECT_DEFAULT,
+            entity=wandb_entity or WANDB_ENTITY_DEFAULT,
+            run_name=wandb_run_name,
+            group=wandb_group,
+            job_type=wandb_job_type or "selector_eval",
+            tags=parse_tags(wandb_tags) + [f"pest:{pest}", "script:run_viz_interval",
+                                              "mode:selector_eval",
+                                              f"cohort:{cohort_label}"],
+            config={
+                "pest": pest, "run": int(run),
+                "selector_per_sample_csv": selector_per_sample_csv,
+                "cohort_label": cohort_label,
+                "n_total_test": int(n_total_test),
+                "sigma_eval": float(sigma_eval),
+                "operational_shift": float(operational_shift),
+                "ideal_lead_low": float(ideal_lead_low),
+                "ideal_lead_high": float(ideal_lead_high),
+            },
+        )
+        sel_out = Path(selector_out_dir) if selector_out_dir else Path(out_root) / "selector_eval"
+        run_selector_metrics(
+            selector_per_sample_csv=selector_per_sample_csv,
+            out_dir=sel_out,
+            cohort_label=cohort_label,
+            n_total=int(n_total_test),
+            sigma_eval=float(sigma_eval),
+            operational_shift=float(operational_shift),
+            ideal_lead_low=float(ideal_lead_low),
+            ideal_lead_high=float(ideal_lead_high),
+            topk=int(topk), worstk=int(worstk), randomk=int(randomk),
+            random_grid_n=int(selector_random_grid_n),
+            random_grid_n_cols=int(selector_random_grid_cols),
+            seed=int(split_seed),
+            Tend=int(selector_Tend),
+            wandb_run=wandb_run_sel,
+        )
+        finish_wandb_run(wandb_run_sel)
+        return
 
     wandb_run = init_wandb_run(
         use_wandb=use_wandb,
@@ -1133,6 +1715,26 @@ def main(
         f"[features:stage2] doy={stage2_doy_start}-{stage2_doy_end} "
         f"n={len(feature_names_eval)} head={feature_names_eval[:5]} tail={feature_names_eval[-5:]}"
     )
+    # Stage-2 DIRECT neighbor: re-append the 6 channels the model was trained with
+    # (driven by ckpt2 metadata), before ablation/split so feature indices stay
+    # aligned. No-op for ckpts trained without --stage2_add_neighbor_history.
+    if bool(ckpt2.get("stage2_neighbor_history_added", False)):
+        from rice.scripts.neighbor_history_utils import (
+            load_long_events, build_neighbor_index, append_neighbor_to_samples,
+            NEIGHBOR_CHANNEL_NAMES, NEIGHBOR_FEATURE_DIM, DEFAULT_DECAY_KM,
+        )
+        _nb_decay = float(ckpt2.get("stage2_neighbor_decay_km", DEFAULT_DECAY_KM))
+        _nb_ev, _nb_co, _nb_sy = load_long_events(
+            C.PATH_OBS, label_col=getattr(C, "LABEL_COL", "label_event"),
+            year_min=getattr(C, "YEAR_MIN", None), year_max=getattr(C, "YEAR_MAX", None),
+        )
+        _nb_index = build_neighbor_index(_nb_ev, _nb_co)
+        _nb_before = int(samples2[0]["X"].shape[1])
+        append_neighbor_to_samples(samples2, _nb_index, doy_start=int(C.DOY_START), decay_km=_nb_decay)
+        feature_names_eval = list(feature_names_eval) + list(NEIGHBOR_CHANNEL_NAMES)
+        print(f"[stage2_neighbor] viz re-append: before_d_in={_nb_before} added={NEIGHBOR_FEATURE_DIM} "
+              f"after_d_in={int(samples2[0]['X'].shape[1])} decay_km={_nb_decay} (matches ckpt meta)")
+
     ablate_feature_indices = resolve_stage2_ablate_feature_indices(
         feature_names_eval,
         ablate_calendar=bool(stage2_ablate_calendar),
@@ -1146,7 +1748,10 @@ def main(
         from rice.scripts.run_eval import resolve_split_seeds_json_path, load_split_seed_from_topk
         split_seeds_json_path = resolve_split_seeds_json_path(out_root, split_seeds_json)
         split_seed, chosen_idx, chosen, _ = load_split_seed_from_topk(split_seeds_json_path, split_seed_from_topk_idx)
-        train_s2_base, val_s2_base, test_s2_base = split_samples(samples2, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s2_base, val_s2_base, test_s2_base = split_samples(
+            samples2, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode,
+            val_year=val_year, test_year_min=test_year_min, test_year_max=test_year_max,
+        )
         print(f"[split_seed_json] selected seed={split_seed} idx={chosen_idx} file={split_seeds_json_path}")
     elif auto_split_seed:
         candidates = parse_seed_candidates(seed_candidates_raw) or list(range(0, 200))
@@ -1167,17 +1772,26 @@ def main(
             split_seed_from_topk_idx = 0
         chosen = topk_list[split_seed_from_topk_idx]
         split_seed = int(chosen["seed"])
-        train_s2_base, val_s2_base, test_s2_base = split_samples(samples2, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s2_base, val_s2_base, test_s2_base = split_samples(
+            samples2, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode,
+            val_year=val_year, test_year_min=test_year_min, test_year_max=test_year_max,
+        )
         print(f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} counts={chosen['counts']}")
     else:
-        train_s2_base, val_s2_base, test_s2_base = split_samples(samples2, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s2_base, val_s2_base, test_s2_base = split_samples(
+            samples2, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode,
+            val_year=val_year, test_year_min=test_year_min, test_year_max=test_year_max,
+        )
 
     log_split_sanity("viz_stage2_base", train_s2_base, val_s2_base, test_s2_base, split_mode=split_mode)
 
     C.DOY_START = stage1_doy_start
     C.DOY_END = stage1_doy_end
     _feature_cols1, feature_names1, _T1, samples1_base = build_samples_for_run(run, get_feature_cols)
-    train_s1_base, val_s1_base, test_s1_base = split_samples(samples1_base, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+    train_s1_base, val_s1_base, test_s1_base = split_samples(
+        samples1_base, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode,
+        val_year=val_year, test_year_min=test_year_min, test_year_max=test_year_max,
+    )
     log_split_sanity("viz_stage1_base", train_s1_base, val_s1_base, test_s1_base, split_mode=split_mode)
     print(
         f"[features:stage1] doy={stage1_doy_start}-{stage1_doy_end} "
@@ -1372,7 +1986,21 @@ def main(
         # Stage1 alerts: no t* condition (use first t* with p>=tau)
         t_alert_start = None
         probs_for_split = p_val_cal if split == "val" else p_test_cal
-        if gate_consecutive_k > 1 or gate_smooth_window > 1:
+        if alert_map_csv:
+            # Pre-computed alerts (e.g. cascade Stage1a+Stage1b output).
+            # Expected columns: site, year, alerted, alert_tstar (Stage1 frame index).
+            df_amap = pd.read_csv(alert_map_csv)
+            alert_map = {}
+            for _, r in df_amap.iterrows():
+                if int(r.get("alerted", 0)) != 1:
+                    continue
+                at = r.get("alert_tstar")
+                if at is None or pd.isna(at):
+                    continue
+                key = f"{r['site']}-{int(r['year'])}"
+                alert_map[key] = int(at)
+            print(f"[seed {seed}] alert_map loaded from {alert_map_csv}: {len(alert_map)} alerts")
+        elif gate_consecutive_k > 1 or gate_smooth_window > 1:
             alert_map = build_alert_map_consecutive(
                 samples1,
                 probs_for_split,
@@ -1429,6 +2057,12 @@ def main(
         model2.eval()
 
         if grouped_mode:
+            # In grouped mode, each site-year group emits one row per t*
+            # candidate (~K rows per group). max_pool=300 (single-row default)
+            # truncates after the first group or two, breaking alert matching.
+            # Auto-raise pool to cover every candidate.
+            auto_pool = sum(len(g.get("samples", [])) for g in source_groups2)
+            effective_max_pool = max(int(max_pool), int(auto_pool))
             rows = collect_interval_preds_grouped(
                 model2,
                 loader2,
@@ -1438,7 +2072,7 @@ def main(
                 pi_method=getattr(C, "PI_METHOD", "shortest"),
                 pi_mass_level=pi_mass_level,
                 ablate_feature_indices=ablate_feature_indices,
-                max_samples=max_pool,
+                max_samples=effective_max_pool,
             )
         else:
             rows = collect_interval_preds(
@@ -1793,12 +2427,22 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--pest", type=str, required=True)
     p.add_argument("--run", type=int, default=0)
-    p.add_argument("--stage1_ckpt", type=str, required=True)
+    p.add_argument("--stage1_ckpt", type=str, default=None,
+                   help="Required for the legacy Stage 2 inference path. "
+                        "Optional when --selector_per_sample_csv is provided.")
     p.add_argument("--stage1_eval_csv", type=str, default=None)
-    p.add_argument("--stage2_ckpt", type=str, required=True)
+    p.add_argument("--stage2_ckpt", type=str, default=None,
+                   help="Required for the legacy Stage 2 inference path. "
+                        "Optional when --selector_per_sample_csv is provided.")
     p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
-    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal"])
+    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal", "year"])
+    p.add_argument("--val_year", type=int, default=2022,
+                   help="split_mode=year: val = samples whose year == val_year")
+    p.add_argument("--test_year_min", type=int, default=2023,
+                   help="split_mode=year: test = samples whose year in [test_year_min, test_year_max]")
+    p.add_argument("--test_year_max", type=int, default=2024,
+                   help="split_mode=year: test = samples whose year in [test_year_min, test_year_max]")
     p.add_argument("--seeds", type=int, nargs="*", default=None)
     p.add_argument("--auto_split_seed", action="store_true")
     p.add_argument("--auto_split_topk", type=int, default=1)
@@ -1829,6 +2473,40 @@ if __name__ == "__main__":
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_tags", type=str, default=None)
     p.add_argument("--wandb_job_type", type=str, default=None)
+    p.add_argument("--alert_map_csv", type=str, default=None,
+                   help="Pre-computed alerts CSV (site,year,alerted,alert_tstar). "
+                        "If given, overrides Stage1 tau-based alert derivation. "
+                        "Used for cascade Stage1a+Stage1b operating points.")
+    # --- Phase S11/S12-style selector-aware eval flags ---
+    p.add_argument("--selector_per_sample_csv", type=str, default=None,
+                   help="phase_s3-style per-sample CSV with (sample_id, L, R, "
+                        "t_star_doy, sigma, mu_at_pred_off, pred_off). When "
+                        "provided, bypass Stage 2 inference and run the metrics "
+                        "+ viz suite directly off this CSV (selector OOF eval).")
+    p.add_argument("--cohort_label", type=str, default="selector_eval",
+                   help="Cohort label used in metrics_summary.csv and wandb tags.")
+    p.add_argument("--n_total_test", type=int, default=575,
+                   help="Denominator for IoU_overall / P_ideal etc. (Phase S "
+                        "test cohort size = 575).")
+    p.add_argument("--sigma_eval", type=float, default=5.0,
+                   help="Fallback σ for PI = [μ−1.96σ, μ+1.96σ] when 'sigma' "
+                        "column is missing from the selector CSV.")
+    p.add_argument("--operational_shift", type=float, default=46.0,
+                   help="Operational shift applied to PI for bucket / P_ideal "
+                        "computation (lead = L − (μ + 1.96σ − shift)).")
+    p.add_argument("--ideal_lead_low", type=float, default=14.0)
+    p.add_argument("--ideal_lead_high", type=float, default=30.0)
+    p.add_argument("--selector_out_dir", type=str, default=None,
+                   help="Output directory for selector eval CSVs + PNGs. "
+                        "Default: <out_root>/selector_eval/")
+    p.add_argument("--selector_Tend", type=int, default=300,
+                   help="Tend used for plot_interval_rows x-axis when in "
+                        "selector-eval mode.")
+    p.add_argument("--selector_random_grid_n", type=int, default=50,
+                   help="Number of random samples for the dense PI grid figure "
+                        "in selector mode (default 50).")
+    p.add_argument("--selector_random_grid_cols", type=int, default=2,
+                   help="Number of columns in the dense PI grid (default 2).")
     args = p.parse_args()
     main(
         pest=args.pest,
@@ -1839,6 +2517,9 @@ if __name__ == "__main__":
         out_root=args.out_root,
         split_seed=args.split_seed,
         split_mode=args.split_mode,
+        val_year=args.val_year,
+        test_year_min=args.test_year_min,
+        test_year_max=args.test_year_max,
         seeds=args.seeds,
         auto_split_seed=args.auto_split_seed,
         seed_candidates_raw=args.seed_candidates,
@@ -1869,4 +2550,17 @@ if __name__ == "__main__":
         wandb_run_name=args.wandb_run_name,
         wandb_tags=args.wandb_tags,
         wandb_job_type=args.wandb_job_type,
+        alert_map_csv=args.alert_map_csv,
+        # selector-aware eval (Phase S11/S12)
+        selector_per_sample_csv=args.selector_per_sample_csv,
+        cohort_label=args.cohort_label,
+        n_total_test=args.n_total_test,
+        sigma_eval=args.sigma_eval,
+        operational_shift=args.operational_shift,
+        ideal_lead_low=args.ideal_lead_low,
+        ideal_lead_high=args.ideal_lead_high,
+        selector_out_dir=args.selector_out_dir,
+        selector_Tend=args.selector_Tend,
+        selector_random_grid_n=args.selector_random_grid_n,
+        selector_random_grid_cols=args.selector_random_grid_cols,
     )

@@ -19,7 +19,7 @@ from rice.src.dataset import (
     build_train_frame,
     slice_season,
     build_samples_season,
-    split_by_site,
+    split_samples,
     split_fingerprint,
     split_seed_search_topk,
 )
@@ -46,6 +46,7 @@ def main(
     split_seed_from_topk_idx: int | None,
     val_frac: float,
     test_frac: float,
+    split_mode: str,
 ):
     C, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -91,6 +92,7 @@ def main(
         target_test_interval=target_test_interval,
         tol_test_interval=tol_test_interval,
         topk=auto_split_topk,
+        split_mode=split_mode,
     )
     topk_list = result["topk"]
     if not topk_list:
@@ -123,11 +125,18 @@ def main(
         "seed_candidates": seed_candidates_raw,
         "val_frac": val_frac,
         "test_frac": test_frac,
+        "split_mode": split_mode,
         "topk": [],
     }
     for item in result["topk"]:
         seed_i = int(item["seed"])
-        tr_i, va_i, te_i = split_by_site(samples, val_frac=val_frac, test_frac=test_frac, seed=seed_i)
+        tr_i, va_i, te_i = split_samples(
+            samples,
+            val_frac=val_frac,
+            test_frac=test_frac,
+            seed=seed_i,
+            split_mode=split_mode,
+        )
         fp_i = split_fingerprint(tr_i, va_i, te_i)
         topk_payload["topk"].append(
             {
@@ -160,6 +169,12 @@ if __name__ == "__main__":
     p.add_argument("--tol_test_interval", type=int, default=None)
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--test_frac", type=float, default=0.1)
+    p.add_argument(
+        "--split_mode",
+        type=str,
+        default="site",
+        choices=["site", "site_year"],
+    )
     args = p.parse_args()
 
     main(
@@ -174,4 +189,5 @@ if __name__ == "__main__":
         split_seed_from_topk_idx=args.split_seed_from_topk_idx,
         val_frac=args.val_frac,
         test_frac=args.test_frac,
+        split_mode=args.split_mode,
     )

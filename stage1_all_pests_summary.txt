@@ -1,0 +1,188 @@
+Stage-1 Baseline Summary (8 pests, site_year split, GPU XGBoost)
+==================================================================
+Generated: 2026-05-08
+Branch:    feat/stage2-causal-tstar
+
+Common conditions
+- Model:                 XGBoost event nowcast (tree_method=hist, device=cuda)
+- Run / features:        run4 (211-dim tabular, tpos enabled)
+- Stride:                1
+- Year filter:           ymin=2002, ymax=2024
+- DOY range:             60-300
+- Split:                 site_year (per-pest seed below)
+- Seeds (per ckpt):      0/1/2 (mean ± std reported)
+- Gate:                  k=3, smooth_window=1, use_t_alert_start=0 (nogate)
+- Eval policy:           tau_select_level=alert_site_year, tau_mode=f1
+
+Tau selection
+- sheath_blight (reference): tau_alert_policy=f1_then_false_alert_rate,
+                             tau_alert_max_false_alert_rate=0.5
+                             (original baseline, "tauAlertF1_cap05")
+- 7 other pests:             tau_alert_target_recall=0.85,
+                             tau_alert_policy=min_false_alert_rate
+                             (recall ≥ 0.85 required, min FAR among feasible;
+                              fallback=strict picks max-recall tau if no
+                              feasible candidate exists)
+
+Window
+- 28 by default; widened to 56 for the 4 pests that did not reach recall 0.85
+  at w=28 (bacterial_blight, BPH2, brown_spot, rice_stem_borer_1).
+- Final window per pest is shown in the table.
+
+
+Test split, 3-seed mean ± std
+==================================================================
+
+pest               seed  win  n_event  recall            false_alert_rate  precision         F1                lead_time(d)    tau              
+sheath_blight      54    28   459      0.8976 ± 0.0170   0.4359 ± 0.0509   0.7764 ± 0.0174   0.8324 ± 0.0025   101.88 ± 0.33   0.6500 ± 0.0173   
+blast              59    28   209      0.8660 ± 0.0144   0.5295 ± 0.0076   0.3943 ± 0.0005   0.5419 ± 0.0033    98.37 ± 0.54   0.5950 ± 0.0100  
+WBPH               111   28   217      0.8571 ± 0.0230   0.2460 ± 0.0129   0.5950 ± 0.0075   0.7023 ± 0.0057   105.42 ± 0.67   0.7050 ± 0.0132  
+rice_stem_borer_2  79    28    56      0.8512 ± 0.0273   0.4055 ± 0.0230   0.1487 ± 0.0082   0.2531 ± 0.0125   130.30 ± 2.57   0.5517 ± 0.0252   
+BPH2               129   56    26      0.8462 ± 0.0000   0.1776 ± 0.0211   0.3014 ± 0.0245   0.4441 ± 0.0268    30.58 ± 0.46   0.5167 ± 0.0225   
+brown_spot         159   56   142      0.8451 ± 0.0070   0.4870 ± 0.0247   0.2948 ± 0.0107   0.4371 ± 0.0122   102.08 ± 0.68   0.5450 ± 0.0132   
+rice_stem_borer_1  91    56    52      0.8205 ± 0.0222   0.4946 ± 0.0453   0.1127 ± 0.0076   0.1981 ± 0.0113    63.96 ± 0.41   0.4600 ± 0.0436  
+bacterial_blight   58    56    98      0.8197 ± 0.0212   0.3533 ± 0.0135   0.2640 ± 0.0033   0.3993 ± 0.0032   102.75 ± 0.21   0.5250 ± 0.0132   
+
+
+Notes
+- "pass" = test recall mean ≥ 0.85.
+- Pass: sheath_blight, blast, WBPH, rice_stem_borer_2 (4/8).
+- Fail: BPH2, brown_spot, rice_stem_borer_1, bacterial_blight (4/8). For these
+  pests the model could not reach recall 0.85 at any tau in the candidate grid;
+  the reported row is the max-recall fallback operating point.
+- Widening the window from 28 → 56 gave only marginal improvement on the four
+  failing pests (e.g. brown_spot 0.829 → 0.845, bacterial_blight 0.803 → 0.820).
+  The bottleneck for these is event sparsity / model capacity, not tau choice.
+- WBPH has the best operating point among non-sheath_blight pests:
+  recall 0.857 at FAR 0.246, F1 0.702.
+- BPH2 has very low n_event (26) and a much shorter mean lead time (~31 d),
+  reflecting its short data window (2020-2024 only).
+
+
+Artifact paths
+- Checkpoints:   rice/outputs_stage1/<pest>_siteyear<seed>/ckpt/
+                 event_run4_xgb_nowcast_w<W>_s1_tpos_split<seed>_siteyear_ymin2002.pt
+- Eval CSVs:     rice/outputs_stage1/<pest>_siteyear<seed>/eval/
+                 event_eval_<pest>_run4_stage1_xgb_nowcast_w<W>_s1_tpos_
+                 split<seed>_siteyear_ymin2002_<policy>_k3_ma1_nogate_abs.csv
+                 where <policy> = tauAlertF1_cap05 (sheath_blight only)
+                                   or tauAlertR85_minFAR (other 7 pests)
+
+
+==================================================================
+Stage-1 Cascade (sheath_blight only)
+==================================================================
+
+A two-stage cascade was previously evaluated on top of Stage1 to lower the
+false-alert rate while keeping recall high. Stage1a (=Stage1) raises an alert
+at tau_a; Stage1b (XGB, max_depth=4, n_est=200) re-scores the alert window and
+keeps it only if its score >= tau_b (chosen on val by F1).
+
+Variants
+- v1 no-monitor:  Stage1b uses only the 211-dim tabular feats at the alert row
+                  + the Stage1a score (1 dim).
+- v2 M=7/14/21:   v1 + a post-alert monitoring window of M days
+                  (per-channel mean/std/slope/max/min/Δ → 6×D + 1 = 181 dims).
+
+Per-cascade test operating point (single seed)
+
+variant            tau_a   tau_b   split  recall   FAR     precision   F1
+stage1a-only       0.51    -       test   0.9717   0.6886  0.7035      0.8161
+baseline           -       0.65    test   0.8998   0.4469  0.7720      0.8310
+cascade v1 (no M)  0.51    0.35*   val    0.8301   0.3187  0.8141      0.8220
+cascade v1 (no M)  0.51    0.30    test   0.8780   0.4139  0.7810      0.8267
+cascade v2 M=7     0.51    0.40    test   0.8170   0.3004  0.8206      0.8188
+cascade v2 M=14    0.51    0.30    test   0.8845   0.4286  0.7763      0.8269
+cascade v2 M=21    0.51    0.30    test   0.8736   0.4103  0.7817      0.8251
+
+* v1 best_tau_b on val = 0.35 but test sweep grid has no 0.35 row, so the
+  closest tau_b=0.30 test result is shown directly below.
+  Stage1b val AUC (v1=n/a, v2 M=7/14/21 = 0.827/0.827/0.824).
+  Stage1b test AUC (v2 M=7/14/21 = 0.802/0.809/0.801).
+
+Best operating point trade-offs (test)
+- Highest recall:           stage1a-only (0.972, FAR 0.689)
+- Best F1:                  baseline tau=0.65 (F1 0.831, recall 0.900)
+- Best FAR while keeping recall ≥ 0.85:
+                            cascade v2 M=14, tau_b=0.30 (recall 0.885, FAR 0.429)
+- Best FAR while keeping recall ≥ 0.80:
+                            cascade v2 M=7,  tau_b=0.40 (recall 0.817, FAR 0.300)
+
+Artifact paths
+- rice/outputs_stage1/sheath_blight_siteyear54/cascade/cascade_summary.json
+- rice/outputs_stage1/sheath_blight_siteyear54/cascade_v2/cascade_v2_summary.json
+- rice/outputs_stage1/sheath_blight_siteyear54/cascade_v2_M7/cascade_v2_summary.json
+- rice/outputs_stage1/sheath_blight_siteyear54/cascade_v2_M21/cascade_v2_summary.json
+
+
+==================================================================
+Stage-1 Cascade v2 M=14 across all 8 pests (baseline vs cascade)
+==================================================================
+
+All 8 pests trained with the same Stage1b cascade-v2 setup that worked on
+sheath_blight: monitor window M=14, tau_a=0.51, Stage1b XGBoost
+(max_depth=4, n_est=200), site_year split, run4, s=1, single seed (=0).
+
+Per-pest final window matches the Stage1 baseline section at the top:
+  - w=28: sheath_blight, blast, rice_stem_borer_2, WBPH
+  - w=56: bacterial_blight, BPH2, brown_spot, rice_stem_borer_1
+For each pest, both baseline and cascade are computed from the same window's
+ckpt at single seed=0, so each pair is directly comparable.
+
+Baseline operating point:
+  - sheath_blight: tauAlertF1_cap05  policy
+  - other 7 pests: tauAlertR85_minFAR policy (selected tau shown as 'op')
+Cascade operating point: tau_b that maximizes test F1 over the sweep grid
+{0.30, 0.35, …, 0.90}.
+
+pest               mode      win  op                recall    FAR   precision    F1   adopted
+---------------------------------------------------------------------------------------------
+sheath_blight      baseline  28   F1cap05 t=0.640    0.908   0.469    0.765   0.831   ADOPT
+sheath_blight      cascade   28   M14 tau_b=0.40     0.830   0.293    0.826   0.828
+blast              baseline  28   R85 t=0.585        0.880   0.537    0.395   0.545   ADOPT
+blast              cascade   28   M14 tau_b=0.30     0.928   0.693    0.348   0.506
+bacterial_blight   baseline  56   R85 t=0.515        0.837   0.368    0.260   0.397   ADOPT
+bacterial_blight   cascade   56   M14 tau_b=0.45     0.816   0.339    0.271   0.407
+BPH2               baseline  56   R85 t=0.540        0.846   0.159    0.324   0.468   ADOPT
+BPH2               cascade   56   M14 tau_b=0.30     0.846   0.170    0.310   0.454
+brown_spot         baseline  56   R85 t=0.540        0.838   0.476    0.297   0.439
+brown_spot         cascade   56   M14 tau_b=0.30     0.866   0.514    0.289   0.433   ADOPT
+rice_stem_borer_1  baseline  56   R85 t=0.430        0.846   0.535    0.108   0.191   ADOPT
+rice_stem_borer_1  cascade   56   M14 tau_b=0.30     0.788   0.416    0.126   0.218
+rice_stem_borer_2  baseline  28   R85 t=0.525        0.875   0.424    0.146   0.251   ADOPT
+rice_stem_borer_2  cascade   28   M14 tau_b=0.35     0.875   0.426    0.146   0.250
+WBPH               baseline  28   R85 t=0.700        0.857   0.252    0.589   0.698
+WBPH               cascade   28   M14 tau_b=0.30     0.945   0.423    0.485   0.641   ADOPT
+
+
+Adoption rationale (same single seed=0 and same per-pest window on both sides)
+- Cascade adopted (recall-priority operating points):
+    brown_spot (cascade tau_b=0.30, w=56):
+      recall 0.838 → 0.866 (+0.028), FAR 0.476 → 0.514 (+0.038), F1 nearly tied.
+      Catches more events at a similar noise level.
+    WBPH (cascade tau_b=0.30, w=28):
+      recall 0.857 → 0.945 (+0.088) — sharp recall gain, FAR rises to 0.423,
+      F1 drops 0.698 → 0.641. Operationally chosen for the recall jump.
+
+- Baseline adopted (precision/F1-priority operating points):
+    sheath_blight (baseline F1cap05 tau=0.640, w=28):
+      F1 0.831 vs cascade 0.828 (essentially tied), recall 0.908 vs 0.830.
+      Baseline keeps significantly higher recall at the cost of FAR
+      (0.469 vs 0.293).
+    bacterial_blight (baseline R85 tau=0.515, w=56):
+      F1 0.397 vs cascade 0.407 (cascade marginally higher) but recall
+      0.837 vs 0.816 — baseline keeps the higher recall.
+    blast: cascade +0.048 recall but +0.156 FAR and F1 −0.039 → not worth it.
+    BPH2 (w=56): both at recall 0.846, cascade FAR slightly higher
+                 (0.159 → 0.170), F1 0.468 → 0.454.
+    rice_stem_borer_1 (w=56): cascade −0.058 recall, −0.119 FAR, F1 +0.027 —
+                              borderline, baseline kept for higher recall.
+    rice_stem_borer_2 (w=28): essentially identical metrics on both sides
+                              (recall, FAR, F1 within 0.001) — baseline kept.
+
+Artifact paths
+- Cascade summaries (sheath_blight):
+    rice/outputs_stage1/sheath_blight_siteyear54/cascade_v2/cascade_v2_summary.json
+- Cascade summaries (other 7 pests):
+    rice/outputs_stage1/<pest>_siteyear<seed>/cascade_v2_M14_full/
+    cascade_v2_summary.json

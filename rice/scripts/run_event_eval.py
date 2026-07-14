@@ -142,7 +142,7 @@ def pr_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
     precision = tp / np.maximum(tp + fp, 1)
     recall = np.concatenate([[0.0], recall])
     precision = np.concatenate([[1.0], precision])
-    return float(np.trapz(precision, recall))
+    return float(np.trapezoid(precision, recall))
 
 
 def apply_temperature(p: np.ndarray, temperature: float, eps: float = 1e-8) -> np.ndarray:

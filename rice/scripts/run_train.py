@@ -589,6 +589,41 @@ def main(
     stage2_pmf_asym_weight: float = 10.0,
     stage2_pmf_right_weight: float = 0.3,
     stage2_pmf_target_offset: float = 0.0,
+    stage2_pmf_asym_weight_early: float = 0.0,
+    stage2_pmf_target_early_offset: float = 30.0,
+    stage2_pmf_target_mode: str = "l_offset",
+    stage2_pmf_zone_late_weight: float = 0.0,
+    stage2_pmf_zone_too_late_weight: float = 0.0,
+    stage2_pmf_zone_missed_weight: float = 0.0,
+    stage2_pmf_zone_too_early_weight: float = 0.0,
+    stage2_pmf_zone_too_late_threshold: float = 15.0,
+    stage2_pmf_zone_missed_threshold: float = 22.0,
+    stage2_pmf_zone_too_early_threshold: float = 23.0,
+    stage2_phenology_bias_head: int = 0,
+    stage2_phenology_hidden: int = 8,
+    stage2_pmf_long_lead_threshold: float = 0.0,
+    stage2_pmf_long_lead_weight: float = 1.0,
+    stage2_pmf_right_anchor: float = 0.0,
+    val_year: int = 2022,
+    test_year_min: int = 2023,
+    test_year_max: int = 2024,
+    stage2_dispatch_feature_csv: str | None = None,
+    stage2_dispatch_feature_mode: str = "causal",
+    stage2_dispatch_feature_missing_value: float = 0.0,
+    stage2_cohort_dispatch_only: bool = False,
+    stage2_pmf_mu_mode: str = "absolute",
+    stage2_pmf_lead_min: float = 7.0,
+    stage2_pmf_lead_max: float = 75.0,
+    stage2_pmf_clim_mid: float = 0.0,
+    stage2_pmf_delta_max: float = 60.0,
+    stage2_reset_head_mu: bool = False,
+    stage2_aux_lead_lambda: float = 0.0,
+    stage2_aux_lead_huber_delta: float = 10.0,
+    stage2_gaussian_loss_mode: str = "asym_mse",
+    stage2_gaussian_interval_continuity_correction: int = 0,
+    stage2_gaussian_interval_lambda: float = 0.1,
+    stage2_add_neighbor_history: bool = False,
+    stage2_neighbor_decay_km: float = 20.0,
 ):
     _, get_feature_cols = resolve_pest(pest)
     if not out_root:
@@ -769,10 +804,103 @@ def main(
     # =========================
     t0 = time.perf_counter()
     df_season = slice_season(train_df, C.DOY_START, C.DOY_END)
-    samples, dropped, feature_names = build_samples_season(df_season, feature_cols, C.DOY_START, C.DOY_END)
+    # Phenology-bias-head: pull static phenology vector per site-year (separate
+    # from the time-series X). Columns must exist in train_df after merge_pheno_daily_ffill.
+    pheno_ext_cols_default = ["best_suitability", "best_months", "offset_days", "window_idx"]
+    pheno_ext_cols = (
+        [c for c in pheno_ext_cols_default if c in df_season.columns]
+        if bool(int(stage2_phenology_bias_head))
+        else None
+    )
+    if pheno_ext_cols is not None:
+        print(f"[phenobias] pheno_ext_cols loaded: {pheno_ext_cols}")
+    samples, dropped, feature_names = build_samples_season(
+        df_season, feature_cols, C.DOY_START, C.DOY_END,
+        pheno_ext_cols=pheno_ext_cols,
+    )
     print("samples:", len(samples), "| dropped groups (len!=T):", dropped)
     print(f"[time] build_samples_season={time.perf_counter()-t0:.2f}s")
     print(f"[features] n={len(feature_names)} head={feature_names[:5]} tail={feature_names[-5:]}")
+
+    # ---- Optional Stage-2 DIRECT neighbor occurrence features (6 channels) ----
+    # Appended right after build_samples_season and BEFORE dispatch features so
+    # train + eval share one channel order: base -> neighbor -> dispatch. Uses the
+    # same util + strict obs_doy < t leakage guard as Stage-1. OFF by default ->
+    # production baseline is byte-identical when the flag is not passed.
+    stage2_neighbor_added = False
+    stage2_neighbor_feature_names: list[str] = []
+    if bool(stage2_add_neighbor_history):
+        from rice.scripts.neighbor_history_utils import (
+            load_long_events, build_neighbor_index, append_neighbor_to_samples,
+            NEIGHBOR_CHANNEL_NAMES, NEIGHBOR_FEATURE_DIM,
+        )
+        d_in_before_nb = int(samples[0]["X"].shape[1])
+        ev_df, co_df, _nb_sy = load_long_events(
+            C.PATH_OBS, label_col=getattr(C, "LABEL_COL", "label_event"),
+            year_min=getattr(C, "YEAR_MIN", None), year_max=getattr(C, "YEAR_MAX", None),
+        )
+        nb_index = build_neighbor_index(ev_df, co_df)
+        append_neighbor_to_samples(
+            samples, nb_index, doy_start=int(C.DOY_START),
+            decay_km=float(stage2_neighbor_decay_km),
+        )
+        feature_names = list(feature_names) + list(NEIGHBOR_CHANNEL_NAMES)
+        stage2_neighbor_added = True
+        stage2_neighbor_feature_names = list(NEIGHBOR_CHANNEL_NAMES)
+        d_in_after_nb = int(samples[0]["X"].shape[1])
+        print(f"[stage2_neighbor] before_d_in={d_in_before_nb}  added={NEIGHBOR_FEATURE_DIM}  "
+              f"after_d_in={d_in_after_nb}  decay_km={float(stage2_neighbor_decay_km)}")
+        print(f"[stage2_neighbor] channels={NEIGHBOR_CHANNEL_NAMES}")
+
+    # ---- Optional Stage-1 dispatch confidence features (causal-fill, 15 chans)
+    stage2_pmf_alert_tstar_feat_idx = -1
+    if stage2_dispatch_feature_csv:
+        from rice.scripts.stage1_confidence_utils import (
+            load_dispatch_feature_table, append_dispatch_confidence_to_samples,
+            DISPATCH_CHANNEL_NAMES, DISPATCH_TOTAL_CHANNELS,
+        )
+        conf_map = load_dispatch_feature_table(stage2_dispatch_feature_csv)
+        # Phase B: optional cohort restriction to dispatch-alerted site-years.
+        # Done BEFORE append so feature appending stays correct on the kept set.
+        if bool(stage2_cohort_dispatch_only):
+            sy_in_conf = set(conf_map.keys())
+            n_before = len(samples)
+            samples = [s for s in samples
+                       if (str(s["site_id"]), int(s["year"])) in sy_in_conf]
+            print(f"[cohort_dispatch_only] filtered samples {n_before} -> {len(samples)} "
+                  f"(kept site-years in conf_map; needed for lead_from_alert)")
+            if not samples:
+                raise SystemExit("[abort] cohort_dispatch_only left 0 samples")
+        # Capture base d_in BEFORE append so alert_tstar channel index is known.
+        base_d_in = int(samples[0]["X"].shape[1])
+        stats = append_dispatch_confidence_to_samples(
+            samples,
+            conf_map,
+            doy_start=int(C.DOY_START),
+            mode=str(stage2_dispatch_feature_mode),
+            missing_value=float(stage2_dispatch_feature_missing_value),
+        )
+        # DISPATCH_FEATURE_NAMES[0] = 'alert_tstar' -> appended at channel index = base_d_in.
+        stage2_pmf_alert_tstar_feat_idx = base_d_in
+        feature_names = list(feature_names) + DISPATCH_CHANNEL_NAMES
+        print(f"[dispatch_features] csv={stage2_dispatch_feature_csv}  "
+              f"mode={stats['mode']}  n_with_alert={stats['n_with_alert']}  "
+              f"n_no_alert={stats['n_no_alert']}  "
+              f"added_channels={stats['added_channels']}  "
+              f"rows_with_feature={stats['n_rows_with_feature']}  "
+              f"rows_missing={stats['n_rows_missing']}  "
+              f"new_feature_count={len(feature_names)}  "
+              f"alert_tstar_feat_idx={stage2_pmf_alert_tstar_feat_idx}  "
+              f"cohort_dispatch_only={bool(stage2_cohort_dispatch_only)}")
+    elif bool(stage2_cohort_dispatch_only):
+        raise SystemExit("[abort] --stage2_cohort_dispatch_only requires "
+                          "--stage2_dispatch_feature_csv (need conf_map to filter)")
+    if str(stage2_pmf_mu_mode) == "lead_from_alert" and stage2_pmf_alert_tstar_feat_idx < 0:
+        raise SystemExit("[abort] --stage2_pmf_mu_mode=lead_from_alert requires "
+                          "--stage2_dispatch_feature_csv (need alert_tstar channel)")
+    if str(stage2_pmf_mu_mode) == "residual_clim" and float(stage2_pmf_clim_mid) <= 0.0:
+        raise SystemExit("[abort] --stage2_pmf_mu_mode=residual_clim requires "
+                          "--stage2_pmf_clim_mid > 0 (per-pest climatology mean_mid in DOY units)")
 
     # =========================
     # 8) Split + norm + datasets
@@ -782,7 +910,16 @@ def main(
     if split_seeds_json is not None:
         split_seeds_json_path = resolve_split_seeds_json_path(out_root, split_seeds_json)
         split_seed, chosen_idx, chosen, payload = load_split_seed_from_topk(split_seeds_json_path, split_seed_from_topk_idx)
-        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed=split_seed,
+            split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
+        )
         print(
             f"[split_seed_json] selected seed={split_seed} idx={chosen_idx} "
             f"file={split_seeds_json_path}"
@@ -799,6 +936,9 @@ def main(
             tol_test_interval=tol_test_interval,
             topk=auto_split_topk,
             split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
         )
         topk_list = result["topk"]
         if not topk_list:
@@ -809,7 +949,16 @@ def main(
             raise ValueError(f"--split_seed_from_topk_idx out of range (0..{len(topk_list)-1})")
         chosen = topk_list[split_seed_from_topk_idx]
         split_seed = int(chosen["seed"])
-        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed=split_seed,
+            split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
+        )
         print(
             f"[auto_split] selected seed={split_seed} score={chosen['score']:.6f} "
             f"counts={chosen['counts']}"
@@ -820,7 +969,16 @@ def main(
         for i, item in enumerate(topk_list):
             print(f"  [{i}] seed={item['seed']} score={item['score']:.6f} test={item['counts']['test']}")
     else:
-        train_s, val_s, test_s = split_samples(samples, val_frac=0.1, test_frac=0.1, seed=split_seed, split_mode=split_mode)
+        train_s, val_s, test_s = split_samples(
+            samples,
+            val_frac=0.1,
+            test_frac=0.1,
+            seed=split_seed,
+            split_mode=split_mode,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
+        )
 
     log_split_sanity("base", train_s, val_s, test_s, split_mode=split_mode)
 
@@ -976,6 +1134,43 @@ def main(
         "stage2_pmf_asym_weight": float(stage2_pmf_asym_weight),
         "stage2_pmf_right_weight": float(stage2_pmf_right_weight),
         "stage2_pmf_target_offset": float(stage2_pmf_target_offset),
+        "stage2_pmf_asym_weight_early": float(stage2_pmf_asym_weight_early),
+        "stage2_pmf_target_early_offset": float(stage2_pmf_target_early_offset),
+        "stage2_pmf_target_mode": str(stage2_pmf_target_mode),
+        "stage2_pmf_zone_late_weight": float(stage2_pmf_zone_late_weight),
+        "stage2_pmf_zone_too_late_weight": float(stage2_pmf_zone_too_late_weight),
+        "stage2_pmf_zone_missed_weight": float(stage2_pmf_zone_missed_weight),
+        "stage2_pmf_zone_too_early_weight": float(stage2_pmf_zone_too_early_weight),
+        "stage2_pmf_zone_too_late_threshold": float(stage2_pmf_zone_too_late_threshold),
+        "stage2_pmf_zone_missed_threshold": float(stage2_pmf_zone_missed_threshold),
+        "stage2_pmf_zone_too_early_threshold": float(stage2_pmf_zone_too_early_threshold),
+        "stage2_phenology_bias_head": int(stage2_phenology_bias_head),
+        "stage2_phenology_hidden": int(stage2_phenology_hidden),
+        "stage2_dispatch_features_added": bool(stage2_dispatch_feature_csv),
+        "stage2_dispatch_feature_csv": (str(stage2_dispatch_feature_csv)
+                                          if stage2_dispatch_feature_csv else None),
+        "stage2_dispatch_feature_mode": str(stage2_dispatch_feature_mode),
+        "stage2_dispatch_feature_missing_value": float(stage2_dispatch_feature_missing_value),
+        "stage2_cohort_dispatch_only": bool(stage2_cohort_dispatch_only),
+        "stage2_pmf_mu_mode": str(stage2_pmf_mu_mode),
+        "stage2_pmf_lead_min": float(stage2_pmf_lead_min),
+        "stage2_pmf_lead_max": float(stage2_pmf_lead_max),
+        "stage2_pmf_clim_mid": float(stage2_pmf_clim_mid),
+        "stage2_pmf_delta_max": float(stage2_pmf_delta_max),
+        "stage2_pmf_alert_tstar_feat_idx": int(stage2_pmf_alert_tstar_feat_idx),
+        "stage2_dispatch_channels_raw": bool(stage2_dispatch_feature_csv),
+        "stage2_neighbor_history_added": bool(stage2_neighbor_added),
+        "stage2_neighbor_feature_names": list(stage2_neighbor_feature_names),
+        "stage2_neighbor_decay_km": float(stage2_neighbor_decay_km),
+        "stage2_reset_head_mu": bool(stage2_reset_head_mu),
+        "stage2_aux_lead_lambda": float(stage2_aux_lead_lambda),
+        "stage2_aux_lead_huber_delta": float(stage2_aux_lead_huber_delta),
+        "stage2_pmf_long_lead_threshold": float(stage2_pmf_long_lead_threshold),
+        "stage2_pmf_long_lead_weight": float(stage2_pmf_long_lead_weight),
+        "stage2_pmf_right_anchor": float(stage2_pmf_right_anchor),
+        "stage2_gaussian_loss_mode": str(stage2_gaussian_loss_mode),
+        "stage2_gaussian_interval_continuity_correction": int(stage2_gaussian_interval_continuity_correction),
+        "stage2_gaussian_interval_lambda": float(stage2_gaussian_interval_lambda),
         "gated_val_stage1_ckpt": gated_val_stage1_ckpt,
         "gated_val_stage1_eval_csv": gated_val_stage1_eval_csv,
         "gated_val_stage2_tstar_offset": int(gated_val_stage2_tstar_offset),
@@ -998,6 +1193,27 @@ def main(
     t0 = time.perf_counter()
     x_mean, x_std = compute_norm_stats(train_s)
     print(f"[time] compute_norm_stats={time.perf_counter()-t0:.2f}s")
+
+    # Phase B fix: dispatch confidence channels (last DISPATCH_TOTAL_CHANNELS
+    # slots, appended after build_samples_season) must stay RAW. The lead head
+    # reads alert_tstar in absolute DOY (~109..180), so standardization would
+    # collapse it to ~0 and break mu = alert_rel + lead. Force mean=0 / std=1
+    # on those slots; other channels keep their standardization.
+    if stage2_dispatch_feature_csv:
+        from rice.scripts.stage1_confidence_utils import DISPATCH_TOTAL_CHANNELS
+        n_disp = int(DISPATCH_TOTAL_CHANNELS)
+        d_total = int(x_mean.shape[0])
+        disp_start = d_total - n_disp
+        if disp_start < 0:
+            raise SystemExit(
+                f"[abort] norm_stats has only {d_total} channels but expected "
+                f">= {n_disp} dispatch channels at the tail"
+            )
+        x_mean[disp_start:] = 0.0
+        x_std[disp_start:] = 1.0
+        print(f"[norm_stats] dispatch channels [{disp_start}:{d_total}] "
+              f"forced to RAW (mean=0, std=1) so lead head reads alert_tstar "
+              f"in absolute DOY")
 
     if grouped_mode:
         train_groups = group_stage2_samples_by_site_year(train_s)
@@ -1029,11 +1245,17 @@ def main(
         idxs = [0, len(train_ds) // 2, len(train_ds) - 1]
         for idx in idxs:
             if grouped_mode:
-                X_i, L_i, R_i, c_i, tstar_i = train_ds[idx]
+                _item = train_ds[idx]
+                if len(_item) == 6:
+                    X_i, L_i, R_i, c_i, tstar_i, pheno_i = _item
+                    pheno_shape = tuple(pheno_i.shape)
+                else:
+                    X_i, L_i, R_i, c_i, tstar_i = _item
+                    pheno_shape = "(none)"
                 print(
                     f"[debug] train_ds[{idx}] X.shape={tuple(X_i.shape)} X.dtype={X_i.dtype} "
                     f"L.shape={tuple(L_i.shape)} R.shape={tuple(R_i.shape)} c.shape={tuple(c_i.shape)} "
-                    f"tstar.shape={tuple(tstar_i.shape)}"
+                    f"tstar.shape={tuple(tstar_i.shape)} pheno.shape={pheno_shape}"
                 )
             else:
                 X_i, L_i, R_i, c_i = train_ds[idx]
@@ -1044,6 +1266,9 @@ def main(
 
     D_in = int(train_ds[0][0].shape[-1])
     print(f"[D_in] computed_from_dataset={D_in}")
+    if stage2_neighbor_added:
+        print(f"[stage2_neighbor] final d_in (model input) = {D_in}  "
+              f"(includes {len(stage2_neighbor_feature_names)} neighbor channels)")
 
     train_seeds = seeds if seeds is not None else C.SEEDS
     gated_val_alert_maps: dict[int, dict[str, int]] = {}
@@ -1125,6 +1350,9 @@ def main(
                 max_len=C.MAX_LEN,
                 max_tstar_len=512,
                 use_tstar_scalar_pos=bool(stage2_use_tstar_scalar_pos),
+                phenology_bias_head=bool(int(stage2_phenology_bias_head)),
+                phenology_dim=4,
+                phenology_hidden=int(stage2_phenology_hidden),
             ).to(device)
             model.early_tstar_weight_min = float(stage2_early_tstar_weight_min)
             model.site_year_mean_loss = bool(stage2_site_year_mean_loss)
@@ -1133,9 +1361,52 @@ def main(
             model.pmf_mode = str(stage2_pmf_mode)
             model.gaussian_sigma = float(stage2_pmf_sigma)
             model.gaussian_mu_max = float(stage2_pmf_mu_max)
+            # Phase B: lead_from_alert mu head config (no-op when mu_mode='absolute')
+            model.mu_mode = str(stage2_pmf_mu_mode)
+            model.lead_min = float(stage2_pmf_lead_min)
+            model.lead_max = float(stage2_pmf_lead_max)
+            # Residual-from-climatology mu head config (no-op when mu_mode != 'residual_clim').
+            # clim_mid is provided in DOY units (e.g. 198.7 for sheath_blight);
+            # convert to 1-based season-index coords to match L/R semantics in
+            # the model head.
+            model.clim_mid_rel = float(stage2_pmf_clim_mid) - float(C.DOY_START) + 1.0
+            model.delta_max = float(stage2_pmf_delta_max)
+            model.alert_tstar_feat_idx = int(stage2_pmf_alert_tstar_feat_idx)
+            model.doy_start = int(C.DOY_START)
+            model.lead_strict_alert_check = True   # safety: catch std-bug fast
+            model.lead_debug_once_pending = (str(stage2_pmf_mu_mode) in
+                                              ("lead_from_alert", "residual_clim"))
+            # Phase B aux lead loss (no-op when lambda=0)
+            model.aux_lead_lambda = float(stage2_aux_lead_lambda)
+            model.aux_lead_huber_delta = float(stage2_aux_lead_huber_delta)
             model.asym_weight = float(stage2_pmf_asym_weight)
             model.right_weight = float(stage2_pmf_right_weight)
             model.target_offset = float(stage2_pmf_target_offset)
+            model.asym_weight_early = float(stage2_pmf_asym_weight_early)
+            model.target_early_offset = float(stage2_pmf_target_early_offset)
+            model.target_mode = str(stage2_pmf_target_mode)
+            model.zone_late_weight = float(stage2_pmf_zone_late_weight)
+            model.zone_too_late_weight = float(stage2_pmf_zone_too_late_weight)
+            model.zone_missed_weight = float(stage2_pmf_zone_missed_weight)
+            model.zone_too_early_weight = float(stage2_pmf_zone_too_early_weight)
+            model.zone_too_late_threshold = float(stage2_pmf_zone_too_late_threshold)
+            model.zone_missed_threshold = float(stage2_pmf_zone_missed_threshold)
+            model.zone_too_early_threshold = float(stage2_pmf_zone_too_early_threshold)
+            # Phase S5: per-sample long-lead weighting (mu-loss multiplier).
+            model.long_lead_threshold = float(stage2_pmf_long_lead_threshold)
+            model.long_lead_weight = float(stage2_pmf_long_lead_weight)
+            model._phase_s5_sw_logged = False
+            # Phase S10: configurable right-cens anchor (0 → Tend fallback).
+            model.right_anchor = float(stage2_pmf_right_anchor)
+            # Gaussian interval NLL ablation: select loss mode for Gaussian PMF.
+            #   asym_mse    (default) : legacy asymmetric_mu_loss (regression-style).
+            #   interval_nll          : gaussian_interval_nll_loss
+            #                            P(L < T ≤ R) on Gaussian with fixed sigma.
+            #   mixed                 : asym_mse + lambda * interval_nll. Lambda
+            #                            controlled via stage2_gaussian_interval_lambda.
+            model.gaussian_loss_mode = str(stage2_gaussian_loss_mode)
+            model.gaussian_interval_continuity_correction = bool(int(stage2_gaussian_interval_continuity_correction))
+            model.gaussian_interval_lambda = float(stage2_gaussian_interval_lambda)
         else:
             model = HazardTransformer(
                 d_in=D_in,
@@ -1151,7 +1422,76 @@ def main(
             warm_state = _select_stage_state(warm_ckpt, warm_seed)
             if warm_state is None:
                 raise ValueError(f"warm-start checkpoint has no trained state for seed={warm_seed}: {stage2_warm_start_ckpt}")
-            missing, unexpected = model.load_state_dict(warm_state["state_dict"], strict=False)
+
+            # Shape-aware patch: when the new model has a larger LAST-dim than
+            # the warm checkpoint (typical case: added input channels such as
+            # dispatch confidence features), copy old weights into [:, :old_in]
+            # and zero-init the new tail. Other shape mismatches are dropped so
+            # load_state_dict can still run, and those tensors fall back to the
+            # current random init.
+            cur_sd = model.state_dict()
+            warm_sd = dict(warm_state["state_dict"])
+            # Phase B headreset: drop head_mu.* keys so they fall through to
+            # the fresh model init. backbone / in_proj / encoder / phen_head
+            # come from warm ckpt as usual. Only active in lead_from_alert mode
+            # since absolute mode reuses head_mu meaningfully.
+            if bool(stage2_reset_head_mu):
+                if str(stage2_pmf_mu_mode) != "lead_from_alert":
+                    print(f"[reset_head_mu] WARNING: --stage2_reset_head_mu set "
+                          f"but mu_mode={stage2_pmf_mu_mode!r}; reset has no "
+                          f"intended effect outside lead_from_alert. Proceeding "
+                          f"anyway.")
+                reset_keys = sorted(k for k in warm_sd if k.startswith("head_mu."))
+                for k in reset_keys:
+                    del warm_sd[k]
+                print(f"[reset_head_mu] reinitialized (dropped from warm-start, "
+                      f"kept current fresh init): {reset_keys}")
+            patched = []
+            dropped = []
+            for k in list(warm_sd.keys()):
+                w_old = warm_sd[k]
+                w_cur = cur_sd.get(k)
+                if w_cur is None:
+                    continue  # unexpected key, load_state_dict will skip
+                if w_old.shape == w_cur.shape:
+                    continue
+                if (w_old.dim() == w_cur.dim()
+                        and w_old.dim() >= 1
+                        and tuple(w_old.shape[:-1]) == tuple(w_cur.shape[:-1])
+                        and int(w_old.shape[-1]) < int(w_cur.shape[-1])):
+                    new_w = w_cur.detach().clone()  # current random init
+                    new_w[..., :int(w_old.shape[-1])] = w_old.to(new_w.dtype)
+                    new_w[..., int(w_old.shape[-1]):] = 0.0
+                    warm_sd[k] = new_w
+                    patched.append({
+                        "key": k,
+                        "old_shape": tuple(w_old.shape),
+                        "new_shape": tuple(new_w.shape),
+                        "copied_in_dim": int(w_old.shape[-1]),
+                        "zeroed_in_dim": int(new_w.shape[-1] - w_old.shape[-1]),
+                    })
+                else:
+                    dropped.append({
+                        "key": k,
+                        "warm_shape": tuple(w_old.shape),
+                        "cur_shape": tuple(w_cur.shape),
+                    })
+                    del warm_sd[k]
+
+            if patched:
+                print(f"[seed {SEED}] warm-start shape-patched {len(patched)} tensor(s) "
+                      f"(zero-padded new input dims):")
+                for p in patched:
+                    print(f"  {p['key']}  old={p['old_shape']} -> new={p['new_shape']}  "
+                          f"copied_in_dim={p['copied_in_dim']}  "
+                          f"zeroed_in_dim={p['zeroed_in_dim']}")
+            if dropped:
+                print(f"[seed {SEED}] warm-start dropped {len(dropped)} incompatible "
+                      f"tensor(s) (current random init kept):")
+                for d in dropped:
+                    print(f"  {d['key']}  warm={d['warm_shape']} cur={d['cur_shape']}")
+
+            missing, unexpected = model.load_state_dict(warm_sd, strict=False)
             print(f"[seed {SEED}] warm-started Stage2 from {stage2_warm_start_ckpt} seed={warm_seed}")
             if missing:
                 print(f"[seed {SEED}] warm-start missing keys ({len(missing)}, will use random init): {missing[:8]}")
@@ -1482,6 +1822,43 @@ def main(
                     "stage2_pmf_asym_weight": float(stage2_pmf_asym_weight),
                     "stage2_pmf_right_weight": float(stage2_pmf_right_weight),
                     "stage2_pmf_target_offset": float(stage2_pmf_target_offset),
+                    "stage2_pmf_asym_weight_early": float(stage2_pmf_asym_weight_early),
+                    "stage2_pmf_target_early_offset": float(stage2_pmf_target_early_offset),
+                    "stage2_pmf_target_mode": str(stage2_pmf_target_mode),
+                    "stage2_pmf_zone_late_weight": float(stage2_pmf_zone_late_weight),
+                    "stage2_pmf_zone_too_late_weight": float(stage2_pmf_zone_too_late_weight),
+                    "stage2_pmf_zone_missed_weight": float(stage2_pmf_zone_missed_weight),
+                    "stage2_pmf_zone_too_early_weight": float(stage2_pmf_zone_too_early_weight),
+                    "stage2_pmf_zone_too_late_threshold": float(stage2_pmf_zone_too_late_threshold),
+                    "stage2_pmf_zone_missed_threshold": float(stage2_pmf_zone_missed_threshold),
+                    "stage2_pmf_zone_too_early_threshold": float(stage2_pmf_zone_too_early_threshold),
+                    "stage2_phenology_bias_head": int(stage2_phenology_bias_head),
+                    "stage2_phenology_hidden": int(stage2_phenology_hidden),
+                    "stage2_dispatch_features_added": bool(stage2_dispatch_feature_csv),
+                    "stage2_dispatch_feature_csv": (str(stage2_dispatch_feature_csv)
+                                                      if stage2_dispatch_feature_csv else None),
+                    "stage2_dispatch_feature_mode": str(stage2_dispatch_feature_mode),
+                    "stage2_dispatch_feature_missing_value": float(stage2_dispatch_feature_missing_value),
+                    "stage2_cohort_dispatch_only": bool(stage2_cohort_dispatch_only),
+                    "stage2_pmf_mu_mode": str(stage2_pmf_mu_mode),
+                    "stage2_pmf_lead_min": float(stage2_pmf_lead_min),
+                    "stage2_pmf_lead_max": float(stage2_pmf_lead_max),
+                    "stage2_pmf_clim_mid": float(stage2_pmf_clim_mid),
+                    "stage2_pmf_delta_max": float(stage2_pmf_delta_max),
+                    "stage2_pmf_alert_tstar_feat_idx": int(stage2_pmf_alert_tstar_feat_idx),
+        "stage2_dispatch_channels_raw": bool(stage2_dispatch_feature_csv),
+        "stage2_neighbor_history_added": bool(stage2_neighbor_added),
+        "stage2_neighbor_feature_names": list(stage2_neighbor_feature_names),
+        "stage2_neighbor_decay_km": float(stage2_neighbor_decay_km),
+        "stage2_reset_head_mu": bool(stage2_reset_head_mu),
+        "stage2_aux_lead_lambda": float(stage2_aux_lead_lambda),
+        "stage2_aux_lead_huber_delta": float(stage2_aux_lead_huber_delta),
+                    "stage2_pmf_long_lead_threshold": float(stage2_pmf_long_lead_threshold),
+                    "stage2_pmf_long_lead_weight": float(stage2_pmf_long_lead_weight),
+                    "stage2_pmf_right_anchor": float(stage2_pmf_right_anchor),
+                    "stage2_gaussian_loss_mode": str(stage2_gaussian_loss_mode),
+                    "stage2_gaussian_interval_continuity_correction": int(stage2_gaussian_interval_continuity_correction),
+                    "stage2_gaussian_interval_lambda": float(stage2_gaussian_interval_lambda),
                     "gated_val_stage1_ckpt": gated_val_stage1_ckpt,
                     "gated_val_stage1_eval_csv": gated_val_stage1_eval_csv,
                     "gated_val_stage2_tstar_offset": int(gated_val_stage2_tstar_offset),
@@ -1626,6 +2003,43 @@ def main(
         "stage2_pmf_asym_weight": float(stage2_pmf_asym_weight),
         "stage2_pmf_right_weight": float(stage2_pmf_right_weight),
         "stage2_pmf_target_offset": float(stage2_pmf_target_offset),
+        "stage2_pmf_asym_weight_early": float(stage2_pmf_asym_weight_early),
+        "stage2_pmf_target_early_offset": float(stage2_pmf_target_early_offset),
+        "stage2_pmf_target_mode": str(stage2_pmf_target_mode),
+        "stage2_pmf_zone_late_weight": float(stage2_pmf_zone_late_weight),
+        "stage2_pmf_zone_too_late_weight": float(stage2_pmf_zone_too_late_weight),
+        "stage2_pmf_zone_missed_weight": float(stage2_pmf_zone_missed_weight),
+        "stage2_pmf_zone_too_early_weight": float(stage2_pmf_zone_too_early_weight),
+        "stage2_pmf_zone_too_late_threshold": float(stage2_pmf_zone_too_late_threshold),
+        "stage2_pmf_zone_missed_threshold": float(stage2_pmf_zone_missed_threshold),
+        "stage2_pmf_zone_too_early_threshold": float(stage2_pmf_zone_too_early_threshold),
+        "stage2_phenology_bias_head": int(stage2_phenology_bias_head),
+        "stage2_phenology_hidden": int(stage2_phenology_hidden),
+        "stage2_dispatch_features_added": bool(stage2_dispatch_feature_csv),
+        "stage2_dispatch_feature_csv": (str(stage2_dispatch_feature_csv)
+                                          if stage2_dispatch_feature_csv else None),
+        "stage2_dispatch_feature_mode": str(stage2_dispatch_feature_mode),
+        "stage2_dispatch_feature_missing_value": float(stage2_dispatch_feature_missing_value),
+        "stage2_cohort_dispatch_only": bool(stage2_cohort_dispatch_only),
+        "stage2_pmf_mu_mode": str(stage2_pmf_mu_mode),
+        "stage2_pmf_lead_min": float(stage2_pmf_lead_min),
+        "stage2_pmf_lead_max": float(stage2_pmf_lead_max),
+        "stage2_pmf_clim_mid": float(stage2_pmf_clim_mid),
+        "stage2_pmf_delta_max": float(stage2_pmf_delta_max),
+        "stage2_pmf_alert_tstar_feat_idx": int(stage2_pmf_alert_tstar_feat_idx),
+        "stage2_dispatch_channels_raw": bool(stage2_dispatch_feature_csv),
+        "stage2_neighbor_history_added": bool(stage2_neighbor_added),
+        "stage2_neighbor_feature_names": list(stage2_neighbor_feature_names),
+        "stage2_neighbor_decay_km": float(stage2_neighbor_decay_km),
+        "stage2_reset_head_mu": bool(stage2_reset_head_mu),
+        "stage2_aux_lead_lambda": float(stage2_aux_lead_lambda),
+        "stage2_aux_lead_huber_delta": float(stage2_aux_lead_huber_delta),
+        "stage2_pmf_long_lead_threshold": float(stage2_pmf_long_lead_threshold),
+        "stage2_pmf_long_lead_weight": float(stage2_pmf_long_lead_weight),
+        "stage2_pmf_right_anchor": float(stage2_pmf_right_anchor),
+        "stage2_gaussian_loss_mode": str(stage2_gaussian_loss_mode),
+        "stage2_gaussian_interval_continuity_correction": int(stage2_gaussian_interval_continuity_correction),
+        "stage2_gaussian_interval_lambda": float(stage2_gaussian_interval_lambda),
         "gated_val_stage1_ckpt": gated_val_stage1_ckpt,
         "gated_val_stage1_eval_csv": gated_val_stage1_eval_csv,
         "gated_val_stage2_tstar_offset": int(gated_val_stage2_tstar_offset),
@@ -1666,7 +2080,10 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default=None)
     p.add_argument("--out_root", type=str, default=None)
     p.add_argument("--split_seed", type=int, default=C.SPLIT_SEED)
-    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal"])
+    p.add_argument("--split_mode", type=str, default="site", choices=["site", "site_year", "temporal", "year"])
+    p.add_argument("--val_year", type=int, default=2022)
+    p.add_argument("--test_year_min", type=int, default=2023)
+    p.add_argument("--test_year_max", type=int, default=2024)
     p.add_argument("--seeds", type=int, nargs="*", default=None)
     p.add_argument("--auto_split_seed", action="store_true")
     p.add_argument("--auto_split_topk", type=int, default=1)
@@ -1751,6 +2168,135 @@ if __name__ == "__main__":
                    help="Weight on right-censored MSE term.")
     p.add_argument("--stage2_pmf_target_offset", type=float, default=0.0,
                    help="Loss target = L + offset for event rows. e.g. +5 to bias mu into a 15-day interval.")
+    p.add_argument("--stage2_pmf_asym_weight_early", type=float, default=0.0,
+                   help="One-sided early MSE weight: penalize mu < L - target_early_offset. 0 disables.")
+    p.add_argument("--stage2_pmf_target_early_offset", type=float, default=30.0,
+                   help="Early lower bound = L - target_early_offset (days). mu below this is penalized.")
+    p.add_argument("--stage2_pmf_target_mode", type=str, default="l_offset",
+                   choices=["l_offset", "center"],
+                   help="'l_offset': legacy target = L + target_offset with asym_weight. "
+                        "'center': target = (L+R)/2, zone-aware soft penalties (zone_* hparams).")
+    p.add_argument("--stage2_pmf_zone_late_weight", type=float, default=0.0,
+                   help="Soft penalty weight for mu > mid (center mode). 0 disables.")
+    p.add_argument("--stage2_pmf_zone_too_late_weight", type=float, default=0.0,
+                   help="Soft penalty weight for mu > L + zone_too_late_threshold. 0 disables.")
+    p.add_argument("--stage2_pmf_zone_missed_weight", type=float, default=0.0,
+                   help="Soft penalty weight for mu > L + zone_missed_threshold (MISSED zone). 0 disables.")
+    p.add_argument("--stage2_pmf_zone_too_early_weight", type=float, default=0.0,
+                   help="Soft penalty weight for mu < L - zone_too_early_threshold. 0 disables.")
+    p.add_argument("--stage2_pmf_zone_too_late_threshold", type=float, default=15.0,
+                   help="Days after L marking USEFUL→TOO_LATE boundary (mu > L + this is too late).")
+    p.add_argument("--stage2_pmf_zone_missed_threshold", type=float, default=22.0,
+                   help="Days after L marking MISSED entry (mu > L + this is post-event).")
+    p.add_argument("--stage2_pmf_zone_too_early_threshold", type=float, default=23.0,
+                   help="Days before L marking TOO_EARLY entry (mu < L - this is too early).")
+    p.add_argument("--stage2_phenology_bias_head", type=int, default=0,
+                   help="1 = enable phenology bias head (Architecture A). "
+                        "Uses 4 site-year static features (best_suitability, best_months, "
+                        "offset_days, window_idx) routed through a small MLP and added to mu. "
+                        "Only active when stage2_pmf_mode='gaussian'.")
+    p.add_argument("--stage2_phenology_hidden", type=int, default=8,
+                   help="Hidden width of phen_head MLP; 0 means linear (Linear(4,1)).")
+    # Phase S5: long-lead per-sample weighting for the Gaussian mu-loss.
+    p.add_argument("--stage2_pmf_long_lead_threshold", type=float, default=0.0,
+                   help="Per-sample weight kicks in when (L+1)-tstar >= threshold (days). "
+                        "0 disables; defaults are legacy unweighted behaviour.")
+    p.add_argument("--stage2_pmf_long_lead_weight", type=float, default=1.0,
+                   help="Multiplier on the event/early mu-loss for samples whose lead >= "
+                        "stage2_pmf_long_lead_threshold. 1.0 is a no-op.")
+    # Phase S10: right-cens loss anchor (replaces the implicit Tend target).
+    p.add_argument("--stage2_dispatch_feature_csv", type=str, default=None,
+                   help="Per-(site,year) dispatch confidence-feature CSV produced "
+                        "by build_dispatch_feature_table.py. If set, 15 channels "
+                        "(14 features + 1 missing indicator) are appended to X "
+                        "before nowcast slicing.")
+    p.add_argument("--stage2_dispatch_feature_mode", type=str,
+                   default="causal", choices=["causal", "broadcast"],
+                   help="'causal': rows with tstar < alert_t_rel are zero-padded "
+                        "with missing=1; 'broadcast': all rows of an alerted sy "
+                        "carry features (leakage; sanity baseline only).")
+    p.add_argument("--stage2_dispatch_feature_missing_value", type=float,
+                   default=0.0,
+                   help="Fill value for the 14 feature slots when no feature "
+                        "applies (alert not yet occurred / never occurred).")
+    p.add_argument("--stage2_cohort_dispatch_only", action="store_true",
+                   help="Phase B: restrict training cohort to dispatch-alerted "
+                        "site-years (sy present in --stage2_dispatch_feature_csv). "
+                        "Required when mu_mode=lead_from_alert is used so the "
+                        "lead target is always defined.")
+    p.add_argument("--stage2_add_neighbor_history", action="store_true",
+                   help="DIRECT neighbor occurrence features: append 6 neighbor "
+                        "channels to Stage-2 X right after build_samples_season "
+                        "(before dispatch). OFF by default -> baseline unchanged.")
+    p.add_argument("--stage2_neighbor_decay_km", type=float, default=20.0,
+                   help="decay length (km) for neighbor_weighted_* channel "
+                        "(default 20.0); only used with --stage2_add_neighbor_history.")
+    p.add_argument("--stage2_pmf_mu_mode", type=str, default="absolute",
+                   choices=["absolute", "lead_from_alert", "residual_clim"],
+                   help="absolute: existing sigmoid*T mu head (Phase A/old Best). "
+                        "lead_from_alert: mu_DOY = alert_tstar + bounded-sigmoid "
+                        "lead. Requires --stage2_dispatch_feature_csv to provide "
+                        "the alert_tstar channel. "
+                        "residual_clim: mu_DOY = clim_mid + delta_max * tanh(raw). "
+                        "Requires --stage2_pmf_clim_mid (per-pest mean_mid DOY).")
+    p.add_argument("--stage2_pmf_lead_min", type=float, default=7.0,
+                   help="Lower bound (days) for bounded-sigmoid lead head.")
+    p.add_argument("--stage2_pmf_lead_max", type=float, default=75.0,
+                   help="Upper bound (days) for bounded-sigmoid lead head.")
+    p.add_argument("--stage2_pmf_clim_mid", type=float, default=0.0,
+                   help="Per-pest climatology mean_mid in DOY units (e.g. 198.7 "
+                        "for sheath_blight). Required when "
+                        "--stage2_pmf_mu_mode=residual_clim. Converted to "
+                        "1-based season-index coords internally.")
+    p.add_argument("--stage2_pmf_delta_max", type=float, default=60.0,
+                   help="Half-range of tanh-bounded delta in residual_clim mode "
+                        "(days). mu = clim_mid + delta_max * tanh(raw). Default 60.")
+    p.add_argument("--stage2_reset_head_mu", action="store_true",
+                   help="Phase B headreset: drop head_mu.* tensors from the "
+                        "warm-start ckpt so the head is trained from a fresh "
+                        "init. backbone/in_proj/encoder/phen_head still come "
+                        "from warm-start. Intended for lead_from_alert mode "
+                        "when probe shows z carries timing signal that the "
+                        "absolute-DOY-trained head cannot read.")
+    p.add_argument("--stage2_aux_lead_lambda", type=float, default=0.0,
+                   help="Phase B auxiliary lead loss weight. When > 0, adds "
+                        "lambda * Huber(mu - L, 0; delta=--stage2_aux_lead_huber_delta) "
+                        "to the asymmetric mu loss on the SAME (interval & "
+                        "lead_loss_mask) cell set. Unweighted (no sample_weight, "
+                        "no asym). Default 0 = no aux loss.")
+    p.add_argument("--stage2_aux_lead_huber_delta", type=float, default=10.0,
+                   help="Huber delta for the aux lead loss (days). Default 10.")
+    p.add_argument("--stage2_gaussian_loss_mode", type=str, default="asym_mse",
+                   choices=["asym_mse", "interval_nll", "mixed"],
+                   help="Stage 2 Gaussian PMF mu-head loss family. "
+                        "asym_mse (default, backward-compatible): legacy "
+                        "asymmetric_mu_loss (regression-style, optional zone/early "
+                        "penalties). interval_nll: gaussian_interval_nll_loss "
+                        "= -log P(L < T <= R) with fixed sigma=--stage2_pmf_sigma; "
+                        "right-cens uses Gaussian survival -log P(T > C); ignores "
+                        "asym_weight / zone_* / aux_lead_lambda. mixed: "
+                        "asym_mse + lambda * interval_nll on the same mu output; "
+                        "lambda controlled by --stage2_gaussian_interval_lambda. "
+                        "Only active when --stage2_pmf_mode=gaussian.")
+    p.add_argument("--stage2_gaussian_interval_lambda", type=float, default=0.1,
+                   help="Mixed-loss weight on the interval_nll term when "
+                        "--stage2_gaussian_loss_mode=mixed. Total Gaussian PMF "
+                        "loss is asym_mse + lambda * interval_nll. Default 0.1 "
+                        "(mild auxiliary signal). Ignored for other loss modes.")
+    p.add_argument("--stage2_gaussian_interval_continuity_correction", type=int, default=0,
+                   choices=[0, 1],
+                   help="Continuity-correction toggle for the interval_nll loss. "
+                        "0 (default): use raw L, R as the half-open Gaussian "
+                        "boundary P(L < T <= R). 1: use (L+0.5, R+0.5) as the "
+                        "continuous proxies for the day-inclusive [L+1, R] "
+                        "discrete interval. Only used when "
+                        "--stage2_gaussian_loss_mode=interval_nll.")
+    p.add_argument("--stage2_pmf_right_anchor", type=float, default=0.0,
+                   help="Target DOY anchoring the right-cens MSE: "
+                        "loss_right = right_weight * mean((mu - right_anchor)^2). "
+                        "0 disables (falls back to Tend, legacy behaviour); >0 lets "
+                        "the right-cens pull aim at a less-extreme target "
+                        "(e.g., 220 ≈ mid_max, 240 ≈ L_max).")
     # Stage-1 style aliases for pipeline consistency.
     p.add_argument("--nowcast_window", dest="stage2_nowcast_window", type=int)
     p.add_argument("--nowcast_stride", dest="stage2_nowcast_stride", type=int)
@@ -1859,4 +2405,39 @@ if __name__ == "__main__":
         args.stage2_pmf_asym_weight,
         args.stage2_pmf_right_weight,
         args.stage2_pmf_target_offset,
+        args.stage2_pmf_asym_weight_early,
+        args.stage2_pmf_target_early_offset,
+        args.stage2_pmf_target_mode,
+        args.stage2_pmf_zone_late_weight,
+        args.stage2_pmf_zone_too_late_weight,
+        args.stage2_pmf_zone_missed_weight,
+        args.stage2_pmf_zone_too_early_weight,
+        args.stage2_pmf_zone_too_late_threshold,
+        args.stage2_pmf_zone_missed_threshold,
+        args.stage2_pmf_zone_too_early_threshold,
+        args.stage2_phenology_bias_head,
+        args.stage2_phenology_hidden,
+        args.stage2_pmf_long_lead_threshold,
+        args.stage2_pmf_long_lead_weight,
+        args.stage2_pmf_right_anchor,
+        args.val_year,
+        args.test_year_min,
+        args.test_year_max,
+        args.stage2_dispatch_feature_csv,
+        args.stage2_dispatch_feature_mode,
+        args.stage2_dispatch_feature_missing_value,
+        args.stage2_cohort_dispatch_only,
+        args.stage2_pmf_mu_mode,
+        args.stage2_pmf_lead_min,
+        args.stage2_pmf_lead_max,
+        args.stage2_pmf_clim_mid,
+        args.stage2_pmf_delta_max,
+        args.stage2_reset_head_mu,
+        args.stage2_aux_lead_lambda,
+        args.stage2_aux_lead_huber_delta,
+        args.stage2_gaussian_loss_mode,
+        args.stage2_gaussian_interval_continuity_correction,
+        args.stage2_gaussian_interval_lambda,
+        stage2_add_neighbor_history=args.stage2_add_neighbor_history,
+        stage2_neighbor_decay_km=args.stage2_neighbor_decay_km,
     )

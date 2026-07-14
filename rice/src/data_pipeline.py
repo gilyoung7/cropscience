@@ -123,6 +123,12 @@ def add_rolling_features(daily: pd.DataFrame) -> pd.DataFrame:
         daily["rh_7d_mean"] = g["평균 상대습도(%)"].transform(lambda s: s.rolling(7, min_periods=1).mean())
         daily["rh_14d_mean"] = g["평균 상대습도(%)"].transform(lambda s: s.rolling(14, min_periods=1).mean())
 
+    # wind rolling
+    if "평균 풍속(m/s)" in daily.columns:
+        daily["wind_7d_mean"] = g["평균 풍속(m/s)"].transform(lambda s: s.rolling(7, min_periods=1).mean())
+    if "최대 풍속(m/s)" in daily.columns:
+        daily["wind_7d_max"] = g["최대 풍속(m/s)"].transform(lambda s: s.rolling(7, min_periods=1).max())
+
     # sun/radiation rolling
     if "합계 일조시간(h)" in daily.columns:
         daily["sun_7d_sum"] = g["합계 일조시간(h)"].transform(lambda s: s.rolling(7, min_periods=1).sum())
@@ -140,6 +146,7 @@ def _daily_cache_key(path_daily: Path) -> str:
         "rain_windows": [7, 14],
         "temp_windows": [7],
         "rh_windows": [7, 14],
+        "wind_windows": [7],
         "sun_windows": [7],
         "rad_windows": [7],
         "dd_window": 7,
@@ -350,6 +357,10 @@ def merge_pheno_daily_ffill(train_df: pd.DataFrame, obs: pd.DataFrame) -> pd.Dat
         "tgt_dst_min",
         "has_arrived",
         "days_since_arrival",
+        "best_suitability",
+        "best_months",
+        "offset_days",
+        "window_idx",
     ]
     pheno_cols = [c for c in candidate_cols if c in obs.columns]
     if not pheno_cols:
@@ -386,6 +397,11 @@ def merge_pheno_daily_ffill(train_df: pd.DataFrame, obs: pd.DataFrame) -> pd.Dat
         # Keep optional arrival features as NaN so __miss indicators are meaningful.
         if c in {"tgt_doy_min", "tgt_dst_min", "days_since_arrival"}:
             continue
+        # offset_days uses 0 as a natural value (1346 real zeros); fill NaN with -1
+        # so the model can distinguish "no observation" from "offset == 0".
+        if c == "offset_days":
+            out[c] = out[c].fillna(-1.0)
+            continue
         out[c] = out[c].fillna(0.0)
     return out
 
@@ -418,6 +434,8 @@ def make_daily_feature_frame(daily: pd.DataFrame) -> tuple[pd.DataFrame, list[st
         "tmin_7d_min",
         "rh_7d_mean",
         "rh_14d_mean",
+        "wind_7d_mean",
+        "wind_7d_max",
         "sun_7d_sum",
         "rad_7d_sum",
         "trange",

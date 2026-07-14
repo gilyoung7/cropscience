@@ -107,7 +107,7 @@ def main():
             min_child_weight=1.0, gamma=0.0,
             random_state=int(args.xgb_seed), eval_metric="logloss",
             scale_pos_weight=float(event_pos_weight),
-            n_jobs=4,
+            tree_method="hist", device="cuda",
         )
         clf.fit(X_tr, y_tr)
         p_he = clf.predict_proba(X_he)[:, 1]

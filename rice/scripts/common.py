@@ -45,20 +45,23 @@ def make_loader(
 
 def collate_grouped_stage2(batch):
     """
-    Batch items:
-      X_seq: (K,T,D), L/R/c/tstar: (K,)
+    Batch items (legacy 5-tuple or new 6-tuple with pheno_vec):
+      X_seq: (K,T,D), L/R/c/tstar: (K,), [pheno_vec: (P,)]
     Output:
       X_pad: (B,Kmax,T,D)
       L/R/c/tstar_pad: (B,Kmax)
       valid_mask: (B,Kmax) bool
+      pheno_pad: (B, P)  — zeros if no pheno_vec is present
     """
     if not batch:
         raise ValueError("collate_grouped_stage2: empty batch")
 
+    has_pheno = len(batch[0]) == 6
     B = len(batch)
     Kmax = max(int(x[0].shape[0]) for x in batch)
     T = int(batch[0][0].shape[1])
     D = int(batch[0][0].shape[2])
+    P = int(batch[0][5].shape[0]) if has_pheno else 0
 
     X_pad = torch.zeros((B, Kmax, T, D), dtype=batch[0][0].dtype)
     L_pad = torch.ones((B, Kmax), dtype=torch.long)
@@ -66,8 +69,10 @@ def collate_grouped_stage2(batch):
     c_pad = torch.ones((B, Kmax), dtype=torch.long)
     tstar_pad = torch.ones((B, Kmax), dtype=torch.long)
     valid_mask = torch.zeros((B, Kmax), dtype=torch.bool)
+    pheno_pad = torch.zeros((B, P), dtype=torch.float32) if P > 0 else torch.zeros((B, 0), dtype=torch.float32)
 
-    for i, (X_seq, L_seq, R_seq, c_seq, tstar_seq) in enumerate(batch):
+    for i, item in enumerate(batch):
+        X_seq, L_seq, R_seq, c_seq, tstar_seq = item[:5]
         k = int(X_seq.shape[0])
         X_pad[i, :k] = X_seq
         L_pad[i, :k] = L_seq
@@ -75,8 +80,10 @@ def collate_grouped_stage2(batch):
         c_pad[i, :k] = c_seq
         tstar_pad[i, :k] = tstar_seq
         valid_mask[i, :k] = True
+        if has_pheno and P > 0:
+            pheno_pad[i] = item[5]
 
-    return X_pad, L_pad, R_pad, c_pad, tstar_pad, valid_mask
+    return X_pad, L_pad, R_pad, c_pad, tstar_pad, valid_mask, pheno_pad
 
 
 def parse_seed_candidates(raw: str | None) -> list[int] | None:

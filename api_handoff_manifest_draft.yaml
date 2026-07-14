@@ -1,0 +1,290 @@
+# API/inference asset manifest draft — Rice Pest/Disease 2-Stage Pipeline
+# Generated: 2026-05-26 (companion to api_handoff_report.md)
+#
+# This is a DRAFT. Items marked TODO need researcher confirmation
+# (see Section H of api_handoff_report.md). Paths verified to exist
+# unless noted.
+#
+# Conventions:
+#   - All file paths are RELATIVE to the repo root: /home/gpu4080/research/cropscience
+#   - Per-pest entries follow the same schema. Only sheath_blight is filled in
+#     fully here; the other 7 pests should be derived from the corresponding
+#     CSVs at rice/outputs_stage2_batch_2024_bestgate/_summary/ (see "stage1"
+#     section in stage1_gate_selection_split3_2024.csv).
+
+version: 1
+generated_at: "2026-05-26"
+default_split: split3   # val=2023, test=2024
+
+# ---------- preprocessing layer ----------
+preprocessing:
+  daily_csv_path: "/home/gpu4080/ygdata/rice/1997_2024_RICE_union_all_sites_with_GDD10_since_gs.csv"   # EXTERNAL — must be mounted
+  obs_csv_dir:    "/home/gpu4080/ygdata/rice/LONG_by_pest/"                                            # EXTERNAL — per-pest Korean-name CSVs
+  cache_dir: "rice/outputs/cache"
+  cache_invalidation_key: "v1.0"   # PREPROC_VERSION from configs/base.py
+  impute_policy: "ffill_bfill_interpolate_fill0"
+  missing_indicator: "enabled"
+  season_doy_range: [60, 300]      # doy_start, doy_end
+  T: 241                            # = doy_end - doy_start + 1
+  # ordered pipeline that turns raw daily CSV → Stage-2 input tensor X
+  pipeline:
+    - "rice.src.data_pipeline:load_daily"                         # Korean columns -> df
+    - "rice.src.data_pipeline:add_rolling_features"               # 7-day rollings
+    - "rice.src.data_pipeline:make_daily_feature_frame"           # base feature frame
+    - "rice.src.data_pipeline:merge_pheno_daily_ffill"            # phenology join (TODO: phenology table source)
+    - "rice.src.data_pipeline:add_site_static_latlon"             # site meta
+    - "rice.src.dataset:build_stage2_nowcast_samples"             # 28-day window samples per (site, year, t*)
+    - "rice.scripts.site_history_utils:append_history_to_samples" # 11 history channels (D_history gate + Stage-2)
+    - "rice.scripts.stage1_confidence_utils:append_dispatch_confidence_to_samples"  # 14 + 1 dispatch channels
+  expected_input_dim: 45            # Stage-2 X channels (matches ckpt d_in=45)
+  feature_column_names_in_ckpt: "feature_names (list of 45) inside Stage-2 ckpt"
+  TODO_phenology_table_source: "confirm phenology table path/format with researcher (Q7)"
+
+# ---------- Stage-1 + Stage-2 + selector + climatology, per pest ----------
+pests:
+
+  - name: sheath_blight
+    config_dir: rice/pests/sheath_blight
+    label_csv: "/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_잎집무늬마름병.csv"
+    target_pest_korean: "잎집무늬마름병"
+    excluded_from_pipeline: false
+    stage1:
+      method: dispatch_group_tau
+      run: 0
+      split: split3_v2023_t2024
+      val_year: 2023
+      test_year: 2024
+      target_label: "R>=0.88"
+      k: 3
+      tau_no: 0.55
+      tau_with: 0.55
+      ckpt_A: "rice/outputs_stage1/batch_rolling/sheath_blight/run0/split3_v2023_t2024/A/ckpt/event_xgb_w28_lead14-45_A.pt"
+      ckpt_D: "rice/outputs_stage1/batch_rolling/sheath_blight/run0/split3_v2023_t2024/D/ckpt/event_xgb_w28_lead14-45_D.pt"
+      dispatch_summary_json: "rice/outputs_stage1/batch_rolling/sheath_blight/run0/split3_v2023_t2024/group_tau/group_tau_hybrid_summary.json"
+      useful_sweep_A_csv: "rice/outputs_stage1/batch_rolling/sheath_blight/run0/split3_v2023_t2024/A/useful_pareto/useful_sweep_A.csv"
+      useful_sweep_D_csv: "rice/outputs_stage1/batch_rolling/sheath_blight/run0/split3_v2023_t2024/D/useful_pareto/useful_sweep_D.csv"
+      ckpt_keys_required_for_inference:
+        - "event_model"          # XGBoost model bytes
+        - "feature_cols"         # 15 raw cols
+        - "feature_names"        # 30 cols incl. nowcast/history extensions
+        - "history_feature_names"  # 11 D-only cols
+        - "nowcast_window"       # 28
+        - "doy_start"; doy_end   # 60, 300
+      TODO_temperature: "confirm calibration storage (Q1)"
+      alert_logic:
+        smoothing_window: TODO   # check best_tau_by_target call site
+        consecutive_k: 3
+        use_t_alert_start: TODO  # check phase_t_group_tau_hybrid implementation
+    stage2:
+      ckpt: "rice/outputs_stage2_batch_2024_bestgate/sheath_blight/lead_v3_final/ckpt/checkpoint_run4.pt"
+      pilot_ckpt: "rice/outputs_stage2_batch_2024_bestgate/sheath_blight/lead_v3_pilot/ckpt/checkpoint_run4.pt"   # (optional, for warm-start audit)
+      dispatch_feature_csv: "rice/outputs_stage2_batch_2024_bestgate/sheath_blight/gate_dispatch_group_tau_R088_features_per_sy.csv"
+      pmf:
+        mode: gaussian
+        sigma: 5.0           # fixed
+        mu_mode: lead_from_alert
+        lead_min: 7
+        lead_max: 75
+        alert_tstar_feat_idx: 30
+        TODO_alert_tstar_feat_idx_verify: "channel 30 = alert_tstar abs DOY? (Q2)"
+        T_season_index: 241
+      input:
+        d_in: 45
+        d_model: 48
+        norm_mean_stored_in_ckpt: true
+        norm_std_stored_in_ckpt: true
+      output:
+        mu_units: "DOY"
+        pi_quantile: 0.95
+        pi_formula: "[round(mu - 1.96*sigma), round(mu + 1.96*sigma)] => [mu-9.8, mu+9.8]"
+      operational_offsets_grid: [7, 14, 21, 30, 45, 60]   # coarse — what Stage-2 was actually evaluated at
+      val_selected_offset: 45   # from selector_by_pest_year.csv 2024 row
+    selector:
+      candidate_offsets_coarse: [7, 14, 21, 30, 45, 60]
+      candidate_offsets_dense: [1, 75]   # interval; uses interpolated mu (diagnostic only)
+      operational_recommendation: "v2_regressor_dense"   # most common winner 2024
+      per_sample_test_offsets_csv: "rice/outputs_stage2_selector_cross_split/2024_sheath_blight/v2_per_sample_test_selections.csv"
+      cross_split_table: "rice/outputs_stage2_selector_cross_split/selector_by_pest_year.csv"
+      best_for_year:
+        2022: "v1_bin_rule[score_rolling_slope_14d]"
+        2023: "v2_ranker_dense"
+        2024: "v2_regressor_dense"
+      TODO_persisted_model: "selector LightGBM is NOT persisted (Q3) — retrain at deploy or persist .save_model() per (pest, year)"
+      training_input:
+        val_sample_grid: "rice/outputs_stage2_batch_2024_bestgate/sheath_blight/lead_v3_val_sample_grid.csv"
+        target: "iou_matched (per (sample, offset) row)"
+        sample_features:
+          - alert_tstar
+          - A_score_at_alert
+          - D_score_at_alert
+          - score_margin
+          - dispatch_score_at_alert
+          - dispatch_tau_used
+          - score_over_tau_margin
+          - recent_14d_mean_score
+          - recent_28d_mean_score
+          - score_above_tau_streak
+          - score_rolling_slope_14d
+          - p_mean_so_far_at_alert
+          - with_history
+        candidate_features_added:
+          - offset
+          - pred_mu          # at this candidate offset
+          - pred_lead        # = pred_mu - alert_tstar
+          - mu_minus_clim_mid
+          - tstar_minus_clim_mid
+          - dispatch_branch_is_D
+      LEAKY_oracle_columns_NOT_for_api:
+        - "v2_test_results_summary.csv selector=LEAKY_sample_oracle_*"
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/sheath_blight/climatology_train_stats.csv"
+      mean_L: 196.32
+      mean_R: 211.01
+      mean_mid: 203.66
+      median_mid: 205
+      sample_grid_mean_mid: "rice/outputs_stage2_batch_2024_bestgate/sheath_blight/climatology_mean_mid_test_sample_grid.csv"
+      best_variant: "clim_mean_mid"   # check selector_by_pest_year.csv best_climatology_name per year
+      fallback_default: "climatology"   # learned selector did NOT beat clim in any of 3 years
+
+  # =================== other 7 pests — fill the same schema ===================
+  # Each pest's stage1 (method/run/k/tau) is in
+  #   rice/outputs_stage2_batch_2024_bestgate/_summary/stage1_gate_selection_split3_2024.csv
+  # Stage-2 ckpt path pattern:
+  #   rice/outputs_stage2_batch_2024_bestgate/<pest>/lead_v3_final/ckpt/checkpoint_run4.pt
+  # Climatology stats path:
+  #   rice/outputs_stage2_batch_2024_bestgate/<pest>/climatology_train_stats.csv
+  # Best-selector / best-clim per year:
+  #   rice/outputs_stage2_selector_cross_split/selector_by_pest_year.csv
+
+  - name: BPH
+    config_dir: rice/pests/BPH
+    excluded_from_pipeline: false
+    stage1:
+      method: D_history
+      run: 2
+      k: 3
+      tau: 0.6
+      ckpt_D: "rice/outputs_stage1/batch_rolling/BPH/run2/split3_v2023_t2024/D/ckpt/event_xgb_w28_lead14-45_D.pt"
+      useful_sweep_D_csv: "rice/outputs_stage1/batch_rolling/BPH/run2/split3_v2023_t2024/D/useful_pareto/useful_sweep_D.csv"
+    stage2:
+      ckpt: "rice/outputs_stage2_batch_2024_bestgate/BPH/lead_v3_final/ckpt/checkpoint_run4.pt"
+    selector:
+      operational_recommendation: "v2_regressor_dense"
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/BPH/climatology_train_stats.csv"
+      fallback_default: "learned"   # BPH climatology=0, learned selector wins 3/3 years
+
+  - name: WBPH
+    stage1: { method: dispatch_group_tau, run: 2, k: 3, tau_no: 0.725, tau_with: 0.700 }
+    stage2: { ckpt: "rice/outputs_stage2_batch_2024_bestgate/WBPH/lead_v3_final/ckpt/checkpoint_run4.pt" }
+    selector: { operational_recommendation: "v2_ranker_dense" }
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/WBPH/climatology_train_stats.csv"
+      fallback_default: "learned"   # 2/3 years beat clim
+
+  - name: bacterial_blight
+    stage1: { method: D_history, run: 0, k: 1, tau: 0.575 }
+    stage2: { ckpt: "rice/outputs_stage2_batch_2024_bestgate/bacterial_blight/lead_v3_final/ckpt/checkpoint_run4.pt" }
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/bacterial_blight/climatology_train_stats.csv"
+      fallback_default: "climatology"
+
+  - name: blast
+    stage1: { method: D_history, run: 0, k: 3, tau: 0.6 }
+    stage2: { ckpt: "rice/outputs_stage2_batch_2024_bestgate/blast/lead_v3_final/ckpt/checkpoint_run4.pt" }
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/blast/climatology_train_stats.csv"
+      fallback_default: "climatology"
+
+  - name: brown_spot
+    stage1: { method: D_history, run: 2, k: 3, tau: 0.5 }
+    stage2: { ckpt: "rice/outputs_stage2_batch_2024_bestgate/brown_spot/lead_v3_final/ckpt/checkpoint_run4.pt" }
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/brown_spot/climatology_train_stats.csv"
+      fallback_default: "climatology"
+
+  - name: rice_stem_borer_1
+    stage1: { method: A_baseline, run: 2, k: 2, tau: 0.575 }
+    stage2: { ckpt: "rice/outputs_stage2_batch_2024_bestgate/rice_stem_borer_1/lead_v3_final/ckpt/checkpoint_run4.pt" }
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/rice_stem_borer_1/climatology_train_stats.csv"
+      fallback_default: "climatology"
+
+  - name: rice_stem_borer_2
+    stage1: { method: D_history, run: 2, k: 3, tau: 0.575 }
+    stage2: { ckpt: "rice/outputs_stage2_batch_2024_bestgate/rice_stem_borer_2/lead_v3_final/ckpt/checkpoint_run4.pt" }
+    climatology:
+      train_stats_csv: "rice/outputs_stage2_batch_2024_bestgate/rice_stem_borer_2/climatology_train_stats.csv"
+      fallback_default: "climatology"
+
+# ---------- shared inference code paths ----------
+inference_code:
+  stage1:
+    model_class: "xgboost.Booster"   # TODO: verify from ckpt['model_type']
+    loader_signature: "TODO: confirm exact load_model(bytes) path"
+    feature_builder: "rice.scripts.run_event_train:build_tabular_from_samples"
+    history_appender: "rice.scripts.site_history_utils:append_history_to_samples"
+    alert_builder: "rice.scripts.run_event_eval:build_alert_rows"
+    tau_picker:  "rice.scripts.run_event_eval:best_tau_by_target"   # offline; deploy uses stored k/tau
+    dispatch_table_builder: "rice.scripts.build_dispatch_feature_table:main"
+  stage2:
+    model_class: "rice.src.model:HierarchicalCausalHazardTransformer"
+    loader_pattern: "see rice/scripts/run_train.py lines 1300-1340 for full attr setup"
+    forward_helper: "rice.scripts.phase_r_oracle_iou:build_stage2_row_map"
+    pi_helper: "rice.scripts.phase_r_oracle_iou:iou_for_mu"
+    overlap_helper: "rice.src.train_eval:overlap_metrics"
+  selector:
+    trainer: "rice.scripts.phase_b_stage2_offset_selector_v2_ranking:main"
+    feature_builder: "rice.scripts.phase_b_stage2_offset_selector_v2_ranking:build_candidate_rows"
+    apply_helper: "rice.scripts.phase_b_stage2_offset_selector_v2_ranking:pick_offsets"
+  climatology:
+    generator: "rice.scripts.phase_b_climatology_baseline:main"
+    inference: "constant mu = climatology_mean_<L|mid|R> per pest"
+
+# ---------- known external dependencies (NOT in repo) ----------
+external_assets:
+  - description: "Daily weather CSV (Korean columns; ~1997-2024 union, with GDD10_since_gs)"
+    path: "/home/gpu4080/ygdata/rice/1997_2024_RICE_union_all_sites_with_GDD10_since_gs.csv"
+  - description: "Per-pest observation CSVs (LONG format, Korean names)"
+    path_pattern: "/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_<KOREAN_PEST_NAME>.csv"
+  - description: "Phenology table (referenced via merge_pheno_daily_ffill)"
+    path: "TODO (Q7)"
+
+# ---------- API contract recommendations (informational, not enforced) ----------
+api_contract:
+  request:
+    pest: "one of [BPH, WBPH, bacterial_blight, blast, brown_spot, rice_stem_borer_1, rice_stem_borer_2, sheath_blight]"
+    site_id: "string"
+    year: "int"
+    today_doy: "int (optional; defaults to current date)"
+  response:
+    stage1:
+      alert_fired: "bool"
+      alert_tstar_doy: "int or null"
+      gate_method: "string"
+    stage2:
+      mu_doy: "float (predicted event center DOY)"
+      pi_95:
+        lower: "int (mu - 9.8 rounded)"
+        upper: "int (mu + 9.8 rounded)"
+      sigma: 5.0
+      selected_offset: "int in {7,14,21,30,45,60} (selector output)"
+      source: "one of {learned_v2_<variant>, climatology_mean_mid, ...}"
+    fallback_triggered: "bool"
+  no_alert_response:
+    "TODO (Q11): define what API returns when Stage-1 gate doesn't fire"
+
+# ---------- known issues / TODOs ----------
+todos:
+  - Q1: Stage-1 temperature scaling storage location
+  - Q2: stage2_pmf_alert_tstar_feat_idx=30 channel semantic
+  - Q3: Persist selector LightGBM models (or commit to V1 bin_rule)
+  - Q4: Confirm 2-pass selector flow (compute all offsets first, then pick)
+  - Q5: Production split policy (split3 vs ensemble vs retrain)
+  - Q6: Daily CSV delivery mode
+  - Q7: Phenology table source path/format
+  - Q8: Dispatch CSV regeneration flow at inference time
+  - Q9: BPH2 inclusion / exclusion
+  - Q10: W&B-free inference path
+  - Q11: No-alert API response
+  - Q12: Confirm coarse-offsets-only for operational selector

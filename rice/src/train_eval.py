@@ -238,64 +238,346 @@ def asymmetric_mu_loss(
     asym_weight: float = 10.0,
     right_weight: float = 0.3,
     target_offset: float = 0.0,
+    asym_weight_early: float = 0.0,
+    target_early_offset: float = 30.0,
+    target_mode: str = "l_offset",
+    zone_late_weight: float = 0.0,
+    zone_too_late_weight: float = 0.0,
+    zone_missed_weight: float = 0.0,
+    zone_too_early_weight: float = 0.0,
+    zone_too_late_threshold: float = 15.0,
+    zone_missed_threshold: float = 22.0,
+    zone_too_early_threshold: float = 23.0,
+    sample_weight=None,
+    right_anchor: float | None = None,
+    lead_loss_mask=None,
+    aux_lead_lambda: float = 0.0,
+    aux_lead_huber_delta: float = 10.0,
 ):
     """
-    Parametric Gaussian PMF loss (Phase 5+).
+    Gaussian PMF mu-loss for Stage 2.
 
-    Event rows (ctype==0): target = L + target_offset. By default target=L
-        (the last day before the event window); set target_offset>0 to bias
-        the target into the interval (e.g. +5 to center on the typical event
-        midpoint when R-L≈15).
-        delta = mu - target. Asymmetric MSE: weight `asym_weight` if delta > 0
-        (predicted later than target, hurts EarlyRecall), weight 1.0 if delta <= 0.
-    Right-censored (ctype==1): target = Tend, scaled by `right_weight`.
+    target_mode='l_offset' (default, backward-compatible):
+        target = L + target_offset
+        loss_event = mean(weight * (mu - target)^2)
+            weight = asym_weight if (mu - target) > 0 else 1.0
+        optional early one-sided MSE:
+            loss_early = asym_weight_early * mean(max(0, (L - target_early_offset) - mu)^2)
+
+    target_mode='center' (zone-aware, mid-target):
+        target = mid = (L + R) / 2
+        base           = (mu - mid)^2                              -- symmetric MSE
+        soft_late      = w_late      * max(0, mu - mid)^2          -- mid 우측
+        soft_too_late  = w_too_late  * max(0, mu - (L + thr_tl))^2 -- USEFUL 우측 초과
+        soft_missed    = w_missed    * max(0, mu - (L + thr_m))^2  -- MISSED 진입
+        soft_too_early = w_too_early * max(0, (L - thr_te) - mu)^2 -- TOO_EARLY 진입
+        loss_event = mean(base) + mean(soft_late) + mean(soft_too_late)
+                     + mean(soft_missed) + mean(soft_too_early)
+        In this mode asym_weight / asym_weight_early / target_offset /
+        target_early_offset are ignored; zone_* hparams take over.
+
+    Right-censored (ctype==1): loss_right = right_weight * mean((mu - Tend)^2)  (same in both modes)
     Left-censored (ctype==2): ignored.
     """
     mi = ctype == CTYPE_INTERVAL
+    # Phase B: lead_from_alert mode restricts mu/L loss to cells where alert
+    # actually occurred. Pre-alert cells stay in attention/context (valid_mask
+    # unchanged) but are excluded from this asymmetric loss. lead_loss_mask is
+    # None for absolute mode (no-op).
+    if lead_loss_mask is not None:
+        mi = mi & lead_loss_mask.to(mi.dtype if mi.dtype == torch.bool else torch.bool)
     mr = ctype == 1
     parts: dict = {
         "mu_event": 0.0,
         "mu_event_n": 0,
         "mu_right": 0.0,
         "mu_right_n": 0,
+        "mu_early": 0.0,
+        "mu_early_n": 0,
+        "mu_late": 0.0,
+        "mu_late_n": 0,
+        "mu_too_late": 0.0,
+        "mu_too_late_n": 0,
+        "mu_missed": 0.0,
+        "mu_missed_n": 0,
+        "mu_too_early": 0.0,
+        "mu_too_early_n": 0,
         "mu_mean_event": float("nan"),
         "mu_minus_L_mean": float("nan"),
         "mu_minus_L_abs_mean": float("nan"),
+        "mu_minus_mid_mean": float("nan"),
+        "mu_minus_mid_abs_mean": float("nan"),
         "mu_pos_frac": float("nan"),
         "mu_minus_target_mean": float("nan"),
+        "aux_lead_raw": 0.0,
+        "aux_lead_weighted": 0.0,
+        "aux_lead_n": 0,
+        "aux_lead_mean_abs_delta": float("nan"),
+        "aux_lead_lambda": float(aux_lead_lambda),
+        "aux_lead_huber_delta": float(aux_lead_huber_delta),
         "target_offset": float(target_offset),
+        "target_early_offset": float(target_early_offset),
+        "target_mode": str(target_mode),
+        "zone_too_late_threshold": float(zone_too_late_threshold),
+        "zone_missed_threshold": float(zone_missed_threshold),
+        "zone_too_early_threshold": float(zone_too_early_threshold),
     }
     loss = mu.new_tensor(0.0)
 
     if mi.any():
         L_e = L[mi].float()
-        target = L_e + float(target_offset)
+        R_e = R[mi].float()
         mu_e = mu[mi]
-        delta = mu_e - target
-        weight = torch.where(
-            delta > 0,
-            mu.new_tensor(float(asym_weight)),
-            mu.new_tensor(1.0),
-        )
-        loss_event = (weight * delta * delta).mean()
+        mid_e = (L_e + R_e) * 0.5
+        # Per-sample multiplier (Phase S5 long-lead weighting).
+        # When sample_weight is None, behaves as all-ones (legacy behaviour).
+        if sample_weight is not None:
+            sw_e = sample_weight[mi].to(mu_e.dtype)
+        else:
+            sw_e = mu_e.new_ones(mu_e.shape)
+
+        if str(target_mode) == "center":
+            target = mid_e
+            delta = mu_e - target
+            loss_event = ((delta * delta) * sw_e).mean()
+        else:
+            target = L_e + float(target_offset)
+            delta = mu_e - target
+            weight = torch.where(
+                delta > 0,
+                mu.new_tensor(float(asym_weight)),
+                mu.new_tensor(1.0),
+            )
+            loss_event = (weight * delta * delta * sw_e).mean()
+
         loss = loss + loss_event
         parts["mu_event"] = float(loss_event.detach().item())
         parts["mu_event_n"] = int(mi.long().sum().item())
         parts["mu_mean_event"] = float(mu_e.detach().mean().item())
-        # mu_minus_L_mean is reported against raw L for diagnostic continuity.
+
+        # Phase B aux lead loss (Huber on delta = mu - L = predicted_lead -
+        # target_lead). Applies to the same interval+lead-loss-mask cells as
+        # the event loss; unweighted (no sample_weight, no asym). Only active
+        # when --stage2_aux_lead_lambda > 0. In l_offset mode delta is
+        # (mu - L - target_offset); for the standard target_offset=0 this is
+        # exactly the lead residual.
+        if float(aux_lead_lambda) > 0.0:
+            huber_d = float(aux_lead_huber_delta)
+            abs_d = delta.abs()
+            quad = torch.where(
+                abs_d <= huber_d,
+                0.5 * delta * delta,
+                huber_d * (abs_d - 0.5 * huber_d),
+            )
+            aux_raw = quad.mean()
+            aux_weighted = float(aux_lead_lambda) * aux_raw
+            loss = loss + aux_weighted
+            parts["aux_lead_raw"] = float(aux_raw.detach().item())
+            parts["aux_lead_weighted"] = float(aux_weighted.detach().item())
+            parts["aux_lead_n"] = int(mi.long().sum().item())
+            parts["aux_lead_mean_abs_delta"] = float(abs_d.detach().mean().item())
+
         delta_L = (mu_e - L_e).detach()
         parts["mu_minus_L_mean"] = float(delta_L.mean().item())
         parts["mu_minus_L_abs_mean"] = float(delta_L.abs().mean().item())
         parts["mu_pos_frac"] = float((delta_L > 0).float().mean().item())
         parts["mu_minus_target_mean"] = float(delta.detach().mean().item())
+        delta_mid = (mu_e - mid_e).detach()
+        parts["mu_minus_mid_mean"] = float(delta_mid.mean().item())
+        parts["mu_minus_mid_abs_mean"] = float(delta_mid.abs().mean().item())
+
+        # Legacy early one-sided MSE (l_offset mode only).
+        if str(target_mode) != "center" and float(asym_weight_early) > 0.0:
+            lower = L_e - float(target_early_offset)
+            early_excess = (lower - mu_e).clamp(min=0.0)
+            n_early = int((early_excess > 0).long().sum().item())
+            if n_early > 0:
+                loss_early = float(asym_weight_early) * (early_excess * early_excess * sw_e).mean()
+                loss = loss + loss_early
+                parts["mu_early"] = float(loss_early.detach().item())
+                parts["mu_early_n"] = n_early
+
+        # Zone-aware soft penalties (always available; default weights = 0).
+        if float(zone_late_weight) > 0.0:
+            late_excess = (mu_e - mid_e).clamp(min=0.0)
+            n_late = int((late_excess > 0).long().sum().item())
+            if n_late > 0:
+                loss_late = float(zone_late_weight) * (late_excess * late_excess).mean()
+                loss = loss + loss_late
+                parts["mu_late"] = float(loss_late.detach().item())
+                parts["mu_late_n"] = n_late
+        if float(zone_too_late_weight) > 0.0:
+            thr_tl = L_e + float(zone_too_late_threshold)
+            too_late_excess = (mu_e - thr_tl).clamp(min=0.0)
+            n_tl = int((too_late_excess > 0).long().sum().item())
+            if n_tl > 0:
+                loss_tl = float(zone_too_late_weight) * (too_late_excess * too_late_excess).mean()
+                loss = loss + loss_tl
+                parts["mu_too_late"] = float(loss_tl.detach().item())
+                parts["mu_too_late_n"] = n_tl
+        if float(zone_missed_weight) > 0.0:
+            thr_m = L_e + float(zone_missed_threshold)
+            missed_excess = (mu_e - thr_m).clamp(min=0.0)
+            n_m = int((missed_excess > 0).long().sum().item())
+            if n_m > 0:
+                loss_m = float(zone_missed_weight) * (missed_excess * missed_excess).mean()
+                loss = loss + loss_m
+                parts["mu_missed"] = float(loss_m.detach().item())
+                parts["mu_missed_n"] = n_m
+        if float(zone_too_early_weight) > 0.0:
+            thr_te = L_e - float(zone_too_early_threshold)
+            too_early_excess = (thr_te - mu_e).clamp(min=0.0)
+            n_te = int((too_early_excess > 0).long().sum().item())
+            if n_te > 0:
+                loss_te = float(zone_too_early_weight) * (too_early_excess * too_early_excess).mean()
+                loss = loss + loss_te
+                parts["mu_too_early"] = float(loss_te.detach().item())
+                parts["mu_too_early_n"] = n_te
 
     if mr.any():
-        target_r = mu.new_tensor(float(Tend))
+        # Phase S10: right_anchor lets the right-cens pull aim at a value
+        # smaller than Tend (e.g., L_max ≈ 240 or mid_max ≈ 220) so the
+        # right-cens MSE keeps producing a learning signal without dragging
+        # mu of *interval* samples all the way to Tend through the shared
+        # head_mu parameters. When right_anchor is None or <= 0, fall back
+        # to the legacy Tend anchor (backward-compatible).
+        if right_anchor is not None and float(right_anchor) > 0.0:
+            anchor_val = float(right_anchor)
+        else:
+            anchor_val = float(Tend)
+        target_r = mu.new_tensor(anchor_val)
         delta_r = mu[mr] - target_r
         loss_right = (delta_r * delta_r).mean() * float(right_weight)
         loss = loss + loss_right
         parts["mu_right"] = float(loss_right.detach().item())
         parts["mu_right_n"] = int(mr.long().sum().item())
+        parts["right_anchor"] = anchor_val
+
+    return loss, parts
+
+
+def gaussian_interval_nll_loss(
+    mu,
+    L,
+    R,
+    ctype,
+    *,
+    sigma: float,
+    Tend: int,
+    right_weight: float = 0.3,
+    right_anchor: float | None = None,
+    sample_weight=None,
+    lead_loss_mask=None,
+    continuity_correction: bool = False,
+    eps: float = 1e-8,
+):
+    """
+    Gaussian interval NLL for Stage 2 mu head (sigma fixed).
+
+    Label convention (matches asymmetric_mu_loss / interval_nll_per_sample):
+        Discrete event interval is T ∈ (L, R]  i.e. day-inclusive [L+1, R].
+
+    Default continuous mapping:
+        P(L < T ≤ R) = Φ((R - μ)/σ) - Φ((L - μ)/σ)
+    This uses raw L, R as the half-open boundary, matching the discrete
+    label semantics directly. (No half-day shift.)
+
+    Continuity-corrected variant (ablation, off by default):
+        Set continuity_correction=True to use (L + 0.5, R + 0.5) as the
+        continuous proxies for the inclusive day boundary [L+1, R].
+
+    Right-censored (ctype==1):
+        T > C survival likelihood: P(T > C) = 1 - Φ((C - μ)/σ) = Φ((μ - C)/σ).
+        nll_r = -log Φ((μ - C)/σ).  C = right_anchor if >0 else Tend.
+
+    Left-censored (ctype==2):
+        T ≤ R: nll_l = -log Φ((R - μ)/σ).
+
+    Numerical stability:
+        log(Φ(zR) - Φ(zL)) = log_ndtr(zR) + log1p(-exp(log_ndtr(zL) - log_ndtr(zR)))
+        when zR >= zL.  We clamp zR >= zL + eps to avoid log(0).
+    """
+    mi = ctype == CTYPE_INTERVAL
+    if lead_loss_mask is not None:
+        mi = mi & lead_loss_mask.to(mi.dtype if mi.dtype == torch.bool else torch.bool)
+    mr = ctype == 1
+    ml = ctype == 2
+
+    parts: dict = {
+        "nll_event": 0.0,
+        "nll_event_n": 0,
+        "nll_right": 0.0,
+        "nll_right_n": 0,
+        "nll_left": 0.0,
+        "nll_left_n": 0,
+        "mu_mean_event": float("nan"),
+        "mu_minus_L_mean": float("nan"),
+        "mu_minus_mid_mean": float("nan"),
+        "sigma": float(sigma),
+        "continuity_correction": bool(continuity_correction),
+        "right_anchor": float("nan"),
+    }
+
+    sigma_t = mu.new_tensor(float(sigma)).clamp(min=1e-6)
+    loss = mu.new_tensor(0.0)
+    log_ndtr = torch.special.log_ndtr
+
+    if mi.any():
+        L_e = L[mi].float()
+        R_e = R[mi].float()
+        mu_e = mu[mi]
+        if continuity_correction:
+            L_cont = L_e + 0.5
+            R_cont = R_e + 0.5
+        else:
+            L_cont = L_e
+            R_cont = R_e
+        zL = (L_cont - mu_e) / sigma_t
+        zR = (R_cont - mu_e) / sigma_t
+        # Enforce zR > zL (always true given R > L); add small floor for safety.
+        zR_safe = torch.maximum(zR, zL + eps)
+        log_pL = log_ndtr(zL)
+        log_pR = log_ndtr(zR_safe)
+        # log(Φ(zR) - Φ(zL)) = log_pR + log1p(-exp(log_pL - log_pR))
+        diff = (log_pL - log_pR).clamp(max=-eps)
+        log_interval = log_pR + torch.log1p(-torch.exp(diff))
+        # Match interval_nll_per_sample stability: clamp NaN/inf and bound the
+        # per-sample NLL so a far-out mu cannot poison the batch with +inf.
+        nll_e = torch.nan_to_num(-log_interval, nan=1e6, posinf=1e6, neginf=0.0)
+        nll_e = nll_e.clamp(max=1e6)
+        if sample_weight is not None:
+            sw_e = sample_weight[mi].to(nll_e.dtype)
+            nll_e = nll_e * sw_e
+        loss = loss + nll_e.mean()
+        parts["nll_event"] = float(nll_e.detach().mean().item())
+        parts["nll_event_n"] = int(mi.long().sum().item())
+        parts["mu_mean_event"] = float(mu_e.detach().mean().item())
+        mid_e = (L_e + R_e) * 0.5
+        parts["mu_minus_L_mean"] = float((mu_e - L_e).detach().mean().item())
+        parts["mu_minus_mid_mean"] = float((mu_e - mid_e).detach().mean().item())
+
+    if mr.any():
+        anchor_val = float(right_anchor) if (right_anchor is not None and float(right_anchor) > 0.0) else float(Tend)
+        mu_r = mu[mr]
+        z_r = (mu_r - anchor_val) / sigma_t
+        nll_r = -log_ndtr(z_r)
+        nll_r = torch.nan_to_num(nll_r, nan=1e6, posinf=1e6, neginf=0.0).clamp(max=1e6)
+        loss = loss + float(right_weight) * nll_r.mean()
+        parts["nll_right"] = float(nll_r.detach().mean().item())
+        parts["nll_right_n"] = int(mr.long().sum().item())
+        parts["right_anchor"] = anchor_val
+
+    if ml.any():
+        R_l = R[ml].float()
+        if continuity_correction:
+            R_l = R_l + 0.5
+        mu_l = mu[ml]
+        z_l = (R_l - mu_l) / sigma_t
+        nll_l = -log_ndtr(z_l)
+        nll_l = torch.nan_to_num(nll_l, nan=1e6, posinf=1e6, neginf=0.0).clamp(max=1e6)
+        loss = loss + nll_l.mean()
+        parts["nll_left"] = float(nll_l.detach().mean().item())
+        parts["nll_left_n"] = int(ml.long().sum().item())
 
     return loss, parts
 
@@ -523,7 +805,12 @@ def run_epoch_weighted_grouped(
     if early_tstar_weight_min <= 0.0 or early_tstar_weight_min > 1.0:
         raise ValueError("early_tstar_weight_min must be in (0, 1]")
 
-    for batch_idx, (X, L, R, ctype, tstar, valid_mask) in enumerate(loader):
+    for batch_idx, _batch in enumerate(loader):
+        if len(_batch) == 7:
+            X, L, R, ctype, tstar, valid_mask, pheno = _batch
+        else:
+            X, L, R, ctype, tstar, valid_mask = _batch
+            pheno = None
         if max_batches is not None and batch_idx >= int(max_batches):
             break
         X = X.to(device, non_blocking=True)
@@ -532,9 +819,11 @@ def run_epoch_weighted_grouped(
         ctype = ctype.to(device, non_blocking=True)
         tstar = tstar.to(device, non_blocking=True)
         valid_mask = valid_mask.to(device, non_blocking=True)
+        if pheno is not None:
+            pheno = pheno.to(device, non_blocking=True)
 
         with torch.set_grad_enabled(bool(train)), _autocast_ctx(device, use_amp=use_amp, amp_dtype=amp_dtype):
-            hazard = model(X, tstar=tstar, valid_mask=valid_mask)
+            hazard = model(X, tstar=tstar, valid_mask=valid_mask, pheno=pheno)
 
             hazard_f, L_f, R_f, ctype_f, n_valid = _flatten_grouped_valid(hazard, L, R, ctype, valid_mask)
             if n_valid <= 0:
@@ -593,16 +882,131 @@ def run_epoch_weighted_grouped(
                 if mu_BK is None:
                     raise RuntimeError("model.pmf_mode='gaussian' but _last_mu_BK is None after forward")
                 mu_f = mu_BK.reshape(-1)[valid_mask.reshape(-1)]
-                base_loss, mu_parts = asymmetric_mu_loss(
-                    mu_f,
-                    L_f,
-                    R_f,
-                    ctype_f,
-                    Tend=Tend,
-                    asym_weight=float(getattr(model, "asym_weight", 10.0)),
-                    right_weight=float(getattr(model, "right_weight", 0.3)),
-                    target_offset=float(getattr(model, "target_offset", 0.0)),
-                )
+                # Phase S5: per-sample long-lead weighting.
+                # lead = (L + 1) - tstar (days). When threshold > 0 and weight != 1,
+                # samples with lead >= threshold receive an upweighted gradient in
+                # the event/early mu-loss terms.
+                ll_thr = float(getattr(model, "long_lead_threshold", 0.0))
+                ll_w = float(getattr(model, "long_lead_weight", 1.0))
+                sw_f = None
+                if ll_thr > 0.0 and abs(ll_w - 1.0) > 1e-12:
+                    lead_f = (L_f.float() + 1.0) - tstar_f.float()
+                    sw_f = torch.where(lead_f >= ll_thr,
+                                       mu_f.new_tensor(ll_w),
+                                       mu_f.new_tensor(1.0))
+                    if bool(train) and not getattr(model, "_phase_s5_sw_logged", False):
+                        with torch.no_grad():
+                            mi_dbg = ctype_f == CTYPE_INTERVAL
+                            if int(mi_dbg.long().sum().item()) > 0:
+                                lead_mi = lead_f[mi_dbg]
+                                sw_mi = sw_f[mi_dbg]
+                                print(
+                                    f"[phase_s5_sw] thr={ll_thr:.0f} w_long={ll_w:.2f}  "
+                                    f"n_event={int(mi_dbg.long().sum().item())}  "
+                                    f"n_long={int((sw_mi > 1.0).long().sum().item())}  "
+                                    f"frac_long={float((sw_mi > 1.0).float().mean().item()):.3f}  "
+                                    f"lead_mean={float(lead_mi.mean().item()):.2f}  "
+                                    f"lead_med={float(lead_mi.median().item()):.2f}  "
+                                    f"lead_max={float(lead_mi.max().item()):.2f}"
+                                )
+                        model._phase_s5_sw_logged = True
+                # Phase B: lead_from_alert excludes pre-alert cells from the
+                # asymmetric mu/L loss. Flatten the (B,K) mask the same way as
+                # mu_f / L_f (valid_mask-indexed) so dims match.
+                _lead_BK = getattr(model, "_last_lead_loss_mask", None)
+                if _lead_BK is not None:
+                    lead_loss_mask_f = _lead_BK.reshape(-1)[valid_mask.reshape(-1)]
+                else:
+                    lead_loss_mask_f = None
+                gaussian_loss_mode = str(getattr(model, "gaussian_loss_mode", "asym_mse"))
+                if gaussian_loss_mode == "interval_nll":
+                    base_loss, mu_parts = gaussian_interval_nll_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        sigma=float(getattr(model, "gaussian_sigma", 5.0)),
+                        Tend=Tend,
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)) or None,
+                        sample_weight=sw_f,
+                        lead_loss_mask=lead_loss_mask_f,
+                        continuity_correction=bool(getattr(model, "gaussian_interval_continuity_correction", False)),
+                    )
+                elif gaussian_loss_mode == "mixed":
+                    # asym_mse keeps mu anchored (prevents t*-collapse), interval_nll
+                    # softly nudges mu's PI toward (L, R]. Single right_weight applies
+                    # to both losses' right-cens terms.
+                    base_loss, mu_parts = asymmetric_mu_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        Tend=Tend,
+                        asym_weight=float(getattr(model, "asym_weight", 10.0)),
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        target_offset=float(getattr(model, "target_offset", 0.0)),
+                        asym_weight_early=float(getattr(model, "asym_weight_early", 0.0)),
+                        target_early_offset=float(getattr(model, "target_early_offset", 30.0)),
+                        target_mode=str(getattr(model, "target_mode", "l_offset")),
+                        zone_late_weight=float(getattr(model, "zone_late_weight", 0.0)),
+                        zone_too_late_weight=float(getattr(model, "zone_too_late_weight", 0.0)),
+                        zone_missed_weight=float(getattr(model, "zone_missed_weight", 0.0)),
+                        zone_too_early_weight=float(getattr(model, "zone_too_early_weight", 0.0)),
+                        zone_too_late_threshold=float(getattr(model, "zone_too_late_threshold", 15.0)),
+                        zone_missed_threshold=float(getattr(model, "zone_missed_threshold", 22.0)),
+                        zone_too_early_threshold=float(getattr(model, "zone_too_early_threshold", 23.0)),
+                        sample_weight=sw_f,
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)),
+                        lead_loss_mask=lead_loss_mask_f,
+                        aux_lead_lambda=float(getattr(model, "aux_lead_lambda", 0.0)),
+                        aux_lead_huber_delta=float(getattr(model, "aux_lead_huber_delta", 10.0)),
+                    )
+                    _intnll_loss, _intnll_parts = gaussian_interval_nll_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        sigma=float(getattr(model, "gaussian_sigma", 5.0)),
+                        Tend=Tend,
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)) or None,
+                        sample_weight=sw_f,
+                        lead_loss_mask=lead_loss_mask_f,
+                        continuity_correction=bool(getattr(model, "gaussian_interval_continuity_correction", False)),
+                    )
+                    _lam = float(getattr(model, "gaussian_interval_lambda", 0.1))
+                    base_loss = base_loss + _lam * _intnll_loss
+                    for _k, _v in _intnll_parts.items():
+                        mu_parts[f"intnll_{_k}"] = _v
+                    mu_parts["intnll_lambda"] = _lam
+                    mu_parts["intnll_loss_raw"] = float(_intnll_loss.detach().item())
+                else:
+                    base_loss, mu_parts = asymmetric_mu_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        Tend=Tend,
+                        asym_weight=float(getattr(model, "asym_weight", 10.0)),
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        target_offset=float(getattr(model, "target_offset", 0.0)),
+                        asym_weight_early=float(getattr(model, "asym_weight_early", 0.0)),
+                        target_early_offset=float(getattr(model, "target_early_offset", 30.0)),
+                        target_mode=str(getattr(model, "target_mode", "l_offset")),
+                        zone_late_weight=float(getattr(model, "zone_late_weight", 0.0)),
+                        zone_too_late_weight=float(getattr(model, "zone_too_late_weight", 0.0)),
+                        zone_missed_weight=float(getattr(model, "zone_missed_weight", 0.0)),
+                        zone_too_early_weight=float(getattr(model, "zone_too_early_weight", 0.0)),
+                        zone_too_late_threshold=float(getattr(model, "zone_too_late_threshold", 15.0)),
+                        zone_missed_threshold=float(getattr(model, "zone_missed_threshold", 22.0)),
+                        zone_too_early_threshold=float(getattr(model, "zone_too_early_threshold", 23.0)),
+                        sample_weight=sw_f,
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)),
+                        lead_loss_mask=lead_loss_mask_f,
+                        aux_lead_lambda=float(getattr(model, "aux_lead_lambda", 0.0)),
+                        aux_lead_huber_delta=float(getattr(model, "aux_lead_huber_delta", 10.0)),
+                    )
             else:
                 nll_vec = interval_nll_per_sample(hazard_f, L_f, R_f, ctype_f, Tend=Tend, tstar=nll_tstar)
                 base_loss = _grouped_weighted_base_loss(
@@ -760,19 +1164,48 @@ def run_epoch_weighted_grouped(
                 + "}"
             )
             if is_gaussian and mu_parts:
+                pb = getattr(model, "_last_phen_bias", None)
+                mut = getattr(model, "_last_mu_temporal", None)
+                pb_mean = float(pb.float().mean().item()) if (pb is not None) else float("nan")
+                pb_std = float(pb.float().std(unbiased=False).item()) if (pb is not None and pb.numel() > 1) else float("nan")
+                mut_mean = float(mut.float().mean().item()) if (mut is not None) else float("nan")
+                print(
+                    prefix
+                    + f"phenobias_head={int(bool(getattr(model, 'phenology_bias_head', False)))} "
+                    + f"phen_bias_mean={pb_mean:.3f} phen_bias_std={pb_std:.3f} "
+                    + f"mu_temporal_mean={mut_mean:.3f}"
+                )
                 print(
                     prefix
                     + f"pmf_mode=gaussian sigma={float(getattr(model, 'gaussian_sigma', 5.0)):.3f} "
+                    + f"target_mode={str(mu_parts.get('target_mode', 'l_offset'))} "
                     + f"asym_w={float(getattr(model, 'asym_weight', 10.0)):.2f} "
+                    + f"asym_w_early={float(getattr(model, 'asym_weight_early', 0.0)):.2f} "
                     + f"right_w={float(getattr(model, 'right_weight', 0.3)):.2f} "
                     + f"target_offset={float(mu_parts.get('target_offset', 0.0)):.2f} "
+                    + f"target_early_offset={float(mu_parts.get('target_early_offset', 30.0)):.2f} "
+                    + f"zone_thr_tl={float(mu_parts.get('zone_too_late_threshold', 15.0)):.1f} "
+                    + f"zone_thr_m={float(mu_parts.get('zone_missed_threshold', 22.0)):.1f} "
+                    + f"zone_thr_te={float(mu_parts.get('zone_too_early_threshold', 23.0)):.1f} "
                     + f"mu_event_loss={float(mu_parts.get('mu_event', float('nan'))):.4f} "
                     + f"mu_event_n={int(mu_parts.get('mu_event_n', 0))} "
+                    + f"mu_early_loss={float(mu_parts.get('mu_early', 0.0)):.4f} "
+                    + f"mu_early_n={int(mu_parts.get('mu_early_n', 0))} "
+                    + f"mu_late_loss={float(mu_parts.get('mu_late', 0.0)):.4f} "
+                    + f"mu_late_n={int(mu_parts.get('mu_late_n', 0))} "
+                    + f"mu_too_late_loss={float(mu_parts.get('mu_too_late', 0.0)):.4f} "
+                    + f"mu_too_late_n={int(mu_parts.get('mu_too_late_n', 0))} "
+                    + f"mu_missed_loss={float(mu_parts.get('mu_missed', 0.0)):.4f} "
+                    + f"mu_missed_n={int(mu_parts.get('mu_missed_n', 0))} "
+                    + f"mu_too_early_loss={float(mu_parts.get('mu_too_early', 0.0)):.4f} "
+                    + f"mu_too_early_n={int(mu_parts.get('mu_too_early_n', 0))} "
                     + f"mu_right_loss={float(mu_parts.get('mu_right', float('nan'))):.4f} "
                     + f"mu_right_n={int(mu_parts.get('mu_right_n', 0))} "
                     + f"mu_mean_event={float(mu_parts.get('mu_mean_event', float('nan'))):.3f} "
                     + f"mu_minus_L_mean={float(mu_parts.get('mu_minus_L_mean', float('nan'))):.3f} "
                     + f"mu_minus_L_abs_mean={float(mu_parts.get('mu_minus_L_abs_mean', float('nan'))):.3f} "
+                    + f"mu_minus_mid_mean={float(mu_parts.get('mu_minus_mid_mean', float('nan'))):.3f} "
+                    + f"mu_minus_mid_abs_mean={float(mu_parts.get('mu_minus_mid_abs_mean', float('nan'))):.3f} "
                     + f"mu_minus_target_mean={float(mu_parts.get('mu_minus_target_mean', float('nan'))):.3f} "
                     + f"mu_pos_frac={float(mu_parts.get('mu_pos_frac', float('nan'))):.3f}"
                 )
@@ -1101,16 +1534,23 @@ def eval_nll_model_grouped(model, loader, Tend, device):
     site_year_mean_loss = bool(getattr(model, "site_year_mean_loss", False))
     conditional_survival = bool(getattr(model, "conditional_survival", True))
     is_gaussian = str(getattr(model, "pmf_mode", "hazard")) == "gaussian"
-    for X, L, R, ctype, tstar, valid_mask in loader:
+    for _batch in loader:
+        if len(_batch) == 7:
+            X, L, R, ctype, tstar, valid_mask, pheno = _batch
+        else:
+            X, L, R, ctype, tstar, valid_mask = _batch
+            pheno = None
         X = X.to(device, non_blocking=True)
         L = L.to(device, non_blocking=True)
         R = R.to(device, non_blocking=True)
         ctype = ctype.to(device, non_blocking=True)
         tstar = tstar.to(device, non_blocking=True)
         valid_mask = valid_mask.to(device, non_blocking=True)
+        if pheno is not None:
+            pheno = pheno.to(device, non_blocking=True)
 
         with _autocast_ctx(device, use_amp=bool(getattr(model, "use_amp_eval", False)), amp_dtype=str(getattr(model, "amp_dtype_eval", "bf16"))):
-            hazard = model(X, tstar=tstar, valid_mask=valid_mask)
+            hazard = model(X, tstar=tstar, valid_mask=valid_mask, pheno=pheno)
             hazard_f, L_f, R_f, ctype_f, n_valid = _flatten_grouped_valid(hazard, L, R, ctype, valid_mask)
             if n_valid <= 0:
                 continue
@@ -1126,16 +1566,91 @@ def eval_nll_model_grouped(model, loader, Tend, device):
                 if mu_BK is None:
                     raise RuntimeError("model.pmf_mode='gaussian' but _last_mu_BK is None after forward")
                 mu_f = mu_BK.reshape(-1)[valid_mask.reshape(-1)]
-                loss, _ = asymmetric_mu_loss(
-                    mu_f,
-                    L_f,
-                    R_f,
-                    ctype_f,
-                    Tend=Tend,
-                    asym_weight=float(getattr(model, "asym_weight", 10.0)),
-                    right_weight=float(getattr(model, "right_weight", 0.3)),
-                    target_offset=float(getattr(model, "target_offset", 0.0)),
-                )
+                _lead_BK = getattr(model, "_last_lead_loss_mask", None)
+                if _lead_BK is not None:
+                    lead_loss_mask_f = _lead_BK.reshape(-1)[valid_mask.reshape(-1)]
+                else:
+                    lead_loss_mask_f = None
+                gaussian_loss_mode = str(getattr(model, "gaussian_loss_mode", "asym_mse"))
+                if gaussian_loss_mode == "interval_nll":
+                    loss, _ = gaussian_interval_nll_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        sigma=float(getattr(model, "gaussian_sigma", 5.0)),
+                        Tend=Tend,
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)) or None,
+                        sample_weight=None,
+                        lead_loss_mask=lead_loss_mask_f,
+                        continuity_correction=bool(getattr(model, "gaussian_interval_continuity_correction", False)),
+                    )
+                elif gaussian_loss_mode == "mixed":
+                    loss, _ = asymmetric_mu_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        Tend=Tend,
+                        asym_weight=float(getattr(model, "asym_weight", 10.0)),
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        target_offset=float(getattr(model, "target_offset", 0.0)),
+                        asym_weight_early=float(getattr(model, "asym_weight_early", 0.0)),
+                        target_early_offset=float(getattr(model, "target_early_offset", 30.0)),
+                        target_mode=str(getattr(model, "target_mode", "l_offset")),
+                        zone_late_weight=float(getattr(model, "zone_late_weight", 0.0)),
+                        zone_too_late_weight=float(getattr(model, "zone_too_late_weight", 0.0)),
+                        zone_missed_weight=float(getattr(model, "zone_missed_weight", 0.0)),
+                        zone_too_early_weight=float(getattr(model, "zone_too_early_weight", 0.0)),
+                        zone_too_late_threshold=float(getattr(model, "zone_too_late_threshold", 15.0)),
+                        zone_missed_threshold=float(getattr(model, "zone_missed_threshold", 22.0)),
+                        zone_too_early_threshold=float(getattr(model, "zone_too_early_threshold", 23.0)),
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)),
+                        lead_loss_mask=lead_loss_mask_f,
+                        aux_lead_lambda=float(getattr(model, "aux_lead_lambda", 0.0)),
+                        aux_lead_huber_delta=float(getattr(model, "aux_lead_huber_delta", 10.0)),
+                    )
+                    _intnll_loss_eval, _ = gaussian_interval_nll_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        sigma=float(getattr(model, "gaussian_sigma", 5.0)),
+                        Tend=Tend,
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)) or None,
+                        sample_weight=None,
+                        lead_loss_mask=lead_loss_mask_f,
+                        continuity_correction=bool(getattr(model, "gaussian_interval_continuity_correction", False)),
+                    )
+                    _lam_eval = float(getattr(model, "gaussian_interval_lambda", 0.1))
+                    loss = loss + _lam_eval * _intnll_loss_eval
+                else:
+                    loss, _ = asymmetric_mu_loss(
+                        mu_f,
+                        L_f,
+                        R_f,
+                        ctype_f,
+                        Tend=Tend,
+                        asym_weight=float(getattr(model, "asym_weight", 10.0)),
+                        right_weight=float(getattr(model, "right_weight", 0.3)),
+                        target_offset=float(getattr(model, "target_offset", 0.0)),
+                        asym_weight_early=float(getattr(model, "asym_weight_early", 0.0)),
+                        target_early_offset=float(getattr(model, "target_early_offset", 30.0)),
+                        target_mode=str(getattr(model, "target_mode", "l_offset")),
+                        zone_late_weight=float(getattr(model, "zone_late_weight", 0.0)),
+                        zone_too_late_weight=float(getattr(model, "zone_too_late_weight", 0.0)),
+                        zone_missed_weight=float(getattr(model, "zone_missed_weight", 0.0)),
+                        zone_too_early_weight=float(getattr(model, "zone_too_early_weight", 0.0)),
+                        zone_too_late_threshold=float(getattr(model, "zone_too_late_threshold", 15.0)),
+                        zone_missed_threshold=float(getattr(model, "zone_missed_threshold", 22.0)),
+                        zone_too_early_threshold=float(getattr(model, "zone_too_early_threshold", 23.0)),
+                        right_anchor=float(getattr(model, "right_anchor", 0.0)),
+                        lead_loss_mask=lead_loss_mask_f,
+                        aux_lead_lambda=float(getattr(model, "aux_lead_lambda", 0.0)),
+                        aux_lead_huber_delta=float(getattr(model, "aux_lead_huber_delta", 10.0)),
+                    )
             else:
                 nll_vec = interval_nll_per_sample(
                     hazard_f,
@@ -1395,15 +1910,22 @@ def eval_metrics_with_overlap_grouped(model, loader, Tend, device, alpha=0.2, pi
     shortest_fallback_count = 0
     conditional_survival = bool(getattr(model, "conditional_survival", True))
 
-    for X, L, R, ctype, tstar, valid_mask in loader:
+    for _batch in loader:
+        if len(_batch) == 7:
+            X, L, R, ctype, tstar, valid_mask, pheno = _batch
+        else:
+            X, L, R, ctype, tstar, valid_mask = _batch
+            pheno = None
         X = X.to(device, non_blocking=True)
         L_t = L.to(device, non_blocking=True)
         R_t = R.to(device, non_blocking=True)
         ctype_t = ctype.to(device, non_blocking=True)
         tstar = tstar.to(device, non_blocking=True)
         valid_mask = valid_mask.to(device, non_blocking=True)
+        if pheno is not None:
+            pheno = pheno.to(device, non_blocking=True)
 
-        hazard = model(X, tstar=tstar, valid_mask=valid_mask)
+        hazard = model(X, tstar=tstar, valid_mask=valid_mask, pheno=pheno)
         hazard_f, L_f, R_f, ctype_f, n_valid = _flatten_grouped_valid(hazard, L_t, R_t, ctype_t, valid_mask)
         if n_valid <= 0:
             continue

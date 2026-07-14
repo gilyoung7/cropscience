@@ -66,12 +66,16 @@ def build_samples_season(
     feature_cols: list[str],
     doy_start: int,
     doy_end: int,
+    pheno_ext_cols: list[str] | None = None,
 ) -> tuple[list[dict], int, list[str]]:
     """
     Returns (samples, dropped_groups, feature_names)
-    samples item: {"site_id","year","X","L","R","censor_type"}
+    samples item: {"site_id","year","X","L","R","censor_type", optional "pheno_vec"}
       - X: (T,D) float32
       - L,R: season coordinates in 1..T
+      - pheno_vec: (len(pheno_ext_cols),) site-year static vector, taken from
+        the last DOY of the season (after merge_pheno_daily_ffill). Present
+        only when `pheno_ext_cols` is provided and the columns exist in df_season.
     """
     T = doy_end - doy_start + 1
     samples: list[dict] = []
@@ -118,7 +122,22 @@ def build_samples_season(
             print(f"[nan_check] non-finite in site={site} year={year} cols={bad}")
             printed_nan = True
 
-        samples.append({"site_id": site, "year": int(year), "X": X, "L": L, "R": R, "censor_type": ctype})
+        rec = {"site_id": site, "year": int(year), "X": X, "L": L, "R": R, "censor_type": ctype}
+
+        if pheno_ext_cols:
+            present = [c for c in pheno_ext_cols if c in sub.columns]
+            if present:
+                last_row = sub.iloc[-1]
+                vec = np.asarray(
+                    [pd.to_numeric(last_row[c], errors="coerce") for c in pheno_ext_cols],
+                    dtype=np.float32,
+                )
+                # Same fallbacks as merge_pheno_daily_ffill: offset_days -> -1, else 0.
+                for i, c in enumerate(pheno_ext_cols):
+                    if not np.isfinite(vec[i]):
+                        vec[i] = -1.0 if c == "offset_days" else 0.0
+                rec["pheno_vec"] = vec
+        samples.append(rec)
 
     return samples, dropped, feature_names
 
@@ -187,6 +206,25 @@ def split_by_temporal(
     return train, val, test
 
 
+def split_by_year(
+    samples: list[dict],
+    val_year: int = 2022,
+    test_year_min: int = 2023,
+    test_year_max: int = 2024,
+):
+    """
+    Split by absolute year boundaries (simple form):
+      train: year <  val_year
+      val:   year == val_year
+      test:  test_year_min <= year <= test_year_max
+    Samples outside any of these ranges are dropped by design.
+    """
+    train = [s for s in samples if int(s["year"]) < int(val_year)]
+    val = [s for s in samples if int(s["year"]) == int(val_year)]
+    test = [s for s in samples if int(test_year_min) <= int(s["year"]) <= int(test_year_max)]
+    return train, val, test
+
+
 def split_samples(
     samples: list[dict],
     val_frac=0.1,
@@ -198,6 +236,9 @@ def split_samples(
     temporal_val_end_year: int = 2020,
     temporal_test_start_year: int = 2021,
     temporal_test_end_year: int = 2022,
+    val_year: int | None = None,
+    test_year_min: int | None = None,
+    test_year_max: int | None = None,
 ):
     mode = str(split_mode).strip().lower()
     if mode == "site":
@@ -213,7 +254,20 @@ def split_samples(
             test_start_year=temporal_test_start_year,
             test_end_year=temporal_test_end_year,
         )
-    raise ValueError(f"unknown split_mode={split_mode!r}; expected one of: site, site_year, temporal")
+    if mode == "year":
+        if val_year is None or test_year_min is None or test_year_max is None:
+            raise ValueError(
+                "split_mode='year' requires val_year, test_year_min, test_year_max"
+            )
+        return split_by_year(
+            samples,
+            val_year=int(val_year),
+            test_year_min=int(test_year_min),
+            test_year_max=int(test_year_max),
+        )
+    raise ValueError(
+        f"unknown split_mode={split_mode!r}; expected one of: site, site_year, temporal, year"
+    )
 
 
 def split_fingerprint(train: list[dict], val: list[dict], test: list[dict], sample_n: int = 5) -> dict:
@@ -378,6 +432,9 @@ def split_seed_search_topk(
     temporal_val_end_year: int = 2020,
     temporal_test_start_year: int = 2021,
     temporal_test_end_year: int = 2022,
+    val_year: int | None = None,
+    test_year_min: int | None = None,
+    test_year_max: int | None = None,
 ) -> dict:
     overall_counts = censor_type_counts(samples)
     overall_probs = _counts_to_probs(overall_counts)
@@ -395,6 +452,9 @@ def split_seed_search_topk(
             temporal_val_end_year=temporal_val_end_year,
             temporal_test_start_year=temporal_test_start_year,
             temporal_test_end_year=temporal_test_end_year,
+            val_year=val_year,
+            test_year_min=test_year_min,
+            test_year_max=test_year_max,
         )
 
         train_counts = censor_type_counts(train_s)
@@ -553,28 +613,29 @@ def build_stage2_nowcast_samples(
                 R_new = int(T)
                 c_new = "right"
 
-            out.append(
-                {
-                    "site_id": s["site_id"],
-                    "year": int(s["year"]),
-                    # store base X only; do masking on-the-fly in __getitem__
-                    "X": X,
-                    "L": L_new,
-                    "R": R_new,
-                    "censor_type": c_new,
-                    "tstar": int(tstar),
-                    "window": int(window),
-                    "event_time": int(event_time) if event_time is not None else None,
-                    "orig_L": int(s["L"]),
-                    "orig_R": int(s["R"]),
-                    "orig_censor_type": str(s["censor_type"]),
-                    "case_bucket": (
-                        "right"
-                        if not has_event
-                        else ("pre_L" if tstar < int(s["L"]) else ("in_LR" if tstar < int(s["R"]) else "post_R"))
-                    ),
-                }
-            )
+            rec = {
+                "site_id": s["site_id"],
+                "year": int(s["year"]),
+                # store base X only; do masking on-the-fly in __getitem__
+                "X": X,
+                "L": L_new,
+                "R": R_new,
+                "censor_type": c_new,
+                "tstar": int(tstar),
+                "window": int(window),
+                "event_time": int(event_time) if event_time is not None else None,
+                "orig_L": int(s["L"]),
+                "orig_R": int(s["R"]),
+                "orig_censor_type": str(s["censor_type"]),
+                "case_bucket": (
+                    "right"
+                    if not has_event
+                    else ("pre_L" if tstar < int(s["L"]) else ("in_LR" if tstar < int(s["R"]) else "post_R"))
+                ),
+            }
+            if "pheno_vec" in s:
+                rec["pheno_vec"] = s["pheno_vec"]
+            out.append(rec)
 
     return out
 
@@ -763,10 +824,16 @@ class GroupedIntervalEventDataset(Dataset):
             tstar_seq.append(tstar_val)
 
         X_arr = np.stack(X_seq, axis=0)  # (K,T,D)
+        # pheno_vec is a site-year static vector; same across rows. Take from rows[0].
+        if "pheno_vec" in rows[0]:
+            pheno_vec = np.asarray(rows[0]["pheno_vec"], dtype=np.float32)
+        else:
+            pheno_vec = np.zeros(0, dtype=np.float32)
         return (
             torch.from_numpy(X_arr).float(),
             torch.tensor(L_seq, dtype=torch.long),
             torch.tensor(R_seq, dtype=torch.long),
             torch.tensor(c_seq, dtype=torch.long),
             torch.tensor(tstar_seq, dtype=torch.long),
+            torch.from_numpy(pheno_vec).float(),
         )

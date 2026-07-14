@@ -57,10 +57,14 @@ from rice.src.train_eval import (
 
 WANDB_ENTITY_DEFAULT = "gilyoung7-seoul-national-university"
 
-def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool = False):
+def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool = False,
+                          pheno_ext_cols: list[str] | None = None):
     """
     Rebuild datasets deterministically (same as training pipeline split seed=42).
     Norm stats are recomputed from train split.
+
+    If `pheno_ext_cols` is given, each sample dict will carry a `pheno_vec`
+    field (site-year static phenology vector) for the phenology bias head.
     """
     # DAILY
     daily = load_daily_preprocessed(C.PATH_DAILY)
@@ -94,7 +98,10 @@ def build_samples_for_run(run: int, get_feature_cols, return_debug_stats: bool =
         .reset_index(name="n_rows")
     )
     dropped_groups_df = group_len[group_len["n_rows"] != T][["site_id", "year"]].copy()
-    samples, dropped, feature_names = build_samples_season(df_season, feature_cols, C.DOY_START, C.DOY_END)
+    samples, dropped, feature_names = build_samples_season(
+        df_season, feature_cols, C.DOY_START, C.DOY_END,
+        pheno_ext_cols=pheno_ext_cols,
+    )
     if dropped > 0:
         print("WARNING: dropped groups (len!=T):", dropped)
 
@@ -691,6 +698,25 @@ def main(
 
     feature_cols, feature_names_eval, T, samples = build_samples_for_run(run, get_feature_cols)
     print(f"[features] n={len(feature_names_eval)} head={feature_names_eval[:5]} tail={feature_names_eval[-5:]}")
+    # Stage-2 DIRECT neighbor: re-append the same 6 channels the model was trained
+    # with (driven by ckpt metadata), in the same position (right after sample build,
+    # before any later append). No-op for ckpts trained without the flag.
+    if bool(ckpt.get("stage2_neighbor_history_added", False)):
+        from rice.scripts.neighbor_history_utils import (
+            load_long_events, build_neighbor_index, append_neighbor_to_samples,
+            NEIGHBOR_CHANNEL_NAMES, NEIGHBOR_FEATURE_DIM, DEFAULT_DECAY_KM,
+        )
+        _nb_decay = float(ckpt.get("stage2_neighbor_decay_km", DEFAULT_DECAY_KM))
+        _nb_ev, _nb_co, _nb_sy = load_long_events(
+            C.PATH_OBS, label_col=getattr(C, "LABEL_COL", "label_event"),
+            year_min=getattr(C, "YEAR_MIN", None), year_max=getattr(C, "YEAR_MAX", None),
+        )
+        _nb_index = build_neighbor_index(_nb_ev, _nb_co)
+        _nb_before = int(samples[0]["X"].shape[1])
+        append_neighbor_to_samples(samples, _nb_index, doy_start=int(C.DOY_START), decay_km=_nb_decay)
+        feature_names_eval = list(feature_names_eval) + list(NEIGHBOR_CHANNEL_NAMES)
+        print(f"[stage2_neighbor] eval re-append: before_d_in={_nb_before} added={NEIGHBOR_FEATURE_DIM} "
+              f"after_d_in={int(samples[0]['X'].shape[1])} decay_km={_nb_decay} (matches ckpt meta)")
     result = None
     chosen = None
     if split_seeds_json is not None:

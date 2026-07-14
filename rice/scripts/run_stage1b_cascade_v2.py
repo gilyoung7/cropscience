@@ -298,7 +298,7 @@ def main():
         n_estimators=int(args.xgb_n_estimators), max_depth=int(args.xgb_max_depth),
         learning_rate=0.05, subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
         random_state=0, eval_metric="logloss", scale_pos_weight=float(pos_w),
-        n_jobs=4,
+        tree_method="hist", device="cuda",
     )
     t0 = time.perf_counter()
     clf.fit(X_tr, y_tr)
@@ -380,7 +380,9 @@ def main():
         if sy in dropped_test: return 1
         return int(sy in keep)
     cascade_alerts["alerted"] = cascade_alerts.apply(newalert, axis=1)
-    bins_b = lead_bin_breakdown(metrics_from_alerts and derive_alerts(test_p, args.tau_baseline) or test_alerts_a)
+    cascade_alerts_path = out_dir / "cascade_alerts_test.csv"
+    cascade_alerts.to_csv(cascade_alerts_path, index=False)
+    print(f"[saved] {cascade_alerts_path}")
     bins_b = lead_bin_breakdown(derive_alerts(test_p, args.tau_baseline))
     bins_a = lead_bin_breakdown(test_alerts_a)
     bins_c = lead_bin_breakdown(cascade_alerts)
