@@ -1,0 +1,39 @@
+# Stage-2 TFLite conversion environment (all 8 pests).
+# Install into a DEDICATED venv (.venv-tflite) — never the system/anaconda env.
+#
+#   cd /Users/doyoung-gil/cropscience
+#   python3 -m venv .venv-tflite
+#   ./.venv-tflite/bin/python -m pip install --upgrade pip
+#   ./.venv-tflite/bin/python -m pip install -r tflite_conversion/stage2/requirements-tflite.txt
+#
+# Verified on: macOS 26.5.1, Apple M3 (arm64), Python 3.12.2, 2026-07-15.
+#
+# NOTE on the package name: `ai-edge-torch` is now a deprecation shim — the
+# project was renamed to `litert-torch`, and `ai_edge_torch.convert` no longer
+# exists. Installing ai-edge-torch pulls litert-torch in as a dependency; our
+# code imports `litert_torch` directly. Both are pinned so the shim's own
+# rename cannot silently move underneath us.
+
+# --- conversion path (torch.export -> litert-torch -> .tflite) ---
+torch==2.12.1
+ai-edge-torch==0.7.2          # deprecation shim; pulls in litert-torch
+litert-torch==0.9.1           # the actual converter entry point
+litert-converter==0.2.0
+ai-edge-litert==2.1.5         # TFLite/LiteRT Interpreter used for validation
+ai-edge-quantizer==0.7.0      # fp16 recipe
+numpy==2.5.1
+
+# --- needed by validate_real.py (drives infer/preprocess.py) and by
+#     checkpoint.selected_offset (reads fallback_policy.yaml) ---
+pandas==3.0.3
+PyYAML==6.0.3
+
+# --- Stage-1 only; NOT needed for Stage-2 conversion -------------------------
+# Pinned here for the record only. BOTH 3.1.2 and 2.1.4 SIGSEGV (exit 139) when
+# torch.load unpickles the shipped Stage-1 checkpoints: the booster is stored as
+# a ~1 MB legacy binary blob under `_Booster.handle`, a format xgboost >= 2
+# rejects by crashing rather than raising. Running the live Stage-1 gate needs
+# the (unknown) xgboost 1.x that produced the ckpts. Stage-2 never imports
+# xgboost, and this pipeline does not touch Stage-1.
+# xgboost==2.1.4
+# scikit-learn==1.9.0
