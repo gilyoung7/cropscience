@@ -1,0 +1,21 @@
+# Standalone Stage-2 RUNTIME dependencies — the minimum to run inference.
+#
+#   python3 -m venv .venv-runtime
+#   ./.venv-runtime/bin/python -m pip install -r requirements-runtime.txt
+#
+# NO torch. NO tensorflow. NO xgboost. The package ships .tflite models only;
+# nothing here can pull a training framework in:
+#   ai-edge-litert requires only backports.strenum, flatbuffers, numpy,
+#   protobuf, tqdm, typing-extensions (verified with `pip show ai-edge-litert`).
+#
+# ai-edge-litert is the LiteRT (formerly TF Lite) interpreter published by
+# Google as a standalone wheel — it does NOT depend on the tensorflow package.
+# Verified installable and importable on macOS 26.5.1 / Apple M3 (arm64) /
+# Python 3.12.2 in a clean venv on 2026-07-15 (tests/test_no_torch_dependency.py).
+
+# LiteRT/TFLite interpreter
+ai-edge-litert==2.1.5
+
+# numerics + daily-weather frame handling
+numpy==2.5.1
+pandas==3.0.3

@@ -70,3 +70,9 @@ __pycache__/
 api_handoff_transformer/
 # build output: .tflite models + run JSON; regenerate with export_all.py
 tflite_conversion/*/artifacts/
+# standalone LiteRT package build output; regenerate with build_package.py
+tflite_conversion/standalone_stage2/dist/
+# runtime-only venv used to prove the package needs no torch
+.venv-runtime-test/
+# fixtures derived from real data (not redistributable)
+tflite_conversion/standalone_stage2/tests/fixtures_real/

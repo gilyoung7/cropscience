@@ -1,0 +1,29 @@
+# Standalone Stage-2 BUILD dependencies — reading .pt checkpoints and packaging.
+#
+# PyTorch IS allowed here: build_package.py must open the Stage-2 checkpoints to
+# extract metadata and normalization. None of this reaches the built package —
+# build_package.py fails the build if any torch/tensorflow/xgboost import or
+# .pt/.pth file lands in dist/.
+#
+# The build venv is the existing .venv-tflite (it already has these):
+#   ./.venv-tflite/bin/python tflite_conversion/standalone_stage2/build_package.py
+#
+# Verified on macOS 26.5.1 / Apple M3 (arm64) / Python 3.12.2, 2026-07-15.
+
+# checkpoint reading (build only — pickle container for the state_dict)
+torch==2.12.1
+
+# reads fallback_policy.yaml for selected_fixed_offset
+PyYAML==6.0.3
+
+# shared with the runtime
+numpy==2.5.1
+pandas==3.0.3
+ai-edge-litert==2.1.5
+
+# only needed if build_package.py must regenerate a missing .tflite via
+# tflite_conversion/stage2/export_all.py (--export-missing-tflite)
+ai-edge-torch==0.7.2
+litert-torch==0.9.1
+litert-converter==0.2.0
+ai-edge-quantizer==0.7.0
