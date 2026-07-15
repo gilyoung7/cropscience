@@ -328,8 +328,25 @@ Expect the 45×241 pests to be ~3.4× the MACs of BPH (241/131 × 45/27).
 
 ## 12. Reproducing
 
-See [`tflite_conversion/bph_stage2/README.md`](../tflite_conversion/bph_stage2/README.md)
-for exact commands from a clean checkout.
+This report documents the BPH **prototype**, whose scripts are no longer tracked
+in git. The prototype was superseded by the common pipeline covering all 8 pests
+(BPH included); reproduce BPH from there:
+
+```bash
+cd tflite_conversion/stage2
+../../.venv-tflite/bin/python export_all.py --pests BPH
+../../.venv-tflite/bin/python validate_all.py --pests BPH
+```
+
+See [`tflite_conversion/stage2/README.md`](../tflite_conversion/stage2/README.md)
+for setup and the full command list, and
+[`all_pests_stage2_tflite_conversion_report.md`](all_pests_stage2_tflite_conversion_report.md)
+for the all-8 results.
+
+Note the prototype and the common pipeline build synthetic inputs differently
+(prototype: `alert_doy=176`; common: the middle of each pest's DOY range), so
+the *synthetic* mu figures in this report are not reproduced verbatim by the
+commands above. The real-data results (§6B) are.
 
 ## 13. Repo hygiene
 

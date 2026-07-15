@@ -122,10 +122,11 @@ raises on any drift.
 
 ## Relationship to `bph_stage2/`
 
-`../bph_stage2/` was the BPH-only prototype. It is **kept intact** (its artifacts
-are untouched) but is superseded by this package. The refactor was verified: the
-old and new wrappers produce bit-identical mu for BPH over 18 (seed, alert)
-cases — max |old − new| = 0.0. New work should use this directory.
+`../bph_stage2/` was the BPH-only prototype, superseded by this package. Its
+scripts are not tracked in git; only a short notice remains there. The refactor
+was verified: the old and new wrappers produce bit-identical mu for BPH over 18
+(seed, alert) cases — max |old − new| = 0.0. Use this directory for all work,
+including BPH.
 
 ## Known limitations
 

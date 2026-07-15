@@ -45,7 +45,8 @@ value is read from the checkpoint.
 
 **Refactor verified safe.** Old vs new wrapper on BPH, identical inputs, 18
 (seed, alert) cases: max |old − new| = **0.0**, and max |original − new| = **0.0**.
-`bph_stage2/` is left intact with its artifacts; its README now points here.
+`bph_stage2/` is superseded: its scripts are untracked and only a short pointer
+notice remains there.
 
 ## 3. Checkpoints are the source of truth
 
@@ -321,7 +322,7 @@ Two caveats worth carrying forward:
   and after). All 8 checkpoints are read-only inputs; none was modified or
   re-saved.
 - `configs/fallback_policy.yaml` and Stage-1 assets untouched.
-- `bph_stage2/` artifacts preserved; only its README gained a pointer here.
+- `bph_stage2/` local files preserved on disk; its README is now a pointer here.
 - New files under `tflite_conversion/stage2/` and `docs/` only.
 - Nothing staged, committed, or pushed. `.venv-tflite/`, `api_handoff_transformer/`
   and all `.tflite` artifacts remain untracked.

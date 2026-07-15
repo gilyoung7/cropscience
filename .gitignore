@@ -61,3 +61,12 @@ __pycache__/
 
 # claude local config
 .claude/
+
+# TFLite conversion (see tflite_conversion/stage2/README.md)
+# NOTE: .gitignore has no inline comments — keep each pattern on its own line.
+# dedicated conversion venv (~1.8 GB)
+.venv-tflite/
+# unzipped API package (~35 MB, ships its own checkpoints)
+api_handoff_transformer/
+# build output: .tflite models + run JSON; regenerate with export_all.py
+tflite_conversion/*/artifacts/
