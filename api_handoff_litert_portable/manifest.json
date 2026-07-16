@@ -1,0 +1,507 @@
+{
+  "manifest_version": "1.0",
+  "built_at_utc": "2026-07-16T04:55:42+00:00",
+  "package": "api_handoff_litert_portable",
+  "model_generation": "lead_v3_final (deployed). Newer DN models excluded by design.",
+  "stage1_backend": "xgboost_json (xgboost.Booster; no scikit-learn)",
+  "stage2_backend": "litert_fp16",
+  "default_stage2_variant": "fp16",
+  "includes_fp32": false,
+  "source_reference_api": {
+    "zip": "api_handoff_transformer_batch_20260710.zip",
+    "sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4"
+  },
+  "pests": [
+    "BPH",
+    "WBPH",
+    "bacterial_blight",
+    "blast",
+    "brown_spot",
+    "rice_stem_borer_1",
+    "rice_stem_borer_2",
+    "sheath_blight"
+  ],
+  "failures": [],
+  "models": {
+    "BPH": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1439690,
+          "sha256": "2df22fc5be01008c58682d90da6263cbf441b695b229ad089409a73c7c410ec2"
+        },
+        "A/calibration.json": {
+          "bytes": 2537,
+          "sha256": "f95e09c2e8733cddc6596a2c2ce965575b80afddb9fdc898b0a3d59e482267af"
+        },
+        "A/metadata.json": {
+          "bytes": 7491,
+          "sha256": "bbffcdec6c3c00d410c912482a6c1a960ccd294d8714d1ca4e84f59758088030"
+        },
+        "D/model.json": {
+          "bytes": 1430627,
+          "sha256": "408911d3b8d25fe779cd30ac0e01c5c9b0d38f7ac1dea19c6c5ff7c7dec0b5ef"
+        },
+        "D/calibration.json": {
+          "bytes": 2535,
+          "sha256": "5a5fdece3d035301074d1f5b12a34099b075dd715f71a5c58148cf821b68bb4c"
+        },
+        "D/metadata.json": {
+          "bytes": 11157,
+          "sha256": "f2e846a0fa814cf2baf8a20aa530efdca7d51a00740757948139fd49e550ffe2"
+        },
+        "gate.json": {
+          "bytes": 894,
+          "sha256": "4a24f7a583986f2ebba89d8bc4789c539b1b969fdea7de2e73bc5d7ca35e57d8"
+        },
+        "site_history.json": {
+          "bytes": 426827,
+          "sha256": "1c7b088b7fcf42ecba57fb96560ca581cb4a1f758f108dbf4c948ff6ca6e1ced"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 5082,
+          "sha256": "69ebda862abaf4212bbbd7c2124ba1e3664593c88cfcb53d941aee1f0b286406"
+        },
+        "normalization.npz": {
+          "bytes": 736,
+          "sha256": "fa4427061fd3b462e8fb545af1dacde66644177b65537d2b229698600048fa31"
+        },
+        "model_fp16.tflite": {
+          "bytes": 380232,
+          "sha256": "a63c718b9e7a03e1c32f047d52dbf2c0632647ecf03a85f6e83370fab81db84e"
+        }
+      }
+    },
+    "WBPH": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1430841,
+          "sha256": "5e6c4f147c6e748bb02f89b0d28ecd93a7cea88f652e3eb7defac9edddcc3cc3"
+        },
+        "A/calibration.json": {
+          "bytes": 2547,
+          "sha256": "a475248838771b8ea55d65eb3f34f4f34c9f178453322ca8d134d1ba276b5547"
+        },
+        "A/metadata.json": {
+          "bytes": 11772,
+          "sha256": "6626067eea03bc549e7f727e5ce941637b62f1b318f09cc94a00754bfb5db8b7"
+        },
+        "D/model.json": {
+          "bytes": 1439498,
+          "sha256": "eb0f0f9f7fba98f34e4d4090021d551f678cdf2a3b2dcf70540501be0a3af3b5"
+        },
+        "D/calibration.json": {
+          "bytes": 2547,
+          "sha256": "b921bc3911e8ab1fcb6a123af8b3b701e32e5d38dcac42c92a0c0b26e2d10f17"
+        },
+        "D/metadata.json": {
+          "bytes": 15437,
+          "sha256": "4a04453a5b399ab042396af1f1f0c4d201a9a6686ae61b0fbe7fe6c9b56d405e"
+        },
+        "gate.json": {
+          "bytes": 913,
+          "sha256": "d3c4ed5ebdd061cb1049850e4884477356048c718f153456ba4c537c54743ccc"
+        },
+        "site_history.json": {
+          "bytes": 434423,
+          "sha256": "94165d49477846dc22a287612ee8f75fb16b124ff6966c3fffa705b84aa1503c"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6097,
+          "sha256": "36dee6475f7311a977f44430871167456815030b6e542146c6436de3c699e37b"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "551047bf74042031e7a006d96af631d6eb143a211526725394537bad21a296a9"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "6e3c4faf0d510d8df81e87834fbc049745a880d357b7706977268940966ce1db"
+        }
+      }
+    },
+    "bacterial_blight": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1430318,
+          "sha256": "116c67005fad3d481ff5508d3083ebd8d3c31a7397bf47748b48621ed9c05890"
+        },
+        "A/calibration.json": {
+          "bytes": 2589,
+          "sha256": "43af1aeebe96a2aac06639723f0ee05e021d1c59d535a58935afa721eabfba6c"
+        },
+        "A/metadata.json": {
+          "bytes": 11808,
+          "sha256": "298c8f60bbfc17b9db7546b47d40298d3d488646d04c447a559e48b8bfd9e545"
+        },
+        "D/model.json": {
+          "bytes": 1446118,
+          "sha256": "826b8d8b7033bb6b496e00530aa3cf09fa44c22cca36d337d6c3e4115ab1bc00"
+        },
+        "D/calibration.json": {
+          "bytes": 2588,
+          "sha256": "090ef976fdeb4e48379c2e51961d26948d1e34e74d19ffddf92a45da68abd816"
+        },
+        "D/metadata.json": {
+          "bytes": 15473,
+          "sha256": "af638aac657e5e13ca691087f65dfa7911b25b6bcd8d5d3788de9bc580f71793"
+        },
+        "gate.json": {
+          "bytes": 923,
+          "sha256": "d456d04fe473725c91f5cead59cf1ec0fd8e307093054f3e51929e8f4e80ce80"
+        },
+        "site_history.json": {
+          "bytes": 427412,
+          "sha256": "290d77dc3ea243ee27130bf01f7e4dc281d4b2b0dcc8cf6386ef5e9b53f2fa91"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6173,
+          "sha256": "1a66818e80c70b81619bff5e80cfb92f5eee2a28403bb14e894f9f9920cb8def"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "c8db0fbfc07da87aa5ce86d598f4a5094106a165ce3615d80f6ef85e96600197"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "94f1819e09bba53996015821ea2c41dde8b66966683479ab5dc319a0f1a60bcc"
+        }
+      }
+    },
+    "blast": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1467912,
+          "sha256": "80d6ef6b5fa439bbe0b8f578051bd523f814d618c802d05ff09d0867b20e2d1e"
+        },
+        "A/calibration.json": {
+          "bytes": 2542,
+          "sha256": "dbe84d85d0b15e9b250106333e08d325a8b32e69d16a5dc71629e10eee75a642"
+        },
+        "A/metadata.json": {
+          "bytes": 11776,
+          "sha256": "8e7ffe762d8d3a01a1937cd7aa843018e65cee8f5ed849581a8ea2e41a96eaa1"
+        },
+        "D/model.json": {
+          "bytes": 1438606,
+          "sha256": "f8b47aaa566bdd6005bc26e6b46adf41c32e91c63933f492cb846fc6439aa0d8"
+        },
+        "D/calibration.json": {
+          "bytes": 2540,
+          "sha256": "f1413229d8c6cd8874173faf61518c0d80d643647641a9295f98c5651ebbb389"
+        },
+        "D/metadata.json": {
+          "bytes": 15441,
+          "sha256": "d56ce48256d9e4288a2084eb4a75c443f0ef759f7f68533d610438f3ef2a01db"
+        },
+        "gate.json": {
+          "bytes": 898,
+          "sha256": "69b1f2f337a3182d41f201356d9ef1b9e7216419ac80abe236d7de3e410a69d4"
+        },
+        "site_history.json": {
+          "bytes": 433353,
+          "sha256": "ac7ddba9dc6c499c3e0c160fbda5c15dc370f6e332961b45e1ea5be5ed76d1d5"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6107,
+          "sha256": "4a85fc4c1cd84416b4b48f6f33b72082e4475aeb384c7f8ae36d7f24253a1a66"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "cac4b93eccc35b4b3c2aba8e47e5a173a8a3b9ab3859c943f21b834c3d322d94"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "775ced8e5c70cab8039a315d9aacbefdc33250d0a9683ed35694b1aba5d29768"
+        }
+      }
+    },
+    "brown_spot": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1495023,
+          "sha256": "2a96953e68b629b84e71fa0ab44cf8b57b1b0397f8ffa8f9820ad8b9b8ec7ef9"
+        },
+        "A/calibration.json": {
+          "bytes": 2556,
+          "sha256": "a405f309c4698a2e5056214857375c90424353d02ca624c3d7de0051c12c2aea"
+        },
+        "A/metadata.json": {
+          "bytes": 11790,
+          "sha256": "c4c9aad75ef5bb0cc21b0e4a30e4743a2240eb0c4484ae0c7a02dfdf627f80f4"
+        },
+        "D/model.json": {
+          "bytes": 1490103,
+          "sha256": "79739e488ebd8455ee4a9b80830470cb5abed16b7cdb3f3faa05aeaa354802ff"
+        },
+        "D/calibration.json": {
+          "bytes": 2555,
+          "sha256": "7305d779668cb978877075a74f70b0276d42f86c8f0b31d290926633d5397a5c"
+        },
+        "D/metadata.json": {
+          "bytes": 15455,
+          "sha256": "fae890c89978c82a4b448d3caa67ff781fd3dd2da45041a8730f5a9e0ed39b08"
+        },
+        "gate.json": {
+          "bytes": 908,
+          "sha256": "f492765c6c3b9e43a4ecd9a4636fdea9db9782f0f7dcc23f0ac31ccee47480ee"
+        },
+        "site_history.json": {
+          "bytes": 428446,
+          "sha256": "0430c7759f61bbcca226cbfc1274da532481f7fa28114c98d2c5eafb9f798f0f"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6138,
+          "sha256": "ffb5d4f3f1617c42fdbd6b37aa93ba84c464e0c80cdf94d4d01d0fd7358e61e5"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "6d69c420d569831824777b0ec4fbd7cff3bf129716c627e5f134bff53e8438c4"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "af95810099dc1314da1f9ae92795145cc8ba6c29bc6aecf7a9bfc9872bb10d92"
+        }
+      }
+    },
+    "rice_stem_borer_1": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1439278,
+          "sha256": "2d2e2c0a6bd14a6dca183e1c68ff05cd2b81a1c0b56295739311bf5e876001e9"
+        },
+        "A/calibration.json": {
+          "bytes": 2580,
+          "sha256": "2cb0b5091d013231276ae96cf540b3a729c5ae8d7902b053586291928f369a4c"
+        },
+        "A/metadata.json": {
+          "bytes": 11811,
+          "sha256": "b7c4997bf5f2c66fa0057e54114203ae18bb6a2083add53e6c617489c96820e7"
+        },
+        "D/model.json": {
+          "bytes": 1403011,
+          "sha256": "2fd520b035b497302668586391fe4c266f590dd13fbdcc7e653774052844f837"
+        },
+        "D/calibration.json": {
+          "bytes": 2579,
+          "sha256": "7b6e8b50c6adda64a635f556bc849c2e3e187395621848a5e9809d302a7a0530"
+        },
+        "D/metadata.json": {
+          "bytes": 15476,
+          "sha256": "b39951bad0a3d2b2d0ff2e83aeb7dca0a10eb6b526723ca37f5c2d0e5d5445bf"
+        },
+        "gate.json": {
+          "bytes": 925,
+          "sha256": "7d1537705c96036620645ad3953e1b5d6b474167417c9c539ae4ddfe04c14f23"
+        },
+        "site_history.json": {
+          "bytes": 426781,
+          "sha256": "bd448a178bd9b4b4f728537bd384bba865fb52fbcfc373c63b78b7769b027e92"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6179,
+          "sha256": "0b3a2148992a79d4384191c7336d61e1f83626046c90de7c2c6b31b4678f5fae"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "7d6de7bf1ff5769c707564e37872f94be4afff5ced8aab0f443ba6cdfd34c726"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "9900a8a3992df773c1f1c57123228494463d134ead85c78961afb1af7a79d2d4"
+        }
+      }
+    },
+    "rice_stem_borer_2": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1432310,
+          "sha256": "59ffbfa33087bc0d38c5afc710859a26f5397c833cd5e434d4259521cccba442"
+        },
+        "A/calibration.json": {
+          "bytes": 2579,
+          "sha256": "db16b9f07eecb65e525dac7f442b018581b34fe217fcf70ea41002c7ed764ff7"
+        },
+        "A/metadata.json": {
+          "bytes": 11811,
+          "sha256": "9ec7ee2b6c72431b5e8962cc22723a863eea3157304e1333da5102b1adec4a77"
+        },
+        "D/model.json": {
+          "bytes": 1424814,
+          "sha256": "011b6b4cdee362e567021205d74ea9de2510cd34ee19c7a5b0a5888d80c7c362"
+        },
+        "D/calibration.json": {
+          "bytes": 2578,
+          "sha256": "cfcaef8e0ade033ee31af9832e8bbe463a13a7d9232eccd13321e2a2e12f49c4"
+        },
+        "D/metadata.json": {
+          "bytes": 15476,
+          "sha256": "2f00a8d0a488d4eea207fda765ef8a4780cc40fb6eb48d0802a3b17fbbf4b3ca"
+        },
+        "gate.json": {
+          "bytes": 926,
+          "sha256": "10c08123a1d46d7e3726d55c9a8fd83576875d388a2aa02ed1afb035f48a250b"
+        },
+        "site_history.json": {
+          "bytes": 425445,
+          "sha256": "91d0e92634aa5d27f7b359c64029a4186fd43a5bf628552735f7c82a1e228dd1"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6180,
+          "sha256": "4a306737feedce400deed00b99698f40a25642a7d8e36465c41ecfd2e5432562"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "252f77cb9833d863ad2814002a49c64c39a17f0054e8c9d56f622c17019b095c"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "772d82a083a505e0281d9687f8a7e20821a0b5bc67da59d83745488fc70e7896"
+        }
+      }
+    },
+    "sheath_blight": {
+      "stage1": {
+        "A/model.json": {
+          "bytes": 1385455,
+          "sha256": "3264367495e624833a5b390a3e7403a22ed64eb4a76b96d8d31b8d04ebcf0e93"
+        },
+        "A/calibration.json": {
+          "bytes": 2574,
+          "sha256": "e37c33d79ecb32ca3925321bf356cd2c94ea71a3120d348ee72c00df3405c3b8"
+        },
+        "A/metadata.json": {
+          "bytes": 11796,
+          "sha256": "3cb90a46814dfffd1f33c6d387964b03eb51aada214ba1a87905e8102cf964e0"
+        },
+        "D/model.json": {
+          "bytes": 1403803,
+          "sha256": "4e69e31228a30fc6467c563ede4927529a03d81eaaee38e1d673b8fb667ca8af"
+        },
+        "D/calibration.json": {
+          "bytes": 2573,
+          "sha256": "132748ff9233791e54f8537b50caa9f2c5cca9d5b4363d1538c78037638ca480"
+        },
+        "D/metadata.json": {
+          "bytes": 15461,
+          "sha256": "56ca887772c11b666ee0ff40d63a901e146e49efc4a694d18f46eba2bd881330"
+        },
+        "gate.json": {
+          "bytes": 931,
+          "sha256": "e7986619ce61de7d65f6d9d565f2da7a7400ef4e794afdbae942e7f89a826c22"
+        },
+        "site_history.json": {
+          "bytes": 445931,
+          "sha256": "7f3e7f1552a6b829e5270319d3ad7e070951e5149cc30ec77df1262bea4a8030"
+        }
+      },
+      "stage2": {
+        "metadata.json": {
+          "bytes": 6156,
+          "sha256": "613a1e94414a69d0069380e4597ca13c064ddea0e8b7f536f50e71d336030fd4"
+        },
+        "normalization.npz": {
+          "bytes": 880,
+          "sha256": "76c2ae03f0a515d2055b02fedd9a437b41dc50e3b4dc224988953cde3973196d"
+        },
+        "model_fp16.tflite": {
+          "bytes": 403328,
+          "sha256": "3387c088ac57debee157c374386a939b31bbe0cb693196d34487f1f74e61f0f4"
+        }
+      }
+    }
+  },
+  "configs": {
+    "fallback_policy.yaml": {
+      "bytes": 9879,
+      "sha256": "afa394a7e78b94828a26811f2d9100f7cb2c264d7edbb6b71ee5b5057233e964"
+    },
+    "climatology/BPH_climatology_train_stats.csv": {
+      "bytes": 288,
+      "sha256": "a6bec4b60de8dc210638b1a02d06d7d66097c57c4d9c38e2a913f202fe5dc262"
+    },
+    "climatology/WBPH_climatology_train_stats.csv": {
+      "bytes": 290,
+      "sha256": "8b30e4454fb960d0597f6cbb0889856c074db7a924fcef727a88496c5bdbea9e"
+    },
+    "climatology/bacterial_blight_climatology_train_stats.csv": {
+      "bytes": 302,
+      "sha256": "e391f8301b2ef76746247afb6b338464b4b87ee93878f8ae7164d75104dc1eb1"
+    },
+    "climatology/blast_climatology_train_stats.csv": {
+      "bytes": 293,
+      "sha256": "f5e582ebae7d1044da3f9e92b4dc914957d1ac7ec33f9d8f744f40f9a9935825"
+    },
+    "climatology/brown_spot_climatology_train_stats.csv": {
+      "bytes": 299,
+      "sha256": "37ce90f92b0c65d7697ded4431045d6401040df7e990b33b1e58749d27552de0"
+    },
+    "climatology/rice_stem_borer_1_climatology_train_stats.csv": {
+      "bytes": 303,
+      "sha256": "5fa93eca4e7f91149f22e83f3a04793245f2e67f2d567424766ffd2270d3039c"
+    },
+    "climatology/rice_stem_borer_2_climatology_train_stats.csv": {
+      "bytes": 304,
+      "sha256": "c8b06633e2a60c9dddd98a22dd64696d84406867798801e1a5458509bd94d1d4"
+    },
+    "climatology/sheath_blight_climatology_train_stats.csv": {
+      "bytes": 299,
+      "sha256": "768ba14350cfdcb07ebde5163aacb1d1b457d19da0d654837f689c3e20c51edc"
+    }
+  },
+  "sizes": {
+    "assets_stage1_bytes": 26703773,
+    "assets_stage2_bytes": 3258536,
+    "assets_configs_bytes": 9879,
+    "assets_climatology_bytes": 2378,
+    "assets_total_bytes": 29974566,
+    "code_bytes": 125444,
+    "per_pest": {
+      "BPH": {
+        "stage1": 3321758,
+        "stage2": 386050
+      },
+      "WBPH": {
+        "stage1": 3337978,
+        "stage2": 410305
+      },
+      "bacterial_blight": {
+        "stage1": 3337229,
+        "stage2": 410381
+      },
+      "blast": {
+        "stage1": 3373068,
+        "stage2": 410315
+      },
+      "brown_spot": {
+        "stage1": 3446836,
+        "stage2": 410346
+      },
+      "rice_stem_borer_1": {
+        "stage1": 3302441,
+        "stage2": 410387
+      },
+      "rice_stem_borer_2": {
+        "stage1": 3315939,
+        "stage2": 410388
+      },
+      "sheath_blight": {
+        "stage1": 3268524,
+        "stage2": 410364
+      }
+    }
+  }
+}

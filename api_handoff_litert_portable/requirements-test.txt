@@ -1,0 +1,5 @@
+# Test-only dependencies (NOT installed in production).
+# The parity tests compare against the reference API and the migration assets,
+# which need torch/scikit-learn; production never does.
+-r requirements-runtime.txt
+scikit-learn==1.6.1   # only for the Booster-vs-XGBClassifier equivalence test

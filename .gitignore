@@ -76,3 +76,12 @@ tflite_conversion/standalone_stage2/dist/
 .venv-runtime-test/
 # fixtures derived from real data (not redistributable)
 tflite_conversion/standalone_stage2/tests/fixtures_real/
+
+# lightweight portable API: build outputs (regenerate with its build_package.py)
+api_handoff_litert_portable/dist/
+api_handoff_litert_portable/assets/
+api_handoff_litert_portable/input/
+api_handoff_litert_portable/output/
+api_handoff_litert_portable/tests/_*.json
+# runtime-only venv used to prove the API needs no torch/tensorflow
+.venv-lightweight-api-test/
