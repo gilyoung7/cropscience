@@ -1,0 +1,180 @@
+{
+  "schema_version": "stage1-xgb-portable-manifest/1.0.0",
+  "generated_utc": "2026-07-15T17:03:34.284994+00:00",
+  "source_env": {
+    "python": "3.12.3",
+    "python_full": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+    "torch": "2.12.0+cu130",
+    "xgboost": "3.3.0",
+    "scikit_learn": "1.9.0",
+    "numpy": "2.4.6",
+    "executable": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/../../api_handoff_transformer/.venv/bin/python"
+  },
+  "portable_assets_per_model": [
+    "model.json",
+    "metadata.json",
+    "calibration.json"
+  ],
+  "portable_assets_per_pest": [
+    "gate.json"
+  ],
+  "external_assets_still_required": {
+    "site_history.json": "per-pest, ~7.3k site-year keys; supplies history channels + with_history routing. Not copied into artifacts/ (see README)."
+  },
+  "calibration": [
+    {
+      "pest": "BPH",
+      "branch": "A",
+      "temperature": 1.95
+    },
+    {
+      "pest": "BPH",
+      "branch": "D",
+      "temperature": 1.5
+    },
+    {
+      "pest": "WBPH",
+      "branch": "A",
+      "temperature": 2.0
+    },
+    {
+      "pest": "WBPH",
+      "branch": "D",
+      "temperature": 2.05
+    },
+    {
+      "pest": "bacterial_blight",
+      "branch": "A",
+      "temperature": 2.5999999999999996
+    },
+    {
+      "pest": "bacterial_blight",
+      "branch": "D",
+      "temperature": 2.5999999999999996
+    },
+    {
+      "pest": "blast",
+      "branch": "A",
+      "temperature": 2.65
+    },
+    {
+      "pest": "blast",
+      "branch": "D",
+      "temperature": 2.5
+    },
+    {
+      "pest": "brown_spot",
+      "branch": "A",
+      "temperature": 4.0
+    },
+    {
+      "pest": "brown_spot",
+      "branch": "D",
+      "temperature": 4.0
+    },
+    {
+      "pest": "rice_stem_borer_1",
+      "branch": "A",
+      "temperature": 1.525
+    },
+    {
+      "pest": "rice_stem_borer_1",
+      "branch": "D",
+      "temperature": 1.475
+    },
+    {
+      "pest": "rice_stem_borer_2",
+      "branch": "A",
+      "temperature": 2.425
+    },
+    {
+      "pest": "rice_stem_borer_2",
+      "branch": "D",
+      "temperature": 2.425
+    },
+    {
+      "pest": "sheath_blight",
+      "branch": "A",
+      "temperature": 5.0
+    },
+    {
+      "pest": "sheath_blight",
+      "branch": "D",
+      "temperature": 5.0
+    }
+  ],
+  "gates": [
+    {
+      "pest": "BPH",
+      "method": "D_history",
+      "k": 3,
+      "tau": 0.6,
+      "tau_no": null,
+      "tau_with": null,
+      "yaml_drifted": false
+    },
+    {
+      "pest": "WBPH",
+      "method": "dispatch_group_tau",
+      "k": 3,
+      "tau": null,
+      "tau_no": 0.725,
+      "tau_with": 0.7,
+      "yaml_drifted": false
+    },
+    {
+      "pest": "bacterial_blight",
+      "method": "D_history",
+      "k": 3,
+      "tau": 0.525,
+      "tau_no": null,
+      "tau_with": null,
+      "yaml_drifted": true
+    },
+    {
+      "pest": "blast",
+      "method": "D_history",
+      "k": 3,
+      "tau": 0.6,
+      "tau_no": null,
+      "tau_with": null,
+      "yaml_drifted": false
+    },
+    {
+      "pest": "brown_spot",
+      "method": "D_history",
+      "k": 3,
+      "tau": 0.5,
+      "tau_no": null,
+      "tau_with": null,
+      "yaml_drifted": false
+    },
+    {
+      "pest": "rice_stem_borer_1",
+      "method": "A_baseline",
+      "k": 3,
+      "tau": 0.55,
+      "tau_no": null,
+      "tau_with": null,
+      "yaml_drifted": true
+    },
+    {
+      "pest": "rice_stem_borer_2",
+      "method": "D_history",
+      "k": 3,
+      "tau": 0.575,
+      "tau_no": null,
+      "tau_with": null,
+      "yaml_drifted": false
+    },
+    {
+      "pest": "sheath_blight",
+      "method": "dispatch_group_tau",
+      "k": 3,
+      "tau": null,
+      "tau_no": 0.55,
+      "tau_with": 0.55,
+      "yaml_drifted": false
+    }
+  ]
+}

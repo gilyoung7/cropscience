@@ -1,0 +1,358 @@
+{
+  "schema_version": "stage1-xgb-portable/1.0.0",
+  "generated_utc": "2026-07-15T16:49:24.940416+00:00",
+  "source_zip": "/home/gpu4080/research/api_handoff_transformer_batch_20260708.zip",
+  "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+  "source_env": {
+    "python": "3.12.3",
+    "python_full": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+    "torch": "2.12.0+cu130",
+    "xgboost": "3.3.0",
+    "scikit_learn": "1.9.0",
+    "numpy": "2.4.6",
+    "executable": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/../../api_handoff_transformer/.venv/bin/python"
+  },
+  "totals": {
+    "attempted": 16,
+    "exported": 16,
+    "failed": 0
+  },
+  "models": [
+    {
+      "pest": "BPH",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/BPH/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "171c38bc7af5f72bb5cc70b49c19d09507b646e5929110c72c98dc5764adef8c",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/BPH/A/model.json",
+      "exported_json_sha256": "2df22fc5be01008c58682d90da6263cbf441b695b229ad089409a73c7c410ec2",
+      "exported_json_bytes": 1439690,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/BPH/A/metadata.json",
+      "n_features_in": 85,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "BPH",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/BPH/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "22a392747f86e9e411163f96d958f473a6041df0484f106ed9618ce772922482",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/BPH/D/model.json",
+      "exported_json_sha256": "408911d3b8d25fe779cd30ac0e01c5c9b0d38f7ac1dea19c6c5ff7c7dec0b5ef",
+      "exported_json_bytes": 1430627,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/BPH/D/metadata.json",
+      "n_features_in": 162,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "WBPH",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/WBPH/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "96af04917ee071441ee5654b9ea4193683485a4632393fb2a92d767047574975",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/WBPH/A/model.json",
+      "exported_json_sha256": "5e6c4f147c6e748bb02f89b0d28ecd93a7cea88f652e3eb7defac9edddcc3cc3",
+      "exported_json_bytes": 1430841,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/WBPH/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "WBPH",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/WBPH/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "57221681f1c4fc7be7f4bdf781aeb934935987110c5fd09f1ae46ca25cf6d096",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/WBPH/D/model.json",
+      "exported_json_sha256": "eb0f0f9f7fba98f34e4d4090021d551f678cdf2a3b2dcf70540501be0a3af3b5",
+      "exported_json_bytes": 1439498,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/WBPH/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "bacterial_blight",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/bacterial_blight/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "7fa047923851481efb69a7ed709a23040a05fdf4f048552f2d2932208c86cf49",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/bacterial_blight/A/model.json",
+      "exported_json_sha256": "116c67005fad3d481ff5508d3083ebd8d3c31a7397bf47748b48621ed9c05890",
+      "exported_json_bytes": 1430318,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/bacterial_blight/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "bacterial_blight",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/bacterial_blight/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "eff2f11a93c7d85726f2f65e5757722527a2574a1d1e18de02e8879bc179624a",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/bacterial_blight/D/model.json",
+      "exported_json_sha256": "826b8d8b7033bb6b496e00530aa3cf09fa44c22cca36d337d6c3e4115ab1bc00",
+      "exported_json_bytes": 1446118,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/bacterial_blight/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "blast",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/blast/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "0b7abeb8e30512c61cf4a31d1c9879732fe71e5752e88ed54ceb596359e5891e",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/blast/A/model.json",
+      "exported_json_sha256": "80d6ef6b5fa439bbe0b8f578051bd523f814d618c802d05ff09d0867b20e2d1e",
+      "exported_json_bytes": 1467912,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/blast/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "blast",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/blast/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "6a97dbc3c3e7c038718c2e675ee7513d7d056bc4fcfd26bf28b525b166a4e4cb",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/blast/D/model.json",
+      "exported_json_sha256": "f8b47aaa566bdd6005bc26e6b46adf41c32e91c63933f492cb846fc6439aa0d8",
+      "exported_json_bytes": 1438606,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/blast/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "brown_spot",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/brown_spot/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "465baad13932b1cd4df81736eb73486284e9ceb492f90285026e36f92072f4f6",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/brown_spot/A/model.json",
+      "exported_json_sha256": "2a96953e68b629b84e71fa0ab44cf8b57b1b0397f8ffa8f9820ad8b9b8ec7ef9",
+      "exported_json_bytes": 1495023,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/brown_spot/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "brown_spot",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/brown_spot/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "ad24f3e8d568c2ffc828a563c8b85721f54005018aef05ed364221e23cb9b696",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/brown_spot/D/model.json",
+      "exported_json_sha256": "79739e488ebd8455ee4a9b80830470cb5abed16b7cdb3f3faa05aeaa354802ff",
+      "exported_json_bytes": 1490103,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/brown_spot/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "rice_stem_borer_1",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/rice_stem_borer_1/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "fe94eb790b35e6fb50d834499765186264c5a6115a3f8cd79a83749d4e1ba723",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_1/A/model.json",
+      "exported_json_sha256": "2d2e2c0a6bd14a6dca183e1c68ff05cd2b81a1c0b56295739311bf5e876001e9",
+      "exported_json_bytes": 1439278,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_1/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "rice_stem_borer_1",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/rice_stem_borer_1/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "7ffb6910279669ec81fdf6ac7b057d496157f02e0a9d9f4f22b361fd0ab93b4a",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_1/D/model.json",
+      "exported_json_sha256": "2fd520b035b497302668586391fe4c266f590dd13fbdcc7e653774052844f837",
+      "exported_json_bytes": 1403011,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_1/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "rice_stem_borer_2",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/rice_stem_borer_2/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "0486b11ac08a184ad7728b96457a1e4e17859ba199bdc3432fd5698891a72b87",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_2/A/model.json",
+      "exported_json_sha256": "59ffbfa33087bc0d38c5afc710859a26f5397c833cd5e434d4259521cccba442",
+      "exported_json_bytes": 1432310,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_2/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "rice_stem_borer_2",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/rice_stem_borer_2/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "1f6f65d001a419aac42a812da05dac4856992aca4cb16de50750ea0edf8c4d82",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_2/D/model.json",
+      "exported_json_sha256": "011b6b4cdee362e567021205d74ea9de2510cd34ee19c7a5b0a5888d80c7c362",
+      "exported_json_bytes": 1424814,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/rice_stem_borer_2/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "sheath_blight",
+      "branch": "A",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/sheath_blight/A_ckpt/event_xgb_w28_lead14-45_A.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "afc1c99d6fc972e160462e24d80bc720d628b41f0b7d275dad8d4e25c0442de2",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/sheath_blight/A/model.json",
+      "exported_json_sha256": "3264367495e624833a5b390a3e7403a22ed64eb4a76b96d8d31b8d04ebcf0e93",
+      "exported_json_bytes": 1385455,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/sheath_blight/A/metadata.json",
+      "n_features_in": 211,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    },
+    {
+      "pest": "sheath_blight",
+      "branch": "D",
+      "source_checkpoint": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/_work/api_handoff_transformer/assets/stage1/sheath_blight/D_ckpt/event_xgb_w28_lead14-45_D.pt",
+      "source_zip_sha256": "665e1b85769d45d27e5e7ed0a9c8b9f686068bf88d9397d3e9388be18a0446b4",
+      "source_checkpoint_sha256": "efad76f4c00caa619d58d4886c2a03a82c2e42b046e687ff099b0bf09986dbad",
+      "load_ok": true,
+      "model_class": "xgboost.sklearn.XGBClassifier",
+      "exported_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/sheath_blight/D/model.json",
+      "exported_json_sha256": "4e69e31228a30fc6467c563ede4927529a03d81eaaee38e1d673b8fb667ca8af",
+      "exported_json_bytes": 1403803,
+      "status": "ok",
+      "metadata_json": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/artifacts/sheath_blight/D/metadata.json",
+      "n_features_in": 288,
+      "n_trees": 400,
+      "classes": [
+        0,
+        1
+      ],
+      "objective": "binary:logistic"
+    }
+  ]
+}

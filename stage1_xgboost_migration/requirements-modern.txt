@@ -1,0 +1,4 @@
+# Minimal deps to replay the portable Stage-1 models on a modern machine.
+# No torch, no scikit-learn pickle path: model.json is XGBoost's own format.
+xgboost>=2.0
+numpy>=1.24

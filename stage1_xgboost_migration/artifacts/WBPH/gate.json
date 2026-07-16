@@ -1,0 +1,24 @@
+{
+  "schema_version": "stage1-xgb-gate/1.0.0",
+  "pest": "WBPH",
+  "method": "dispatch_group_tau",
+  "k": 3,
+  "tau": null,
+  "tau_no": 0.725,
+  "tau_with": 0.7,
+  "target_label": "R>=0.88",
+  "resolved_from": {
+    "method_source": "configs/stage1_selected_gates.yaml : per_pest.<pest>.method",
+    "k_tau_source": "assets/stage1/WBPH/group_tau/group_tau_hybrid_summary.json : selections['R>=0.88']['dispatch_group_tau']",
+    "summary_json_sha256": "bfdb6a90db7081c2566726a19b1219ff7c892d5f03ae0e417ea59c8641c21224",
+    "note": "k/tau intentionally NOT taken from the yaml: infer/stage1.py marks the summary JSON authoritative and the yaml copy drifted."
+  },
+  "yaml_copy_for_reference": {
+    "k": 3,
+    "tau": null,
+    "tau_no": 0.725,
+    "tau_with": 0.7,
+    "drifted_vs_authoritative": false
+  },
+  "source_temperature_json_sha256": "2f1c24cee436b1b055eadeb8d8069254632b1a36259382fa26f7a88d373c9505"
+}

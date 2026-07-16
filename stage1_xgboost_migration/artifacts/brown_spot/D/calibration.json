@@ -1,0 +1,43 @@
+{
+  "schema_version": "stage1-xgb-calibration/1.0.0",
+  "pest": "brown_spot",
+  "branch": "D",
+  "calibration_method": "temperature_scaling",
+  "temperature": 4.0,
+  "applies_to": "positive-class probability, i.e. predict_proba(X)[:, 1]",
+  "formula": "p_cal = sigmoid(logit(clip(p_raw, 1e-8, 1-1e-8)) / temperature); port of infer/stage1.py::_apply_temperature",
+  "eps": 1e-08,
+  "probability_before": "raw XGBoost predict_proba(X)[:, 1]",
+  "probability_after": "calibrated probability compared against tau by the gate",
+  "source": {
+    "temperature_json": "/home/gpu4080/research/api_handoff_transformer/assets/stage1/brown_spot/temperature.json",
+    "temperature_json_sha256": "d37e0ec5920c6787e0945a9223b1768cf83720ae3d0ac6943204501daca0d68e",
+    "source_checkpoint_sha256": "ad24f3e8d568c2ffc828a563c8b85721f54005018aef05ed364221e23cb9b696",
+    "model_json_sha256": "79739e488ebd8455ee4a9b80830470cb5abed16b7cdb3f3faa05aeaa354802ff",
+    "doy_start_in_temperature_json": 60,
+    "method_in_temperature_json": "D_history"
+  },
+  "provenance": {
+    "origin": "frozen asset shipped with the API package; the API's production path (infer/stage1.py::compute_alert_single_sy via load_stage1_reference) reads this value and does NOT re-fit.",
+    "originally_fitted_by": "infer/stage1.py::_fit_temperature_grid, minimising binary NLL over a fixed grid on VAL_YEAR=2023 raw probabilities (cohort path _calibrated_per_sy).",
+    "refit_at_runtime": false,
+    "n_fit_samples": null,
+    "n_fit_samples_note": "not recorded in the shipped temperature.json and not recoverable from the checkpoint; left null rather than guessed. See reports/alert_parity_report.md."
+  },
+  "site_history_reference": {
+    "required_for_this_branch": true,
+    "path": "/home/gpu4080/research/api_handoff_transformer/assets/stage1/brown_spot/site_history.json",
+    "sha256": "0430c7759f61bbcca226cbfc1274da532481f7fa28114c98d2c5eafb9f798f0f",
+    "note": "site_history.json supplies the 11 history channels and the with_history flag that selects tau_no vs tau_with; it is a required portable asset for the D branch and for dispatch_group_tau routing."
+  },
+  "export_timestamp_utc": "2026-07-15T17:03:34.284994+00:00",
+  "source_env": {
+    "python": "3.12.3",
+    "python_full": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+    "torch": "2.12.0+cu130",
+    "xgboost": "3.3.0",
+    "scikit_learn": "1.9.0",
+    "numpy": "2.4.6",
+    "executable": "/home/gpu4080/research/cropscience/stage1_xgboost_migration/../../api_handoff_transformer/.venv/bin/python"
+  }
+}

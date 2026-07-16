@@ -1,0 +1,24 @@
+{
+  "schema_version": "stage1-xgb-gate/1.0.0",
+  "pest": "bacterial_blight",
+  "method": "D_history",
+  "k": 3,
+  "tau": 0.525,
+  "tau_no": null,
+  "tau_with": null,
+  "target_label": "R>=0.88",
+  "resolved_from": {
+    "method_source": "configs/stage1_selected_gates.yaml : per_pest.<pest>.method",
+    "k_tau_source": "assets/stage1/bacterial_blight/group_tau/group_tau_hybrid_summary.json : selections['R>=0.88']['D_raw_global']",
+    "summary_json_sha256": "4e6550c043eb1c2dc85902be7279980257030973ff01a2d166e17afef8f55d32",
+    "note": "k/tau intentionally NOT taken from the yaml: infer/stage1.py marks the summary JSON authoritative and the yaml copy drifted."
+  },
+  "yaml_copy_for_reference": {
+    "k": 1,
+    "tau": 0.575,
+    "tau_no": null,
+    "tau_with": null,
+    "drifted_vs_authoritative": true
+  },
+  "source_temperature_json_sha256": "886309bc0c0ebb685864db0393f42f3b0868f1682d939a276c16f88a4d5b5eac"
+}
