@@ -1,0 +1,24 @@
+{
+  "schema_version": "stage1-xgb-gate/1.0.0",
+  "pest": "rice_stem_borer_2",
+  "method": "D_history",
+  "k": 3,
+  "tau": 0.575,
+  "tau_no": null,
+  "tau_with": null,
+  "target_label": "R>=0.88",
+  "resolved_from": {
+    "method_source": "configs/stage1_selected_gates.yaml : per_pest.<pest>.method",
+    "k_tau_source": "assets/stage1/rice_stem_borer_2/group_tau/group_tau_hybrid_summary.json : selections['R>=0.88']['D_raw_global']",
+    "summary_json_sha256": "2f2b1332862add791afbc1830d0b2e5e058bab814814396447d61cb3238dc938",
+    "note": "k/tau intentionally NOT taken from the yaml: infer/stage1.py marks the summary JSON authoritative and the yaml copy drifted."
+  },
+  "yaml_copy_for_reference": {
+    "k": 3,
+    "tau": 0.575,
+    "tau_no": null,
+    "tau_with": null,
+    "drifted_vs_authoritative": false
+  },
+  "source_temperature_json_sha256": "5a2a767d6cce115e59676a92c6ad5246e241277b555f890dd43b30d46c85f24b"
+}

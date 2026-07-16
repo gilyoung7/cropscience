@@ -1,0 +1,24 @@
+{
+  "schema_version": "stage1-xgb-gate/1.0.0",
+  "pest": "sheath_blight",
+  "method": "dispatch_group_tau",
+  "k": 3,
+  "tau": null,
+  "tau_no": 0.55,
+  "tau_with": 0.55,
+  "target_label": "R>=0.88",
+  "resolved_from": {
+    "method_source": "configs/stage1_selected_gates.yaml : per_pest.<pest>.method",
+    "k_tau_source": "assets/stage1/sheath_blight/group_tau/group_tau_hybrid_summary.json : selections['R>=0.88']['dispatch_group_tau']",
+    "summary_json_sha256": "8be5e721163f2acd568dbc5e52a0c0e615281666336cff4d2b494f389ca6b1c5",
+    "note": "k/tau intentionally NOT taken from the yaml: infer/stage1.py marks the summary JSON authoritative and the yaml copy drifted."
+  },
+  "yaml_copy_for_reference": {
+    "k": 3,
+    "tau": null,
+    "tau_no": 0.55,
+    "tau_with": 0.55,
+    "drifted_vs_authoritative": false
+  },
+  "source_temperature_json_sha256": "d62fd95de9ac03451e9e7803ba51e2ce36106e24b40a170cd1d5d4d889f4c7be"
+}

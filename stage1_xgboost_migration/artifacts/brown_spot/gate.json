@@ -1,0 +1,24 @@
+{
+  "schema_version": "stage1-xgb-gate/1.0.0",
+  "pest": "brown_spot",
+  "method": "D_history",
+  "k": 3,
+  "tau": 0.5,
+  "tau_no": null,
+  "tau_with": null,
+  "target_label": "R>=0.88",
+  "resolved_from": {
+    "method_source": "configs/stage1_selected_gates.yaml : per_pest.<pest>.method",
+    "k_tau_source": "assets/stage1/brown_spot/group_tau/group_tau_hybrid_summary.json : selections['R>=0.88']['D_raw_global']",
+    "summary_json_sha256": "61e68d8960da68346c570901e24b32b22d4ce20f0a56f260b58af1ebb89e54cf",
+    "note": "k/tau intentionally NOT taken from the yaml: infer/stage1.py marks the summary JSON authoritative and the yaml copy drifted."
+  },
+  "yaml_copy_for_reference": {
+    "k": 3,
+    "tau": 0.5,
+    "tau_no": null,
+    "tau_with": null,
+    "drifted_vs_authoritative": false
+  },
+  "source_temperature_json_sha256": "d37e0ec5920c6787e0945a9223b1768cf83720ae3d0ac6943204501daca0d68e"
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": "stage1-xgb-gate/1.0.0",
+  "pest": "blast",
+  "method": "D_history",
+  "k": 3,
+  "tau": 0.6,
+  "tau_no": null,
+  "tau_with": null,
+  "target_label": "R>=0.88",
+  "resolved_from": {
+    "method_source": "configs/stage1_selected_gates.yaml : per_pest.<pest>.method",
+    "k_tau_source": "assets/stage1/blast/group_tau/group_tau_hybrid_summary.json : selections['R>=0.88']['D_raw_global']",
+    "summary_json_sha256": "cdddc9f022df8f22b0a3a335279db026428641352456974290765f33d93eef33",
+    "note": "k/tau intentionally NOT taken from the yaml: infer/stage1.py marks the summary JSON authoritative and the yaml copy drifted."
+  },
+  "yaml_copy_for_reference": {
+    "k": 3,
+    "tau": 0.6,
+    "tau_no": null,
+    "tau_with": null,
+    "drifted_vs_authoritative": false
+  },
+  "source_temperature_json_sha256": "fd4787904de5f54fcb1ad8eb9554d805b95e11312c1af2a772ba484423a9caa7"
+}

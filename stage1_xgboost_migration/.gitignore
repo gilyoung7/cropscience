@@ -1,0 +1,16 @@
+# Checkpoints extracted from ../../api_handoff_transformer_batch_20260708.zip.
+# Never commit: these are copies of the original .pt handoff artefacts.
+_work/
+
+# Fixture inputs + reference predictions/alerts. Derived from real observation and
+# weather data whose redistribution status is not established, so they stay out of
+# git. Regenerate on the server with validate_server_parity.py +
+# validate_alert_parity.py (see README). ~2.7 MB total; move out of band.
+fixtures/
+
+# Generated parity reports. The JSON reports record every site-year of a
+# 7321-site-year cohort x 8 pests (alert_parity_report.json alone is ~21 MB), so they
+# are regenerated rather than committed. The rendered Markdown summary is small and
+# is the readable artefact, so it is kept.
+reports/*
+!reports/alert_parity_report.md
