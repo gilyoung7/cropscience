@@ -209,11 +209,19 @@ def check_required(include_fp32: bool) -> list[str]:
     return missing
 
 
-def make_archive(include_fp32: bool) -> Path:
+def make_archive(include_fp32: bool, archive_name: str | None = None) -> Path:
     dist = HERE / "dist"
     dist.mkdir(parents=True, exist_ok=True)
-    name = f"api_handoff_litert_portable{'_fp32' if include_fp32 else ''}.tar.gz"
+    name = archive_name or (
+        f"api_handoff_litert_portable{'_fp32' if include_fp32 else ''}.tar.gz")
+    if not name.endswith(".tar.gz"):
+        name += ".tar.gz"
     out = dist / name
+    if out.exists():
+        raise BuildError(
+            f"refusing to overwrite an existing archive: {out}. "
+            f"Pass --archive-name with a new name."
+        )
     exclude_names = {"dist", "tests", "build_package.py", "requirements-test.txt",
                      "__pycache__", "input", "output"}
 
@@ -238,6 +246,8 @@ def main() -> int:
     ap.add_argument("--include-fp32", action="store_true",
                     help="keep FP32 Stage-2 models (validation build; not production)")
     ap.add_argument("--archive", action="store_true", help="emit dist/*.tar.gz")
+    ap.add_argument("--archive-name", default=None,
+                    help="archive filename (refuses to overwrite an existing one)")
     ap.add_argument("--clean", action="store_true")
     args = ap.parse_args()
 
@@ -329,7 +339,7 @@ def main() -> int:
           f"configs+clim {sizes['assets_configs_bytes']+sizes['assets_climatology_bytes']:>7,} B")
 
     if args.archive:
-        arc = make_archive(args.include_fp32)
+        arc = make_archive(args.include_fp32, args.archive_name)
         print(f"archive: {arc} ({arc.stat().st_size:,} B)")
 
     print(f"built {len(manifest_models)}/{len(args.pests)} pests; {len(failures)} failed")

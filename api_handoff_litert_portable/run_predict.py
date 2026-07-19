@@ -121,13 +121,21 @@ def _first_doy_start(paths: Paths, pest: str) -> int:
     return pb.doy_start
 
 
-def run_pipeline(paths: Paths, request: dict, variant: str) -> tuple[dict, str | None]:
-    """Stage-1 -> Stage-2 -> response. Never raises for Stage-2 failures."""
+def run_pipeline(paths: Paths, request: dict, variant: str,
+                 ctx=None) -> tuple[dict, str | None]:
+    """Stage-1 -> Stage-2 -> response. Never raises for Stage-2 failures.
+
+    `ctx` is an optional per-pest asset cache (infer.batch._PestContext). When
+    given, the policy/climatology/Stage-2 model are reused instead of reloaded —
+    this is what lets batch amortize asset loading while running the EXACT same
+    code path as a single request. When None the behaviour is unchanged.
+    """
     pest, site_id, year = request["pest"], request["site_id"], int(request["year"])
     policy = load_policy(paths.configs_dir / "fallback_policy.yaml")
     pp = per_pest_policy(policy, pest)
-    climatology = compute_climatology(paths.climatology_dir, pest,
-                                      climatology_variant(policy, pest))
+    climatology = (ctx.climatology if ctx is not None
+                   else compute_climatology(paths.climatology_dir, pest,
+                                            climatology_variant(policy, pest)))
 
     diag: dict = {"stage1_backend": "xgboost_json", "stage2_backend": f"litert_{variant}"}
     run_log: list[str] = [f"pest={pest} site={site_id} year={year}",
@@ -181,7 +189,8 @@ def run_pipeline(paths: Paths, request: dict, variant: str) -> tuple[dict, str |
         return build_response(request, None, climatology, policy, diag, err,
                              _backends(variant)), err
     try:
-        model = Stage2Model(pest, paths.stage2_dir, variant=variant)
+        model = ctx.model if ctx is not None else Stage2Model(
+            pest, paths.stage2_dir, variant=variant)
         diag.update({"d_in": model.md.d_in, "T_full_season": model.md.T,
                      "doy_start": model.md.doy_start, "doy_end": model.md.doy_end,
                      "sigma_days": model.sigma, "ckpt_loaded": True})
@@ -193,7 +202,13 @@ def run_pipeline(paths: Paths, request: dict, variant: str) -> tuple[dict, str |
             cols = [c for c in ("days_since_growing_start", "days_until_growing_end",
                                 "is_growing") if c in model.md.base_channels]
             pheno_rows = obs.rows(site_id, year)[["obs_doy"] + cols].to_dict("records")
-        out = model.predict(weather.frame, pest, int(alert_for_build),
+        # Stage-2's tensor builder is per-site by contract and rejects a
+        # multi-site frame. The daily input may legitimately hold many sites
+        # (a batch run, or the full master handed to a single request), so
+        # filter to this site first — the deployed API does the same via
+        # load_input_daily(site_id=...) / _daily_year_from_frame.
+        site_daily = weather.daily(site_id, year)
+        out = model.predict(site_daily, pest, int(alert_for_build),
                             dispatch_override, site_d, pheno_rows, year)
     except Exception as e:  # Stage-2 never propagates — matches the deployed contract
         err = f"Stage-2 failed for pest={pest}: {type(e).__name__}: {e}"
@@ -260,12 +275,49 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--stage2-variant", choices=VARIANTS, default=DEFAULT_VARIANT,
                     help=f"Stage-2 model precision (default: {DEFAULT_VARIANT})")
+    ap.add_argument("--representative-sites", default=None,
+                    help="path to representative_site_ids_2002_2024.csv (batch mode)")
     args = ap.parse_args(argv)
 
     paths = Paths.from_root(PKG_ROOT, args.input_dir, args.output_dir)
     req_path = paths.input_dir / "request.json"
     if not req_path.is_file():
         check_input_files(paths, None)
+
+    # Peek at `mode` BEFORE single-mode validation, exactly as the deployed API
+    # does (run_predict.py:792-797) — batch has its own request schema, so
+    # validating it as a single request would reject it with a misleading
+    # "site_id must be a non-empty string".
+    try:
+        raw_request = json.loads(req_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        fail(f"request.json is not valid JSON: {type(e).__name__}: {e}")
+    if not isinstance(raw_request, dict):
+        fail("request.json must contain a JSON object")
+
+    if str(raw_request.get("mode", "single")).lower() == "batch":
+        from infer.batch import run_batch
+
+        variant = str(raw_request.get("stage2_variant") or args.stage2_variant)
+        if variant not in VARIANTS:
+            fail(f"invalid stage2_variant {variant!r}; must be one of {list(VARIANTS)}")
+        if args.representative_sites and not raw_request.get("representative_sites_path"):
+            raw_request["representative_sites_path"] = args.representative_sites
+        # Batch needs EITHER a rep-CSV selection (pest+year) OR a generic input_csv.
+        if raw_request.get("input_csv") is None and (
+            raw_request.get("pest") is None or raw_request.get("year") is None
+        ):
+            fail(
+                "batch request is missing its input specification. Supply either:\n"
+                "  (a) representative-site batch: \"pest\" and \"year\" (plus optional "
+                "\"representative_sites_path\"), or\n"
+                "  (b) generic CSV batch: \"input_csv\" pointing at a CSV with columns "
+                "pest,site_id,year[,alert_tstar_doy].\n"
+                f"  got keys: {sorted(raw_request)}",
+                code=2,
+            )
+        return run_batch(paths, raw_request, run_pipeline, variant)
+
     try:
         request = load_request(req_path)
     except RequestError as e:

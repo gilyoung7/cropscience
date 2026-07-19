@@ -100,10 +100,27 @@ metadata. No existing field is removed, renamed or re-typed.
 
 ### Batch
 
-**Not implemented in this package.** The deployed `infer/batch.py` needs the
-880-representative-site CSV and emits a different summary schema; it is out of
-scope for this step. Loop `run_predict.py` per site, or see the report §"next
-steps" for wiring it.
+Two shapes, both via `request.json` (see `examples/`):
+
+```jsonc
+// (a) generic CSV — mixed pests/sites/years, input row order preserved
+{"mode":"batch","input_csv":"rows.csv","stage2_variant":"fp16","include_diagnostics":false}
+
+// (b) representative sites — the deployed contract: ONE pest + ONE year
+{"mode":"batch","pest":"BPH","year":2004,
+ "representative_sites_path":"/path/to/representative_site_ids_2002_2024.csv",
+ "max_sites":50}
+```
+
+`rows.csv` needs `pest,site_id,year` (optional `alert_tstar_doy`).
+
+Outputs `predictions.csv` (the 16 single-mode columns + `status,error_reason`
+[+ 9 diagnostics columns; generic mode also prefixes `row_index`]),
+`response.json` (batch summary) and `run_log.txt`.
+
+A bad row never aborts the batch — it becomes an error row. A bad *request*
+(missing CSV, missing column, unknown pest) fails the whole batch with exit 2,
+still writing all three files. Details: `analysis/BATCH_IMPLEMENTATION_REPORT.md`.
 
 ## What you must still supply
 

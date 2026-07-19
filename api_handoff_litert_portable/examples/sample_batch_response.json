@@ -1,0 +1,53 @@
+{
+  "mode": "batch",
+  "input_kind": "representative_sites",
+  "model_version": "v0-transformer-real-ckpt",
+  "stage2_variant": "fp16",
+  "requested_count": 6,
+  "success_count": 6,
+  "fallback_count": 0,
+  "error_count": 0,
+  "elapsed_seconds": 0.85,
+  "results": [
+    {
+      "row_index": 0,
+      "pest": "BPH",
+      "site_id": "29608_53769",
+      "year": 2004,
+      "status": "success",
+      "error_reason": "",
+      "final_source": "learned_stage2",
+      "final_mu_doy": 224.97,
+      "final_pi95": {
+        "lower_doy": 215,
+        "upper_doy": 235,
+        "sigma_days": 5.0
+      },
+      "learned_mu_doy": 224.97,
+      "alert_tstar_doy": 173
+    },
+    {
+      "row_index": 1,
+      "pest": "BPH",
+      "site_id": "29851_55024",
+      "year": 2004,
+      "status": "success",
+      "error_reason": "",
+      "final_source": "learned_stage2",
+      "final_mu_doy": 229.07,
+      "final_pi95": {
+        "lower_doy": 219,
+        "upper_doy": 239,
+        "sigma_days": 5.0
+      },
+      "learned_mu_doy": 229.07,
+      "alert_tstar_doy": 176
+    }
+  ],
+  "pest": "BPH",
+  "pest_korean": "벼멸구",
+  "year": 2004,
+  "representative_site_count": 856,
+  "year_available_site_count": 6,
+  "recommended_source": "learned_stage2"
+}

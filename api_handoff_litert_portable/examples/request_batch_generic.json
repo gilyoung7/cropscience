@@ -1,0 +1,6 @@
+{
+  "mode": "batch",
+  "input_csv": "examples/batch_rows.csv",
+  "stage2_variant": "fp16",
+  "include_diagnostics": false
+}

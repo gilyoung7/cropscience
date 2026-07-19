@@ -1,0 +1,7 @@
+pest,site_id,year,model_version,final_source,final_mu_doy,final_pi95_lower,final_pi95_upper,learned_mu_doy,learned_selected_offset,learned_output_status,climatology_mu_doy,climatology_variant,recommended_source,fallback_triggered,alert_tstar_doy,status,error_reason
+BPH,29608_53769,2004,v0-transformer-real-ckpt,learned_stage2,224.97,215,235,224.97,30,main,147.55,mean_mid,learned_stage2,False,173,success,
+BPH,29851_55024,2004,v0-transformer-real-ckpt,learned_stage2,229.07,219,239,229.07,30,main,147.55,mean_mid,learned_stage2,False,176,success,
+BPH,30144_56664,2004,v0-transformer-real-ckpt,learned_stage2,240.74,231,251,240.74,30,main,147.55,mean_mid,learned_stage2,False,169,success,
+BPH,30236_55575,2004,v0-transformer-real-ckpt,learned_stage2,230.08,220,240,230.08,30,main,147.55,mean_mid,learned_stage2,False,177,success,
+BPH,30247_65595,2004,v0-transformer-real-ckpt,learned_stage2,222.64,213,232,222.64,30,main,147.55,mean_mid,learned_stage2,False,171,success,
+BPH,30304_62145,2004,v0-transformer-real-ckpt,learned_stage2,243.57,234,253,243.57,30,main,147.55,mean_mid,learned_stage2,False,188,success,

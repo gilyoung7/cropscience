@@ -1,0 +1,16 @@
+run_predict.py log (Stage-1 XGBoost JSON + Stage-2 LiteRT — BATCH mode)
+timestamp_utc: 2026-07-19T17:56:18+00:00
+model_version: v0-transformer-real-ckpt
+request: {"mode": "batch", "pest": "BPH", "year": 2004, "representative_sites_path": "/Users/doyoung-gil/연구실/데이터/관측소 메타데이터/representative_site_ids_2002_2024.csv", "max_sites": 6}
+
+NOTE: per-pest assets (Stage-2 LiteRT model + normalization, Stage-1 A/D
+Booster models, gate.json, site_history.json, climatology) are loaded once
+per pest and reused across rows — no per-row reload.
+
+events:
+  - BATCH pest=BPH (rep-name=벼멸구) year=2004 include_diagnostics=False
+  - representative_sites_path=/Users/doyoung-gil/연구실/데이터/관측소 메타데이터/representative_site_ids_2002_2024.csv
+  - representative_site_count=856
+  - year_available_site_count=6 requested_count=6
+  - ASSET LOAD (once) for pest=BPH
+  - per-row loop done: success=6 fallback=0 error=0 elapsed_seconds=0.85
