@@ -1,5 +1,20 @@
 # Test-only dependencies (NOT installed in production).
-# The parity tests compare against the reference API and the migration assets,
-# which need torch/scikit-learn; production never does.
+#
+#   python -m pip install -r requirements-test.txt
+#   pytest -q
+#
+# Production installs requirements-runtime.txt only — pytest and scikit-learn
+# never reach a deployed environment.
+
 -r requirements-runtime.txt
-scikit-learn==1.6.1   # only for the Booster-vs-XGBClassifier equivalence test
+
+# Test runner. The suite uses only long-stable API (tmp_path, monkeypatch,
+# parametrize, raises, and custom markers declared in pytest.ini), so a range
+# rather than a pin. Verified on 9.1.1; lower bound is 8.0.
+pytest>=8.0,<10.0
+
+# Only for the Booster-vs-XGBClassifier equivalence test in
+# tests/test_stage1_portable.py. Pinned deliberately: XGBClassifier.load_model
+# raises "TypeError: _estimator_type undefined" under xgboost 2.1.4 with newer
+# scikit-learn, which would break that comparison.
+scikit-learn==1.6.1

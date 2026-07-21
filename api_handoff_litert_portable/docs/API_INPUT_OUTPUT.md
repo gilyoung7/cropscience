@@ -4,7 +4,13 @@
 
 이 문서는 추측이 아니라 현재 구현된 코드에서 직접 확인한 내용입니다. 근거 위치를
 각 항목에 표기했습니다 (`schemas.py`, `run_predict.py`, `infer/batch.py`,
-`infer/cohort.py`, `infer/fallback.py`, `assets/configs/fallback_policy.yaml`).
+`infer/cohort.py`, `infer/inputs.py`, `infer/fallback.py`,
+`assets/configs/fallback_policy.yaml`).
+
+> **문서 역할 분담**
+> [`../README.md`](../README.md) — 설치부터 첫 실행까지의 빠른 시작.
+> 이 문서 — 요청 필드, 출력 컬럼, fallback 사례, 운영 상세의 전체 레퍼런스.
+> 빠른 시작만 필요하면 README로 충분합니다.
 
 ---
 
@@ -112,6 +118,7 @@ python run_predict.py --input-dir IN --output-dir OUT \
 | `long_observation_path` | string | 선택 | Layout A → Layout B | LONG 관측 CSV 경로 |
 | `max_sites` | int | 선택 | 없음(전체) | 연도별 상한. 운영/테스트용 |
 | `include_diagnostics` | bool | 선택 | `false` | 행별 진단 컬럼 추가 |
+| `stage2_variant` | string | 선택 | `fp16` | `fp16` \| `fp32`. **`--stage2-variant`보다 우선** (`run_predict.py:425`). fp32는 `--include-fp32` 빌드에만 존재 |
 | `overwrite` | bool | 선택 | `false` | 기존 결과 덮어쓰기 허용 |
 | `unique_output_subdir` | bool | 선택 | `false` | 요청별 고유 출력 하위 폴더 생성 |
 
@@ -123,9 +130,34 @@ python run_predict.py --input-dir IN --output-dir OUT \
 |---|---|---|---|
 | `mode` | string | **필수** | `"batch"` |
 | `input_csv` | string | **필수** | `pest,site_id,year[,alert_tstar_doy]` 컬럼 CSV |
+| `stage2_variant` | string | 선택 | `fp16` \| `fp32` |
 
 generic 모드는 코호트 pre-pass를 쓰지 않고 행 단위로 처리합니다
 (`batch.run_batch`의 `if not generic` 분기).
+
+`input_csv`는 다른 경로 필드와 **동일한 규칙**으로 해석됩니다 — 절대경로는 그대로,
+상대경로는 CWD → `--input-dir` → 패키지 루트 순 (`batch.resolve_input_csv`).
+
+#### 행 단위 필드 상속
+
+최상위 요청의 다음 필드는 각 행에 상속됩니다 (`batch.INHERITED_ROW_FIELDS`):
+
+`daily_weather_path`, `long_observation_path`, `representative_sites_path`,
+`stage2_variant`, `include_diagnostics`
+
+**행에 같은 이름의 컬럼이 있으면 행 값이 우선**하고, 없거나 빈 셀이면 최상위 값을
+씁니다 (`batch._inherit_request_fields`). 빈 셀은 pandas에서 `NaN`으로 오므로
+"값 없음"으로 정규화됩니다.
+
+```csv
+pest,site_id,year,long_observation_path
+BPH,33210_56298,2004,                                  # 최상위 값 상속
+WBPH,33908_67063,2011,/srv/pest/assets/LONG_by_pest/RICE_LONG_WBPH.csv
+```
+
+행이 `stage2_variant`를 덮어쓰면 그 행은 해당 정밀도의 Stage-2 모델로 실행됩니다.
+컨텍스트 캐시가 `(pest, variant)`로 키잉되어 있어 변형별 모델이 각각 한 번만
+로드됩니다.
 
 ### 1-3. 날짜 표기 — DOY인가 날짜 문자열인가
 
@@ -230,7 +262,30 @@ diagnostics : {...}                                ← include_diagnostics=true 
 | `final_prediction.selected_offset` | int \| null | learned일 때만 값 |
 | `final_prediction.fallback_triggered` | bool | learned 권장인데 learned가 없을 때 true |
 
-### 2-2. `predictions.csv` — 16 + 2 컬럼
+### 2-2. `predictions.csv` — 한 행이 의미하는 것
+
+**한 행 = 하나의 `site_id` × 하나의 대상 연도.**
+
+한 번의 batch 요청은 **병해충 1종**을 처리하고, 그 병해충의 대표 site마다 한 행을
+생성합니다.
+
+| 요청 | 대표 site | 행 수 | 실측 |
+|---|---:|---:|---|
+| `"year": 2004` | 858 | **858** | success 134 + fallback 724 |
+| `"start_year": 2023, "end_year": 2024` | 858 | **1716** (858 × 2) | 2023년 858행 + 2024년 858행 |
+| `"as_of_date": "2004-08-10"` | 858 | **858** | 아직 평가 불가한 site는 fallback 행 |
+
+- **fallback site도 제거하지 않고 행으로 남깁니다.** 경보가 없거나, 운영상 아직
+  이르거나, 결측 때문에 보류된 site는 climatology 값이 채워진 행이 됩니다.
+  858개를 요청하면 결과도 858행입니다 — 행이 줄어들면 그것이 이상 신호입니다.
+- 여러 연도 요청은 site가 연도마다 반복되므로 고유 `site_id` 수는 그대로 858입니다.
+- `max_sites`를 주면 연도별로 그 수만큼 잘립니다(운영/테스트용).
+- generic CSV batch(`input_csv`)는 입력 CSV의 행 수·순서를 그대로 따릅니다.
+
+행 수가 예상과 다르면 `run_log.txt`의
+`year_available_site_count` / `requested_count`를 확인하세요.
+
+### 2-2-1. 컬럼 — 16 + 2
 
 근거: `schemas.FLAT_COLS`, `batch.write_predictions_csv`
 
@@ -637,6 +692,90 @@ done
 wait
 # → /srv/pest/out/<날짜>/BPH_<날짜>_<UTC타임스탬프>_pid<PID>/ ... 4벌 모두 보존
 ```
+
+### 여러 연도 batch (historical, 평가용)
+
+프로젝트의 분할 경계(2002–2022 / 2023 / 2024)를 한 번에 재현할 때 씁니다.
+
+```bash
+ASSETS=/srv/pest/assets
+REQ=/tmp/req_span; OUT=/tmp/out_span; mkdir -p $REQ $OUT
+
+cat > $REQ/request.json <<EOF
+{"mode": "batch",
+ "pest": "sheath_blight",
+ "start_year": 2023,
+ "end_year": 2024,
+ "daily_weather_path": "$ASSETS/daily_weather.csv",
+ "long_observation_path": "$ASSETS/LONG_by_pest/RICE_LONG_sheath_blight.csv",
+ "representative_sites_path": "$ASSETS/representative_site_ids_2002_2024.csv"}
+EOF
+
+python run_predict.py --input-dir $REQ --output-dir $OUT
+wc -l $OUT/predictions.csv        # 1717 = 헤더 1 + 858 site × 2 연도
+```
+
+daily 마스터는 요청당 **한 번만** 스캔되며, 요청한 모든 연도를 한 번에 걸러냅니다
+(`cohort.load_daily_cohort`). 연도를 늘려도 마스터를 다시 읽지 않습니다.
+
+### 동일 output-dir 충돌 시 동작
+
+```bash
+OUT=/tmp/out_collide; mkdir -p $OUT
+python run_predict.py --input-dir $REQ --output-dir $OUT   # 1회차 → exit 0
+python run_predict.py --input-dir $REQ --output-dir $OUT   # 2회차 → exit 1
+```
+
+2회차 출력:
+
+```
+[run_predict] ERROR: output directory already contains results: response.json, predictions.csv, run_log.txt
+  dir: /tmp/out_collide
+  Refusing to overwrite — another request may have written these.
+  Choose one:
+    * point --output-dir at a fresh directory (recommended for concurrent runs), or
+    * pass --unique-output-subdir (or "unique_output_subdir": true) to auto-create a per-run subfolder, or
+    * pass --overwrite (or "overwrite": true) to replace them.
+```
+
+**거부된 실행은 아무것도 쓰지 않습니다** — 1회차 결과는 그대로 보존됩니다
+(실측: `predictions.csv` SHA-256 불변).
+
+동시 실행이면 메시지가 달라집니다. 세 프로세스가 빈 디렉터리를 동시에 봐도
+`.run_claim` 선점 덕분에 **1건만 통과하고 2건은 exit 1**입니다.
+
+```
+[run_predict] ERROR: output directory is claimed by another run (pid=12345 ...).
+```
+
+### 여러 병해충 동시 실행 (`--unique-output-subdir`)
+
+```bash
+ASSETS=/srv/pest/assets
+TODAY=$(date +%F)
+OUT=/srv/pest/out/$TODAY; mkdir -p $OUT
+
+for PEST in BPH WBPH sheath_blight; do
+  REQ=/srv/pest/runs/$TODAY/$PEST; mkdir -p $REQ
+  cat > $REQ/request.json <<EOF
+{"mode": "batch", "pest": "$PEST", "as_of_date": "$TODAY",
+ "daily_weather_path": "$ASSETS/daily_weather.csv",
+ "long_observation_path": "$ASSETS/LONG_by_pest/RICE_LONG_$PEST.csv",
+ "representative_sites_path": "$ASSETS/representative_site_ids_2002_2024.csv"}
+EOF
+  python run_predict.py --input-dir $REQ --output-dir $OUT --unique-output-subdir &
+done
+wait
+
+ls $OUT
+# BPH_20260722_20260722T041121268219_pid1940846
+# WBPH_20260722_20260722T041121267409_pid1940847
+# sheath_blight_20260722_20260722T041121268809_pid1940848
+```
+
+폴더명은 `<pest>_<시간지정>_<UTC타임스탬프(마이크로초)>_pid<PID>`이며, 시간지정의
+하이픈은 제거됩니다(`2026-07-22` → `20260722`, `inputs.unique_run_dir`).
+같은 마이크로초에 시작해도 PID가 달라 충돌하지 않습니다. 3벌 모두 보존됩니다.
 
 ### 하지 말아야 할 것
 

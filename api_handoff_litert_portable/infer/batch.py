@@ -116,6 +116,68 @@ def representative_sites(rep_csv: Path, pest: str) -> list[str]:
     return sorted(dict.fromkeys(sites.tolist()))
 
 
+def resolve_input_csv(explicit: str, input_dir: Path, pkg_root: Path) -> Path:
+    """Resolve the generic-batch CSV. Same rule as resolve_rep_csv.
+
+    Absolute paths are used as given; relative paths are tried against the
+    caller's cwd, then --input-dir, then the package root. Previously this file
+    alone was resolved with a bare `Path(...)`, so a relative name only worked
+    when the process happened to run from the right directory.
+    """
+    p = Path(explicit).expanduser()
+    candidates = ([p] if p.is_absolute()
+                  else [Path.cwd() / p, input_dir / p, pkg_root / p])
+    for c in candidates:
+        if c.is_file():
+            return c
+    raise BatchRequestError(
+        f"batch input_csv not found: {explicit}. Tried: "
+        + ", ".join(str(c) for c in candidates)
+    )
+
+
+# Request-level settings a generic-batch row inherits when it does not carry
+# its own. Without this the per-row request was rebuilt from scratch, so a
+# top-level daily_weather_path / long_observation_path never reached the
+# pipeline and every row failed with "daily weather CSV not found".
+INHERITED_ROW_FIELDS = (
+    "daily_weather_path",
+    "long_observation_path",
+    "representative_sites_path",
+    "stage2_variant",
+    "include_diagnostics",
+)
+
+
+def _inherit_request_fields(req: dict, raw_request: dict, raw_row: dict) -> None:
+    """Fill `req` from the row first, then the top-level request.
+
+    A value on the row always wins, so a mixed-pest CSV can point individual
+    rows at their own LONG file while the rest inherit one shared master.
+    Blank CSV cells ("", "nan") count as absent — pandas gives every column a
+    value for every row, so an empty cell must not shadow the request default.
+    """
+    for key in INHERITED_ROW_FIELDS:
+        row_val = raw_row.get(key)
+        # An empty CSV cell reaches us as float NaN even with dtype=str, so a
+        # bare `is not None` test would hand NaN to Path() further down.
+        if row_val is not None and not isinstance(row_val, (str, bool, int)):
+            row_val = None if pd.isna(row_val) else str(row_val)
+        if isinstance(row_val, str):
+            row_val = row_val.strip()
+            if row_val.lower() in ("", "nan", "none"):
+                row_val = None
+        if row_val is not None:
+            req[key] = row_val
+        elif raw_request.get(key) is not None:
+            req[key] = raw_request[key]
+    # CSV cells arrive as strings, and a non-empty string is always truthy --
+    # "false" would switch diagnostics ON. Coerce this one back to a real bool.
+    v = req.get("include_diagnostics")
+    if isinstance(v, str):
+        req["include_diagnostics"] = v.strip().lower() in ("1", "true", "yes", "y")
+
+
 def load_generic_rows(input_csv: Path) -> list[dict]:
     """Read a generic batch CSV. Row order is preserved.
 
@@ -380,7 +442,7 @@ def _prepare_cohort(paths: Paths, pest: str, year: int, sites: list[str],
     ctx.cohort_daily_by_site = daily_by_site
     log.append(f"cohort pre-pass done in {_t.perf_counter() - t0:.1f}s "
                f"(Stage-2 will run for {len(alerts)} alerted site-years)")
-    return {pest: ctx}
+    return {(pest, variant): ctx}
 
 
 def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
@@ -411,8 +473,10 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
     # ---- build the work list -------------------------------------------
     try:
         if generic:
-            rows_in = load_generic_rows(Path(raw_request["input_csv"]))
-            log.append(f"BATCH generic input_csv={raw_request['input_csv']} "
+            csv_path = resolve_input_csv(
+                str(raw_request["input_csv"]), paths.input_dir, paths.pkg_root)
+            rows_in = load_generic_rows(csv_path)
+            log.append(f"BATCH generic input_csv={csv_path} "
                        f"rows={len(rows_in)} include_diagnostics={include_diag}")
         else:
             pest = normalize_pest(raw_request.get("pest"))
@@ -539,7 +603,10 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
     rows: list[dict] = []
     results: list[dict] = []
     counts = {"success": 0, "fallback": 0, "error": 0}
-    ctx_cache: dict[str, _PestContext] = {}
+    # Keyed by (pest, variant): a generic-batch row may override stage2_variant,
+    # and each variant needs its own Stage2Model. Carrying the field without
+    # keying on it would make a row-level override silently inert.
+    ctx_cache: dict[tuple[str, str], _PestContext] = {}
 
     # ---- cohort pre-pass: ONE daily-master scan + ONE vectorized Stage-1 ------
     # This is the training/evaluation data flow (phase_r_oracle_iou.
@@ -579,19 +646,32 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
                 raise BatchRequestError(
                     f"invalid year {raw_row.get('year')!r}; must be an integer") from None
 
-            if row_pest not in ctx_cache:
-                ctx_cache[row_pest] = _PestContext(paths, row_pest, policy, variant)
-                log.append(f"ASSET LOAD (once) for pest={row_pest}")
-            ctx = ctx_cache[row_pest]
-            clim_for_row = ctx.climatology
-
+            # Build the per-row request FIRST: the inherited fields decide which
+            # Stage-2 variant this row needs, so the context cannot be chosen
+            # before they are resolved.
             req = {"pest": row_pest, "site_id": site, "year": row_year,
                    "include_diagnostics": include_diag}
+            _inherit_request_fields(req, raw_request, raw_row)
             alert = raw_row.get("alert_tstar_doy")
             if alert not in (None, "", "nan"):
                 req["alert_tstar_doy"] = int(float(alert))
 
-            resp, err = run_row(paths, req, variant, ctx)
+            from .stage2_litert import VARIANTS as VARIANT_NAMES
+
+            row_variant = str(req.get("stage2_variant") or variant)
+            if row_variant not in VARIANT_NAMES:
+                raise BatchRequestError(
+                    f"invalid stage2_variant {row_variant!r}; must be one of "
+                    f"{sorted(VARIANT_NAMES)}")
+            ck = (row_pest, row_variant)
+            if ck not in ctx_cache:
+                ctx_cache[ck] = _PestContext(paths, row_pest, policy, row_variant)
+                log.append(f"ASSET LOAD (once) for pest={row_pest} "
+                           f"variant={row_variant}")
+            ctx = ctx_cache[ck]
+            clim_for_row = ctx.climatology
+
+            resp, err = run_row(paths, req, row_variant, ctx)
             status, reason = classify(resp["stage2"]["learned_stage2"], err)
             row = flatten_response(resp)
             row["status"] = status
@@ -656,7 +736,8 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
         # fallback row is filled from, so the summary is self-describing.
         clim = None
         if pest:
-            ctx_for_clim = ctx_cache.get(pest)
+            ctx_for_clim = next((c for (p_, _v), c in ctx_cache.items()
+                             if p_ == pest), None)
             clim = (ctx_for_clim.climatology if ctx_for_clim is not None
                     else compute_climatology(paths.climatology_dir, pest,
                                              climatology_variant(policy, pest)))

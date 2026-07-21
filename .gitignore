@@ -86,6 +86,9 @@ api_handoff_litert_portable/tests/_*.json
 # runtime-only venv used to prove the API needs no torch/tensorflow
 .venv-lightweight-api-test/
 
+# pytest run cache
+.pytest_cache/
+
 # --- lightweight portable API: operational safety additions -------------------
 # assets may be a real dir OR a symlink to a built copy; the slash-form rule
 # above only matches a directory, so match the bare name too.
