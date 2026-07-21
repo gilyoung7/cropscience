@@ -1,0 +1,45 @@
+{
+  "mode": "batch",
+  "input_kind": "representative_sites",
+  "model_version": "v0-transformer-real-ckpt",
+  "stage2_variant": "fp16",
+  "requested_count": 1,
+  "success_count": 0,
+  "fallback_count": 1,
+  "error_count": 0,
+  "elapsed_seconds": 6.52,
+  "results": [
+    {
+      "row_index": 0,
+      "pest": "WBPH",
+      "site_id": "33908_67063",
+      "year": 2011,
+      "status": "fallback",
+      "error_reason": "Stage-2 not yet evaluable for pest=WBPH site=33908_67063 year=2011: needs weather through DOY 216 (alert 171 + offset 45), as_of_date is DOY 201 [stage2_pending_window_not_yet_observed]",
+      "final_source": "climatology_no_alert",
+      "final_mu_doy": 203.5,
+      "final_pi95": {
+        "lower_doy": 194,
+        "upper_doy": 213,
+        "sigma_days": 5.0
+      },
+      "learned_mu_doy": null,
+      "alert_tstar_doy": null
+    }
+  ],
+  "pest": "WBPH",
+  "pest_korean": "흰등멸구",
+  "year": null,
+  "representative_site_count": 1,
+  "year_available_site_count": 1,
+  "recommended_source": "learned_stage2",
+  "climatology": {
+    "mu_doy": 203.5,
+    "pi_95": {
+      "lower_doy": 194,
+      "upper_doy": 213,
+      "sigma_days": 5.0
+    },
+    "variant": "mean_mid"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "mode": "batch",
+  "input_kind": "representative_sites",
+  "model_version": "v0-transformer-real-ckpt",
+  "stage2_variant": "fp16",
+  "requested_count": 2,
+  "success_count": 1,
+  "fallback_count": 1,
+  "error_count": 0,
+  "elapsed_seconds": 0.24,
+  "results": [
+    {
+      "row_index": 0,
+      "pest": "sheath_blight",
+      "site_id": "29851_55024",
+      "year": 2004,
+      "status": "fallback",
+      "error_reason": "Stage-2 withheld for pest=sheath_blight site=29851_55024 year=2004: column '평균기온(°C)' has a missing run inside the window [142,169] with no observed value before as_of_doy=170; the full-year run would impute it from a later observation [stage2_window_crosses_unresolved_missing_run]",
+      "final_source": "climatology",
+      "final_mu_doy": 203.66,
+      "final_pi95": {
+        "lower_doy": 194,
+        "upper_doy": 213,
+        "sigma_days": 5.0
+      },
+      "learned_mu_doy": null,
+      "alert_tstar_doy": null
+    },
+    {
+      "row_index": 1,
+      "pest": "sheath_blight",
+      "site_id": "29894_62082",
+      "year": 2004,
+      "status": "success",
+      "error_reason": "",
+      "final_source": "climatology",
+      "final_mu_doy": 203.66,
+      "final_pi95": {
+        "lower_doy": 194,
+        "upper_doy": 213,
+        "sigma_days": 5.0
+      },
+      "learned_mu_doy": 198.82,
+      "alert_tstar_doy": 124
+    }
+  ],
+  "pest": "sheath_blight",
+  "pest_korean": "잎집무늬마름병",
+  "year": null,
+  "representative_site_count": 2,
+  "year_available_site_count": 2,
+  "recommended_source": "climatology",
+  "climatology": {
+    "mu_doy": 203.66,
+    "pi_95": {
+      "lower_doy": 194,
+      "upper_doy": 213,
+      "sigma_days": 5.0
+    },
+    "variant": "mean_mid"
+  }
+}

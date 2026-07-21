@@ -1,0 +1,2 @@
+pest,site_id,year,model_version,final_source,final_mu_doy,final_pi95_lower,final_pi95_upper,learned_mu_doy,learned_selected_offset,learned_output_status,climatology_mu_doy,climatology_variant,recommended_source,fallback_triggered,alert_tstar_doy
+WBPH,33908_67063,2011,v0-transformer-real-ckpt,learned_stage2,245.82,236,256,245.82,45,main,203.5,mean_mid,learned_stage2,False,171

@@ -56,8 +56,14 @@ def validate_request(req: dict) -> dict:
 
 def build_response(request: dict, learned: dict | None, climatology: dict,
                    policy: dict, transformer_diag: dict, learned_error: str | None,
-                   backends: dict) -> dict:
-    """Port of run_predict.py:514-590, key-for-key and in emission order."""
+                   backends: dict, stage2_output_status: str | None = None) -> dict:
+    """Port of run_predict.py:514-590, key-for-key and in emission order.
+
+    `stage2_output_status` names why Stage-2 produced nothing when the reason is
+    a deliberate operational block rather than a failure. It is set ONLY by the
+    operational_daily path, so the historical/batch response stays byte-identical
+    to the deployed schema.
+    """
     pest = request["pest"]
     pp = per_pest_policy(policy, pest)
     recommended = pp.get("recommended_source", "climatology")
@@ -98,6 +104,11 @@ def build_response(request: dict, learned: dict | None, climatology: dict,
     }
     # Additive-only optional metadata (permitted by the brief). Nothing above changes.
     response["backends"] = backends
+    if learned is None and stage2_output_status:
+        # Operational block only. Carried on the stage2 block so predictions.csv
+        # can report it through the EXISTING learned_output_status column — no
+        # new column, so the CSV schema still matches the deployed API.
+        response["stage2"]["output_status"] = stage2_output_status
 
     if request.get("include_diagnostics"):
         response["diagnostics"] = {
@@ -136,7 +147,8 @@ def flatten_response(response: dict) -> dict:
         "final_pi95_upper": final["pi_95"]["upper_doy"],
         "learned_mu_doy": (learned or {}).get("mu_doy"),
         "learned_selected_offset": (learned or {}).get("selected_offset"),
-        "learned_output_status": (learned or {}).get("output_status"),
+        "learned_output_status": ((learned or {}).get("output_status")
+                                  or response["stage2"].get("output_status")),
         "climatology_mu_doy": clim["mu_doy"],
         "climatology_variant": clim["variant"],
         "recommended_source": response["stage2"]["recommended_source"],

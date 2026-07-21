@@ -38,6 +38,7 @@ from typing import Any
 import pandas as pd
 
 from .fallback import climatology_variant, compute_climatology, load_policy, per_pest_policy
+from .inputs import existing_outputs, resolve_daily, resolve_obs, write_atomic
 from .paths import MODEL_VERSION, VALID_PESTS, Paths
 from .providers import FrameWeatherProvider, LongObsProvider
 from .schemas import FLAT_COLS, flatten_response
@@ -147,6 +148,13 @@ def classify(learned: dict | None, learned_err: str | None) -> tuple[str, str]:
         return "success", ""
     if learned_err and ("fired no alert" in learned_err or "no_alert" in learned_err):
         return "fallback", learned_err
+    # Operational blocks are deliberate policy outcomes, not failures: the site
+    # is answered from climatology and the batch carries on. They are marked
+    # with an explicit status so they are never confused with a real error.
+    if learned_err and (
+            "stage2_window_crosses_unresolved_missing_run" in learned_err
+            or "stage2_pending_window_not_yet_observed" in learned_err):
+        return "fallback", learned_err
     return "error", (learned_err or "unknown Stage-2 failure")
 
 
@@ -192,11 +200,14 @@ def write_predictions_csv(path: Path, rows: list[dict], include_diag: bool,
         list(FLAT_COLS) + list(BATCH_EXTRA_COLS)
     if include_diag:
         fieldnames += list(DIAG_COLS)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k) for k in fieldnames})
+    import io
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow({k: r.get(k) for k in fieldnames})
+    write_atomic(path, buf.getvalue(), newline="")
 
 
 def write_run_log(path: Path, raw_request: dict, lines: list[str]) -> None:
@@ -217,7 +228,7 @@ def write_run_log(path: Path, raw_request: dict, lines: list[str]) -> None:
         "events:",
         *[f"  - {ln}" for ln in lines],
     ]
-    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    write_atomic(path, "\n".join(body) + "\n")
 
 
 def fail_batch(output_dir: Path, raw_request: dict, reason: str, t0: float,
@@ -227,6 +238,15 @@ def fail_batch(output_dir: Path, raw_request: dict, reason: str, t0: float,
 
     elapsed = round(time.perf_counter() - t0, 2)
     print(f"[run_predict:batch] ERROR (whole batch): {reason}", file=sys.stderr)
+    # A failed run must never replace results a previous successful run left
+    # here. If any output file already exists, keep it and report instead.
+    already = existing_outputs(output_dir)
+    if already:
+        print(
+            f"[run_predict:batch] existing results preserved ({', '.join(already)}) "
+            f"— the failure was NOT written to {output_dir}",
+            file=sys.stderr)
+        return 2
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "mode": "batch",
@@ -236,8 +256,8 @@ def fail_batch(output_dir: Path, raw_request: dict, reason: str, t0: float,
         "requested_count": 0, "success_count": 0, "fallback_count": 0,
         "error_count": 0, "elapsed_seconds": elapsed, "results": [],
     }
-    (output_dir / "response.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_atomic(output_dir / "response.json",
+                 json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     write_predictions_csv(output_dir / "predictions.csv", [], include_diag=False,
                           generic=generic)
     write_run_log(output_dir / "run_log.txt", raw_request,
@@ -247,7 +267,17 @@ def fail_batch(output_dir: Path, raw_request: dict, reason: str, t0: float,
 
 class _PestContext:
     """Per-pest assets, loaded once and reused across rows (deployed batch does
-    the same with the .pt assets)."""
+    the same with the .pt assets).
+
+    In cohort mode the context also carries, for the whole batch:
+      weather / obs  — providers over the ONE chunked pass of the daily master
+                       and the ONE read of the LONG file;
+      alert_map      — {site_id: {alert_tstar_doy, dispatch_features}} produced
+                       by a single vectorized Stage-1 pass over every site;
+      stage1_notes   — {site_id: reason} for sites Stage-1 could not evaluate.
+    When these are set, run_pipeline reuses them instead of re-reading the master
+    and re-running Stage-1 per site.
+    """
 
     def __init__(self, paths: Paths, pest: str, policy: dict, variant: str):
         from .stage2_litert import Stage2Model
@@ -257,6 +287,100 @@ class _PestContext:
         self.climatology = compute_climatology(
             paths.climatology_dir, pest, climatology_variant(policy, pest))
         self.model = Stage2Model(pest, paths.stage2_dir, variant=variant)
+        # cohort extras (None => per-row behaviour, unchanged)
+        self.weather = None
+        self.obs = None
+        self.alert_map: dict | None = None
+        self.stage1_notes: dict = {}
+
+
+def _prepare_cohort(paths: Paths, pest: str, year: int, sites: list[str],
+                    policy: dict, variant: str, include_diag: bool,
+                    log: list[str], daily_by_site: dict | None = None,
+                    obs_provider=None, years: list[int] | None = None,
+                    as_of_doy: int | None = None,
+                    request: dict | None = None) -> dict:
+    """Build the per-pest context with the cohort pre-pass already done.
+
+    `daily_by_site` is the per-site season map from the site-selection scan; it
+    is passed in so the daily master is read exactly ONCE per request. Returns
+    {pest: _PestContext} so the caller can seed its ctx cache.
+    """
+    import time as _t
+
+    from .cohort import load_daily_cohort, load_obs_for_stage1, stage1_cohort
+    from .providers import FrameWeatherProvider, LongObsProvider
+    from .stage1_portable import load_gate
+
+    t0 = _t.perf_counter()
+    daily_csv = (resolve_daily(request, paths.input_dir, paths.pkg_root)
+                 or paths.input_dir / "daily_weather.csv")
+    obs_csv = _obs_path(paths, pest, request)
+
+    if daily_by_site is None:
+        daily_by_site = load_daily_cohort(daily_csv, set(map(str, sites)), {int(year)})
+        log.append(f"cohort daily: ONE chunked pass -> {len(daily_by_site)} sites")
+    else:
+        log.append(f"cohort daily: reusing the selection scan "
+                   f"({len(daily_by_site)} sites) — master read once per request")
+    n_rows = sum(len(d) for d in daily_by_site.values())
+    log.append(f"cohort daily rows={n_rows}")
+
+    # Labels always come from load_obs_for_stage1, never from the provider's
+    # frame: it applies the YEAR_MIN..YEAR_MAX window and the int year dtype the
+    # label builder was written against (stage1.py::_load_obs_for_stage1).
+    obs_frame = load_obs_for_stage1(obs_csv)
+    log.append(f"cohort LONG: {len(obs_frame)} rows (label frame)")
+
+    ctx = _PestContext(paths, pest, policy, variant)
+
+    # Operational mode: hand Stage-2 the observed prefix only, padded to the
+    # fixed season length. The padded rows are masked out before the model sees
+    # them, so this is the same tensor a full-year run would build — see
+    # cohort.pad_daily_to_season.
+    if as_of_doy is not None:
+        from .cohort import pad_daily_to_season
+
+        md_doy_end = None
+        try:
+            md_doy_end = int(json.loads(
+                (paths.stage2_dir / pest / "metadata.json")
+                .read_text(encoding="utf-8"))["doy_end"])
+        except Exception:
+            pass
+        if md_doy_end is not None:
+            daily_by_site = {
+                s: pad_daily_to_season(d, int(year), int(as_of_doy), md_doy_end)
+                for s, d in daily_by_site.items()}
+            daily_by_site = {s: d for s, d in daily_by_site.items() if len(d)}
+            log.append(f"operational: daily truncated to DOY<={as_of_doy} and "
+                       f"padded to season end {md_doy_end} for {len(daily_by_site)} sites")
+
+    cohort_daily = (pd.concat(daily_by_site.values(), ignore_index=True)
+                    if daily_by_site else pd.DataFrame())
+    ctx.weather = FrameWeatherProvider(cohort_daily) if len(cohort_daily) else None
+    ctx.obs = LongObsProvider(obs_frame)
+
+    gate = load_gate(pest, paths.stage1_dir)
+    ctx.gate_method = gate["method"]
+    ctx.as_of_doy = as_of_doy
+    site_history = json.loads(
+        (paths.stage1_pest(pest) / "site_history.json").read_text(encoding="utf-8"))
+
+    alerts: dict = {}
+    notes: dict = {}
+    for y in (years or [int(year)]):
+        a, n = stage1_cohort(
+            paths, pest, int(y), [str(s) for s in sites], daily_by_site, obs_frame,
+            ctx.obs, ctx.obs, gate, site_history, log, as_of_doy=as_of_doy)
+        alerts.update(a)
+        notes.update(n)
+    ctx.alert_map = alerts
+    ctx.stage1_notes = notes
+    ctx.cohort_daily_by_site = daily_by_site
+    log.append(f"cohort pre-pass done in {_t.perf_counter() - t0:.1f}s "
+               f"(Stage-2 will run for {len(alerts)} alerted site-years)")
+    return {pest: ctx}
 
 
 def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
@@ -271,6 +395,12 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
     include_diag = bool(raw_request.get("include_diagnostics", False))
     output_dir = paths.output_dir
     generic = raw_request.get("input_csv") is not None
+    # Set by the representative-site path so the cohort pre-pass can reuse the
+    # one daily-master scan instead of doing a second one.
+    prescanned_daily: dict | None = None
+    prescanned_obs = None
+    prescanned_years: list[int] = []
+    prescanned_as_of_doy: int | None = None
 
     try:
         policy = load_policy(paths.configs_dir / "fallback_policy.yaml")
@@ -291,12 +421,44 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
                     output_dir, raw_request,
                     f"invalid pest {raw_request.get('pest')!r}; must be one of "
                     f"{sorted(VALID_PESTS)}", t0, generic)
-            year_raw = raw_request.get("year")
-            if not isinstance(year_raw, int) or isinstance(year_raw, bool):
-                return fail_batch(output_dir, raw_request,
-                                  f"invalid year {year_raw!r}; must be an integer",
-                                  t0, generic)
-            year = int(year_raw)
+            # Mode A (historical): `year`, or `start_year`/`end_year` for a span
+            #   such as 2002-2022 / 2023 / 2024 (the project's split boundaries).
+            # Mode B (operational): `as_of_date` = YYYY-MM-DD; the year comes
+            #   from the date and the season is truncated to that DOY.
+            as_of_date = raw_request.get("as_of_date")
+            as_of_doy = None
+            if as_of_date is not None:
+                ts = pd.to_datetime(str(as_of_date), errors="coerce")
+                if pd.isna(ts):
+                    return fail_batch(
+                        output_dir, raw_request,
+                        f"invalid as_of_date {as_of_date!r}; expected YYYY-MM-DD",
+                        t0, generic)
+                years = [int(ts.year)]
+                as_of_doy = int(ts.dayofyear)
+            elif raw_request.get("start_year") is not None or \
+                    raw_request.get("end_year") is not None:
+                sy, ey = raw_request.get("start_year"), raw_request.get("end_year")
+                for nm, v in (("start_year", sy), ("end_year", ey)):
+                    if not isinstance(v, int) or isinstance(v, bool):
+                        return fail_batch(
+                            output_dir, raw_request,
+                            f"invalid {nm} {v!r}; must be an integer", t0, generic)
+                if int(ey) < int(sy):
+                    return fail_batch(
+                        output_dir, raw_request,
+                        f"end_year {ey} is before start_year {sy}", t0, generic)
+                years = list(range(int(sy), int(ey) + 1))
+            else:
+                year_raw = raw_request.get("year")
+                if not isinstance(year_raw, int) or isinstance(year_raw, bool):
+                    return fail_batch(
+                        output_dir, raw_request,
+                        f"invalid year {year_raw!r}; must be an integer "
+                        f"(or supply start_year/end_year, or as_of_date)",
+                        t0, generic)
+                years = [int(year_raw)]
+            year = years[0]
             rep_csv = resolve_rep_csv(
                 raw_request.get("representative_sites_path")
                 or raw_request.get("representative_sites_csv"),
@@ -307,31 +469,66 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
             log.append(f"representative_sites_path={rep_csv}")
             log.append(f"representative_site_count={len(rep_sites)}")
 
-            # Restrict to sites that actually have BOTH LONG and daily for the year.
-            daily_csv = paths.input_dir / "daily_weather.csv"
-            obs_csv = _obs_path(paths, pest)
+            # Keep every representative site that has EITHER a LONG observation
+            # OR daily weather for the year — the union, matching the deployed
+            # API (run_predict batch.py: rep_set & (long_year_sites |
+            # daily_year_sites)).
+            #
+            # An intersection here would silently drop the representative sites
+            # that have weather but were not surveyed that year. Survey coverage
+            # is the sparse side: for sheath_blight 2004 only 135 of 858
+            # representative sites carry a LONG row, so an intersection returns
+            # 135 instead of 858. Those 723 sites are not a data error — Stage-1
+            # simply fires no alert for them and the fallback policy answers with
+            # climatology, which is exactly what a forecast for an unsurveyed
+            # site should be. A forward-looking request (a season with no
+            # observations yet) would intersect to zero sites and return an empty
+            # batch.
+            daily_csv = (resolve_daily(raw_request, paths.input_dir, paths.pkg_root)
+                         or paths.input_dir / "daily_weather.csv")
+            obs_csv = _obs_path(paths, pest, raw_request)
             if not daily_csv.is_file():
                 raise BatchRequestError(f"batch daily_weather.csv not found: {daily_csv}")
             if not Path(obs_csv).is_file():
                 raise BatchRequestError(f"batch LONG observation CSV not found: {obs_csv}")
             obs = LongObsProvider(obs_csv)
-            long_year = set(obs.frame[obs.frame["year"] == year]["site_id"]
-                            .astype(str).tolist())
-            weather = FrameWeatherProvider(daily_csv)
-            wf = weather.frame
-            site_col = "지점ID" if "지점ID" in wf.columns else wf.columns[0]
-            dt = pd.to_datetime(wf["일시"], errors="coerce")
-            daily_year = set(wf[dt.dt.year == year][site_col].astype(str).tolist())
+            # ONE chunked pass over the daily master, filtered to the
+            # representative sites and every requested year. This both decides
+            # which sites have weather and produces the per-site seasons the
+            # cohort Stage-1 pass needs, so the master is never loaded whole and
+            # never re-read per site or per year.
+            from .cohort import load_daily_cohort
+
             rep_set = set(rep_sites)
-            target = sorted(rep_set & long_year & daily_year)
-            year_available_count = len(target)
+            daily_by_site = load_daily_cohort(daily_csv, rep_set, set(years))
+            log.append(f"cohort daily scan: {len(daily_by_site)} sites over "
+                       f"years={years[0]}..{years[-1]}")
+
+            obs_year_col = pd.to_numeric(obs.frame["year"], errors="coerce")
+            rows_in = []
+            per_year_target: dict[int, list[str]] = {}
+            year_available_count = 0
             max_sites = raw_request.get("max_sites")
-            if isinstance(max_sites, int) and max_sites >= 0 and len(target) > max_sites:
-                log.append(f"max_sites={max_sites} -> truncating {len(target)}")
-                target = target[:max_sites]
+            for y in years:
+                long_y = set(obs.frame[obs_year_col == y]["site_id"].astype(str))
+                daily_y = {s for s, d in daily_by_site.items()
+                           if (pd.to_datetime(d["일시"], errors="coerce").dt.year == y).any()}
+                # rep & (long | daily); daily_y is already within rep_set
+                target_y = sorted((rep_set & long_y) | daily_y)
+                year_available_count += len(target_y)
+                if isinstance(max_sites, int) and max_sites >= 0 and len(target_y) > max_sites:
+                    log.append(f"year={y} max_sites={max_sites} -> truncating {len(target_y)}")
+                    target_y = target_y[:max_sites]
+                per_year_target[y] = target_y
+                rows_in.extend({"pest": pest, "site_id": s, "year": y} for s in target_y)
+                log.append(f"year={y}: rep_in_long={len(rep_set & long_y)} "
+                           f"rep_in_daily={len(daily_y)} union={len(target_y)}")
             log.append(f"year_available_site_count={year_available_count} "
-                       f"requested_count={len(target)}")
-            rows_in = [{"pest": pest, "site_id": s, "year": year} for s in target]
+                       f"requested_count={len(rows_in)}")
+            prescanned_daily = daily_by_site
+            prescanned_obs = obs
+            prescanned_years = years
+            prescanned_as_of_doy = as_of_doy
     except BatchRequestError as e:
         return fail_batch(output_dir, raw_request, str(e), t0, generic)
     except Exception as e:
@@ -343,6 +540,27 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
     results: list[dict] = []
     counts = {"success": 0, "fallback": 0, "error": 0}
     ctx_cache: dict[str, _PestContext] = {}
+
+    # ---- cohort pre-pass: ONE daily-master scan + ONE vectorized Stage-1 ------
+    # This is the training/evaluation data flow (phase_r_oracle_iou.
+    # build_dispatch_alert_map, vendored as stage1.py::compute_stage1_table):
+    # load the season for every site once, forward the whole cohort through the
+    # A and D models in blocks, then read the alert off each site's series.
+    # Stage-2 still runs per site, but only for the sites that actually fired.
+    cohort_ctx: dict[str, _PestContext] = {}
+    if not generic and rows_in:
+        try:
+            cohort_ctx = _prepare_cohort(
+                paths, pest, year, [r["site_id"] for r in rows_in], policy,
+                variant, include_diag, log,
+                daily_by_site=prescanned_daily, obs_provider=prescanned_obs,
+                years=prescanned_years, as_of_doy=prescanned_as_of_doy,
+                request=raw_request)
+        except Exception as e:  # never fatal: fall back to the per-row path
+            log.append(f"cohort pre-pass unavailable ({type(e).__name__}: {e}); "
+                       f"falling back to per-row Stage-1")
+            cohort_ctx = {}
+    ctx_cache.update(cohort_ctx)
 
     for i, raw_row in enumerate(rows_in):
         row_pest = normalize_pest(raw_row.get("pest"))
@@ -433,10 +651,25 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
             "recommended_source": per_pest_policy(policy, pest).get(
                 "recommended_source", "climatology") if pest else None,
         })
+        # Top-level climatology block, restored to match the deployed batch
+        # summary (run_predict batch.py). It is the per-pest constant every
+        # fallback row is filled from, so the summary is self-describing.
+        clim = None
+        if pest:
+            ctx_for_clim = ctx_cache.get(pest)
+            clim = (ctx_for_clim.climatology if ctx_for_clim is not None
+                    else compute_climatology(paths.climatology_dir, pest,
+                                             climatology_variant(policy, pest)))
+        if clim:
+            summary["climatology"] = {
+                "mu_doy": clim["mu_doy"],
+                "pi_95": clim["pi_95"],
+                "variant": clim["variant"],
+            }
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "response.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_atomic(output_dir / "response.json",
+                 json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     write_predictions_csv(output_dir / "predictions.csv", rows, include_diag, generic)
     write_run_log(output_dir / "run_log.txt", raw_request, log)
 
@@ -446,9 +679,9 @@ def run_batch(paths: Paths, raw_request: dict, run_row, variant: str) -> int:
     return 0
 
 
-def _obs_path(paths: Paths, pest: str) -> Path:
-    """Layout A wins, else Layout B (mirrors run_predict._obs_path)."""
-    local = paths.input_dir / "long_observation.csv"
-    if local.is_file():
-        return local
+def _obs_path(paths: Paths, pest: str, request: dict | None = None) -> Path:
+    """long_observation_path from the request, else Layout A, else Layout B."""
+    p = resolve_obs(request, paths.input_dir, paths.pkg_root, pest)
+    if p is not None:
+        return p
     return paths.input_dir / "LONG_by_pest" / f"RICE_LONG_{pest}.csv"

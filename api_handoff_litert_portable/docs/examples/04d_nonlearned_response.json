@@ -1,0 +1,114 @@
+{
+  "pest": "sheath_blight",
+  "site_id": "35694_60137",
+  "year": 2004,
+  "model_version": "v0-transformer-real-ckpt",
+  "stage1": {
+    "alert_fired": true,
+    "alert_tstar_doy": 118,
+    "gate_method": "dispatch_group_tau",
+    "alert_source": "stage1_live",
+    "wiring_status": "stage1_xgboost_live"
+  },
+  "stage2": {
+    "learned_stage2": {
+      "mu_doy": 192.72,
+      "pi_95": {
+        "lower_doy": 183,
+        "upper_doy": 203,
+        "sigma_days": 5.0
+      },
+      "selected_offset": 45,
+      "output_status": "experimental",
+      "model_kind": "lead_v3"
+    },
+    "climatology": {
+      "mu_doy": 203.66,
+      "pi_95": {
+        "lower_doy": 194,
+        "upper_doy": 213,
+        "sigma_days": 5.0
+      },
+      "variant": "mean_mid"
+    },
+    "recommended_source": "climatology"
+  },
+  "final_prediction": {
+    "source": "climatology",
+    "mu_doy": 203.66,
+    "pi_95": {
+      "lower_doy": 194,
+      "upper_doy": 213,
+      "sigma_days": 5.0
+    },
+    "selected_offset": null,
+    "fallback_triggered": false
+  },
+  "backends": {
+    "stage1_backend": "xgboost_json",
+    "stage2_backend": "litert_fp16"
+  },
+  "diagnostics": {
+    "selector_used": false,
+    "climatology_train_stats_path": "sheath_blight_climatology_train_stats.csv",
+    "selected_fixed_offset_from_policy": 45,
+    "transformer": {
+      "stage1_backend": "xgboost_json",
+      "stage2_backend": "litert_fp16",
+      "daily_input": "daily_weather.csv",
+      "long_observation_input": "RICE_LONG_sheath_blight.csv",
+      "input_mode": "full_bundle",
+      "stage1_method": "dispatch_group_tau",
+      "stage1_base_x_layout": {
+        "A": {
+          "dtype": "float32",
+          "shape": [
+            241,
+            30
+          ],
+          "strides": [
+            4,
+            964
+          ],
+          "c_contiguous": false,
+          "f_contiguous": true
+        },
+        "D": {
+          "dtype": "float32",
+          "shape": [
+            241,
+            30
+          ],
+          "strides": [
+            4,
+            964
+          ],
+          "c_contiguous": false,
+          "f_contiguous": true
+        }
+      },
+      "alert_source": "stage1_live",
+      "stage1_alert_tstar_doy": 118,
+      "stage1_error": null,
+      "d_in": 45,
+      "T_full_season": 241,
+      "doy_start": 60,
+      "doy_end": 300,
+      "sigma_days": 5.0,
+      "ckpt_loaded": true,
+      "model_forward_succeeded": true,
+      "input_X_shape": [
+        1,
+        1,
+        241,
+        45
+      ],
+      "alert_tstar_doy_used": 118,
+      "tstar_season_index": 104,
+      "base_channels_status": "real_preprocessing",
+      "zero_placeholder_used": false,
+      "mu_rel_season_index": 133.7224
+    },
+    "transformer_error": null
+  }
+}

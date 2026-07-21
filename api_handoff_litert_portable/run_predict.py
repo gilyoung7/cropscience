@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import sys
 import traceback
@@ -27,6 +28,10 @@ if str(PKG_ROOT) not in sys.path:
 
 from infer.fallback import (  # noqa: E402
     PolicyError, climatology_variant, compute_climatology, load_policy, per_pest_policy,
+)
+from infer.inputs import (  # noqa: E402
+    InputResolutionError, OutputCollisionError, plan_output_dir, release_claim,
+    resolve_daily, resolve_obs, write_atomic,
 )
 from infer.paths import MODEL_VERSION, Paths  # noqa: E402
 from infer.preprocessing import PreprocessError, build_season  # noqa: E402
@@ -51,32 +56,45 @@ def fail(msg: str, code: int = 1, exc: Exception | None = None):
 
 
 def check_input_files(paths: Paths, request: dict | None) -> None:
-    """Port of run_predict.py:170-212 — exit 2 with the required-files list."""
+    """Port of run_predict.py:170-212 — exit 2 with the required-files list.
+
+    Honours the optional request fields daily_weather_path /
+    long_observation_path; with neither, the historical input_dir filenames are
+    used unchanged.
+    """
     missing = []
     if request is None:
         missing.append("request.json")
-    if not (paths.input_dir / "daily_weather.csv").is_file():
-        missing.append("daily_weather.csv")
-    if not _obs_path(paths, request).is_file():
-        missing.append("long_observation.csv (or LONG_by_pest/RICE_LONG_<pest>.csv)")
+    try:
+        if _daily_path(paths, request) is None:
+            missing.append("daily_weather.csv")
+        if _obs_path(paths, request) is None:
+            missing.append("long_observation.csv (or LONG_by_pest/RICE_LONG_<pest>.csv)")
+    except InputResolutionError as e:
+        print(f"[run_predict] ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
     if missing:
         print(
             "[run_predict] ERROR: missing required input file(s): "
             + ", ".join(missing)
             + f"\n  input dir: {paths.input_dir}\n"
-            "  required: request.json, daily_weather.csv, long_observation.csv",
+            "  required: request.json, daily_weather.csv, long_observation.csv\n"
+            "  (or name them explicitly via daily_weather_path / "
+            "long_observation_path in request.json)",
             file=sys.stderr,
         )
         sys.exit(2)
 
 
-def _obs_path(paths: Paths, request: dict | None) -> Path:
-    """Port of run_predict.py:157-167 — Layout A wins, else Layout B."""
-    local = paths.input_dir / "long_observation.csv"
-    if local.is_file():
-        return local
-    pest = (request or {}).get("pest", "UNKNOWN")
-    return paths.input_dir / "LONG_by_pest" / f"RICE_LONG_{pest}.csv"
+def _daily_path(paths: Paths, request: dict | None) -> Path | None:
+    """daily_weather_path from the request, else input_dir/daily_weather.csv."""
+    return resolve_daily(request, paths.input_dir, paths.pkg_root)
+
+
+def _obs_path(paths: Paths, request: dict | None) -> Path | None:
+    """long_observation_path from the request, else Layout A, else Layout B."""
+    return resolve_obs(request, paths.input_dir, paths.pkg_root,
+                       (request or {}).get("pest"))
 
 
 def run_stage1(paths: Paths, pest: str, site_id: str, year: int, weather,
@@ -142,11 +160,16 @@ def run_pipeline(paths: Paths, request: dict, variant: str,
                           f"climatology mu_doy={climatology['mu_doy']} "
                           f"variant={climatology['variant']}"]
 
-    daily_csv = paths.input_dir / "daily_weather.csv"
-    obs_csv = _obs_path(paths, request)
+    daily_csv = _daily_path(paths, request) or (paths.input_dir / "daily_weather.csv")
+    obs_csv = _obs_path(paths, request) or (
+        paths.input_dir / "LONG_by_pest" / f"RICE_LONG_{pest}.csv")
+    # In cohort batch mode the providers were built once, over a single chunked
+    # pass of the daily master; reuse them instead of re-reading it per site.
+    cohort_weather = getattr(ctx, "weather", None) if ctx is not None else None
+    cohort_obs = getattr(ctx, "obs", None) if ctx is not None else None
     try:
-        weather = FrameWeatherProvider(daily_csv)
-        obs = LongObsProvider(obs_csv)
+        weather = cohort_weather if cohort_weather is not None else FrameWeatherProvider(daily_csv)
+        obs = cohort_obs if cohort_obs is not None else LongObsProvider(obs_csv)
     except ProviderError as e:
         diag["input_error"] = str(e)
         return build_response(request, None, climatology, policy, diag, str(e),
@@ -155,9 +178,22 @@ def run_pipeline(paths: Paths, request: dict, variant: str,
     diag["long_observation_input"] = obs_csv.name
     diag["input_mode"] = "per_site" if obs_csv.name == "long_observation.csv" else "full_bundle"
 
-    # ---- Stage 1 (live, portable JSON) --------------------------------
+    # ---- Stage 1 ------------------------------------------------------
+    # Cohort mode: the alert + 14 dispatch features for every site were computed
+    # in one vectorized pass before this loop (infer/cohort.stage1_cohort), so
+    # here we only look this site up. A site absent from the map fired no alert
+    # — the same outcome the per-site path produces, reached the same way.
     manual_alert = request.get("alert_tstar_doy")
-    s1, s1_err = run_stage1(paths, pest, site_id, year, weather, obs, obs, diag)
+    alert_map = getattr(ctx, "alert_map", None) if ctx is not None else None
+    if alert_map is not None:
+        diag["stage1_method"] = getattr(ctx, "gate_method", None)
+        key = f"{site_id}|{int(year)}"
+        hit = alert_map.get(key)
+        s1 = hit
+        s1_err = None if hit else (getattr(ctx, "stage1_notes", {}) or {}).get(key)
+        diag["stage1_source"] = "cohort_prepass"
+    else:
+        s1, s1_err = run_stage1(paths, pest, site_id, year, weather, obs, obs, diag)
     s1_alert = s1["alert_tstar_doy"] if s1 else None
     dispatch_override = s1["dispatch_features"] if s1 else None
     if s1_err:
@@ -176,8 +212,13 @@ def run_pipeline(paths: Paths, request: dict, variant: str,
                    + (f" error={s1_err}" if s1_err else ""))
 
     if alert_for_build is None or dispatch_override is None:
-        err = (f"Stage-1 fired no alert for pest={pest} site={site_id} year={year}; "
-               f"no dispatch features available. " + (s1_err or ""))
+        # Worded to match the deployed API verbatim (run_predict.py:406-409),
+        # including the trailing space before the appended Stage-1 error, so
+        # error_reason in predictions.csv compares equal string-for-string.
+        _gate = diag.get("stage1_method") or "?"
+        err = (f"Stage-1 fired no alert for pest={pest} site={site_id} "
+               f"year={year} (gate={_gate}); no manual "
+               f"alert_tstar_doy supplied. " + (s1_err or ""))
         run_log.append(err)
         return build_response(request, None, climatology, policy, diag, err,
                              _backends(variant)), err
@@ -188,6 +229,52 @@ def run_pipeline(paths: Paths, request: dict, variant: str,
         err = f"selected_fixed_offset missing in fallback_policy.yaml for pest={pest}"
         return build_response(request, None, climatology, policy, diag, err,
                              _backends(variant)), err
+    # Operational guard: Stage-2 reads the window [tstar-window+1, tstar] with
+    # tstar = alert + selected_offset. Before that DOY is observed, part of the
+    # window is padding, and running anyway would silently return a number built
+    # from imputed filler. Fall back instead, and say why.
+    as_of_doy = getattr(ctx, "as_of_doy", None) if ctx is not None else None
+    if as_of_doy is not None and alert_for_build is not None:
+        need_doy = int(alert_for_build) + int(selected_offset)
+        if int(as_of_doy) < need_doy:
+            status = "stage2_pending_window_not_yet_observed"
+            err = (f"Stage-2 not yet evaluable for pest={pest} site={site_id} "
+                   f"year={year}: needs weather through DOY {need_doy} "
+                   f"(alert {alert_for_build} + offset {selected_offset}), "
+                   f"as_of_date is DOY {as_of_doy} [{status}]")
+            diag["stage2_output_status"] = status
+            diag["stage2_needs_doy"] = need_doy
+            run_log.append(err)
+            return build_response(request, None, climatology, policy, diag, err,
+                                  _backends(variant), stage2_output_status=status), err
+
+        # The window IS observed, but the training imputation
+        # (interpolate(limit_direction="both")) fills a gap from the first valid
+        # value AFTER it. If a missing run inside the window is still unresolved
+        # at as_of_date, an operational run would impute it differently from the
+        # full-season run — so decline rather than emit a number we cannot stand
+        # behind. Historical mode never reaches here.
+        from infer.cohort import as_of_reproduces_full_year
+
+        try:
+            site_daily_for_check = weather.daily(site_id, year)
+        except ProviderError:
+            site_daily_for_check = None
+        if site_daily_for_check is not None:
+            reproducible, why = as_of_reproduces_full_year(
+                site_daily_for_check, int(as_of_doy), need_doy,
+                int(ctx.model.md.nowcast_window) if ctx is not None else 28)
+            if not reproducible:
+                status = "stage2_window_crosses_unresolved_missing_run"
+                err = (f"Stage-2 withheld for pest={pest} site={site_id} "
+                       f"year={year}: {why} [{status}]")
+                diag["stage2_output_status"] = status
+                diag["stage2_block_detail"] = why
+                run_log.append(err)
+                return build_response(request, None, climatology, policy, diag,
+                                      err, _backends(variant),
+                                      stage2_output_status=status), err
+
     try:
         model = ctx.model if ctx is not None else Stage2Model(
             pest, paths.stage2_dir, variant=variant)
@@ -243,16 +330,19 @@ def _backends(variant: str) -> dict:
 
 
 def write_outputs(paths: Paths, response: dict) -> None:
-    """Port of run_predict.py:593-622 — response.json + predictions.csv."""
+    """Port of run_predict.py:593-622 — response.json + predictions.csv.
+
+    Written atomically (temp file + os.replace) so an interrupted run leaves the
+    previous results intact rather than a truncated file.
+    """
     paths.output_dir.mkdir(parents=True, exist_ok=True)
-    (paths.output_dir / "response.json").write_text(
-        json.dumps(response, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    flat = flatten_response(response)
-    with open(paths.output_dir / "predictions.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FLAT_COLS)
-        w.writeheader()
-        w.writerow(flat)
+    write_atomic(paths.output_dir / "response.json",
+                 json.dumps(response, indent=2, ensure_ascii=False) + "\n")
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=FLAT_COLS)
+    w.writeheader()
+    w.writerow(flatten_response(response))
+    write_atomic(paths.output_dir / "predictions.csv", buf.getvalue(), newline="")
 
 
 def write_run_log(paths: Paths, request: dict, lines: list[str]) -> None:
@@ -266,10 +356,21 @@ def write_run_log(paths: Paths, request: dict, lines: list[str]) -> None:
         "events:",
         *[f"  - {ln}" for ln in lines],
     ]
-    (paths.output_dir / "run_log.txt").write_text("\n".join(body) + "\n", encoding="utf-8")
+    write_atomic(paths.output_dir / "run_log.txt", "\n".join(body) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point. Wraps _main so the output-directory claim is always released,
+    whether the run succeeds, fails, or exits via sys.exit."""
+    claimed: list[Path] = []
+    try:
+        return _main(argv, claimed)
+    finally:
+        for d in claimed:
+            release_claim(d)
+
+
+def _main(argv: list[str] | None, claimed: list[Path]) -> int:
     ap = argparse.ArgumentParser(description="Lightweight portable pest-timing API")
     ap.add_argument("--input-dir", type=Path, default=None)
     ap.add_argument("--output-dir", type=Path, default=None)
@@ -277,6 +378,13 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"Stage-2 model precision (default: {DEFAULT_VARIANT})")
     ap.add_argument("--representative-sites", default=None,
                     help="path to representative_site_ids_2002_2024.csv (batch mode)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace existing results in --output-dir "
+                         "(default: refuse, so concurrent runs cannot clobber "
+                         "each other)")
+    ap.add_argument("--unique-output-subdir", action="store_true",
+                    help="write into a fresh per-run subfolder of --output-dir "
+                         "instead of the directory itself")
     args = ap.parse_args(argv)
 
     paths = Paths.from_root(PKG_ROOT, args.input_dir, args.output_dir)
@@ -295,6 +403,22 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(raw_request, dict):
         fail("request.json must contain a JSON object")
 
+    # Decide where this run may write BEFORE doing any work, so a collision is
+    # reported immediately and nothing is half-produced. The request may set the
+    # same two switches as the CLI flags.
+    try:
+        out_dir, out_note = plan_output_dir(
+            paths.output_dir, raw_request,
+            overwrite=bool(args.overwrite or raw_request.get("overwrite")),
+            unique_subdir=bool(args.unique_output_subdir
+                               or raw_request.get("unique_output_subdir")))
+    except OutputCollisionError as e:
+        fail(str(e), code=1)
+    claimed.append(out_dir)
+    paths = Paths(pkg_root=paths.pkg_root, input_dir=paths.input_dir,
+                  output_dir=out_dir)
+    print(f"[run_predict] {out_note}", file=sys.stderr)
+
     if str(raw_request.get("mode", "single")).lower() == "batch":
         from infer.batch import run_batch
 
@@ -303,13 +427,19 @@ def main(argv: list[str] | None = None) -> int:
             fail(f"invalid stage2_variant {variant!r}; must be one of {list(VARIANTS)}")
         if args.representative_sites and not raw_request.get("representative_sites_path"):
             raw_request["representative_sites_path"] = args.representative_sites
-        # Batch needs EITHER a rep-CSV selection (pest+year) OR a generic input_csv.
+        # Batch needs EITHER a rep-CSV selection (pest + a time spec) OR a
+        # generic input_csv. The time spec is `year` (one season),
+        # `start_year`/`end_year` (a span such as 2002-2022), or `as_of_date`
+        # (operational run for the season containing that date).
+        _has_time = any(raw_request.get(k) is not None
+                        for k in ("year", "start_year", "end_year", "as_of_date"))
         if raw_request.get("input_csv") is None and (
-            raw_request.get("pest") is None or raw_request.get("year") is None
+            raw_request.get("pest") is None or not _has_time
         ):
             fail(
                 "batch request is missing its input specification. Supply either:\n"
-                "  (a) representative-site batch: \"pest\" and \"year\" (plus optional "
+                "  (a) representative-site batch: \"pest\" plus one of \"year\", "
+                "\"start_year\"+\"end_year\", or \"as_of_date\" (plus optional "
                 "\"representative_sites_path\"), or\n"
                 "  (b) generic CSV batch: \"input_csv\" pointing at a CSV with columns "
                 "pest,site_id,year[,alert_tstar_doy].\n"

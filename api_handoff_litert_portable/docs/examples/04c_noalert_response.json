@@ -1,0 +1,58 @@
+{
+  "pest": "sheath_blight",
+  "site_id": "24950_66616",
+  "year": 2018,
+  "model_version": "v0-transformer-real-ckpt",
+  "stage1": {
+    "alert_fired": false,
+    "alert_tstar_doy": null,
+    "gate_method": "dispatch_group_tau",
+    "alert_source": "stage1_error",
+    "wiring_status": "stage1_xgboost_live"
+  },
+  "stage2": {
+    "learned_stage2": null,
+    "climatology": {
+      "mu_doy": 203.66,
+      "pi_95": {
+        "lower_doy": 194,
+        "upper_doy": 213,
+        "sigma_days": 5.0
+      },
+      "variant": "mean_mid"
+    },
+    "recommended_source": "climatology"
+  },
+  "final_prediction": {
+    "source": "climatology",
+    "mu_doy": 203.66,
+    "pi_95": {
+      "lower_doy": 194,
+      "upper_doy": 213,
+      "sigma_days": 5.0
+    },
+    "selected_offset": null,
+    "fallback_triggered": false
+  },
+  "backends": {
+    "stage1_backend": "xgboost_json",
+    "stage2_backend": "litert_fp16"
+  },
+  "diagnostics": {
+    "selector_used": false,
+    "climatology_train_stats_path": "sheath_blight_climatology_train_stats.csv",
+    "selected_fixed_offset_from_policy": 45,
+    "transformer": {
+      "stage1_backend": "xgboost_json",
+      "stage2_backend": "litert_fp16",
+      "daily_input": "daily_weather.csv",
+      "long_observation_input": "RICE_LONG_sheath_blight.csv",
+      "input_mode": "full_bundle",
+      "stage1_method": "dispatch_group_tau",
+      "alert_source": "stage1_error",
+      "stage1_alert_tstar_doy": null,
+      "stage1_error": "Stage1Error: site_history.json has no entry for '24950_66616|2018'. The deployed API would re-derive history from the request's prior-year observations; this package requires the shipped site_history asset to cover the site-year. Nothing is defaulted to zero."
+    },
+    "transformer_error": "Stage-1 fired no alert for pest=sheath_blight site=24950_66616 year=2018 (gate=dispatch_group_tau); no manual alert_tstar_doy supplied. Stage1Error: site_history.json has no entry for '24950_66616|2018'. The deployed API would re-derive history from the request's prior-year observations; this package requires the shipped site_history asset to cover the site-year. Nothing is defaulted to zero."
+  }
+}

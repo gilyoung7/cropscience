@@ -85,3 +85,25 @@ api_handoff_litert_portable/output/
 api_handoff_litert_portable/tests/_*.json
 # runtime-only venv used to prove the API needs no torch/tensorflow
 .venv-lightweight-api-test/
+
+# --- lightweight portable API: operational safety additions -------------------
+# assets may be a real dir OR a symlink to a built copy; the slash-form rule
+# above only matches a directory, so match the bare name too.
+api_handoff_litert_portable/assets
+# scratch working copy used while patching; the committed source lives in
+# api_handoff_litert_portable/
+api_handoff_litert_portable_patched/
+# A/B validation workspace: runtime venv (~1.1 GB) + raw run outputs, not source
+ab_validation_legacy_vs_litert/
+# concurrency claim file written into an output dir while a run holds it
+.run_claim
+# per-request output directories (response.json / predictions.csv / run_log.txt).
+# Scoped to output dirs so docs/examples/ keeps its documentation samples.
+api_handoff_litert_portable/out/
+api_handoff_litert_portable/output/
+api_handoff_litert_portable/runs/
+# ...but the package's checked-in documentation samples are source, not data.
+# Same exemption the existing examples/ CSVs already rely on (the global *.csv
+# rule above is a dataset policy, and these are <1 KB illustrations).
+!api_handoff_litert_portable/examples/*.csv
+!api_handoff_litert_portable/docs/examples/*.csv
