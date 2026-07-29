@@ -19,7 +19,7 @@ import numpy as np, pandas as pd
 CS = Path("/home/gpu4080/research/cropscience")
 WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
 AP = CS / "rice/experiments/allpests_e5d"
-sys.path.insert(0, str(AP)); sys.path.insert(0, str(WS))
+sys.path.insert(0, str(AP)); sys.path.insert(0, str(AP / "vendor"))   # pinned deps only
 import pest_paths as PP
 import pest_eval as PE
 import wandb_viz_e5d as VW
@@ -60,7 +60,7 @@ def main():
     ap.add_argument("--wandb_project", default=None, help="omit to run fully offline")
     ap.add_argument("--wandb_entity", default=None)
     ap.add_argument("--wandb_group", default="e5d_dev_smoke")
-    ap.add_argument("--out_dir", default=str(WS / "outputs/allpests_e5d/_wandb_smoke"))
+    ap.add_argument("--out_dir", default=str(PP.OUT_ROOT / "_wandb_smoke"))
     a = ap.parse_args()
 
     if not WBPH_DEV_GRID.exists():

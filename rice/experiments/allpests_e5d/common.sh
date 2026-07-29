@@ -13,11 +13,12 @@
 
 set -euo pipefail
 
-WS=/home/gpu4080/research/wbph_interval_perf_202607
 CS=/home/gpu4080/research/cropscience
+# The external workspace is NOT used at runtime -- all code comes from vendor/.
+VENDOR="$CS/rice/experiments/allpests_e5d/vendor"
 PY="$CS/.venv/bin/python"
 AP="$CS/rice/experiments/allpests_e5d"
-OUT_ROOT="${OUT_ROOT:-$WS/outputs/allpests_e5d}"
+OUT_ROOT="${OUT_ROOT:-${ALLPESTS_OUT_ROOT:-$CS/rice/outputs_allpests_e5d}}"
 
 YEARS_DEFAULT="2022 2023 2024"
 OFFS_DEFAULT="3,7,14,21,28,30,35,42,45,49,56,60"

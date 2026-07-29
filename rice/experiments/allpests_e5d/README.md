@@ -144,3 +144,34 @@ needs no retraining. Do not delete them.
 - The dev half-split is **not** the same partition the WBPH 2x2 used; WBPH's published dev
   number came from `scripts/95`. Small deviation from 0.3956 is expected on that basis alone —
   the clean number is the strict reproduction target.
+
+## Vendored dependencies (`vendor/`)
+
+Both servers execute **only** the code under `rice/experiments/allpests_e5d/vendor/`. There is
+no fallback to the external `wbph_interval_perf_202607` workspace — a fallback is precisely how
+two machines end up silently running different code. Server 2 does not need that workspace at
+all.
+
+`VENDOR_MANIFEST.csv` pins all 10 files by sha256, size, original absolute path and vendoring
+timestamp. `vendor_check.py` re-hashes them; `dry_run.py` check [12] turns any missing file or
+hash mismatch into a FAIL, which stops training.
+
+| file | purpose |
+|---|---|
+| `scripts/87_make_shared_offset_grid.py` | `collect()` — the offsets-1..75 grid forward |
+| `src/{io_utils,selector_utils,diagnostics,eval_metrics}.py` | candidate build, coverage-aware selector, metrics |
+| `src/vendor/{model,run_train}.py` | E5d model + Stage-2 trainer |
+| `_patched_train.py` | clean-fold training (val restricted to val_ckpt) |
+
+**`87_make_shared_offset_grid.py` is deliberately pinned to the 2026-07-29 revision**, which
+adds the module-level `PEST` global so one `collect()` can serve all 8 pests. Its default is
+`"WBPH"`, so every pre-existing WBPH result stays bit-identical. This is knowingly *not* the
+revision that produced the original WBPH numbers — it is behaviourally identical for
+`pest=WBPH`, and the manifest's `note` column records the same caveat.
+
+If the external workspace happens to exist, `vendor_check.py` reports whether it has drifted
+from the pin. That is **informational only**: the pinned copy is authoritative and the external
+copy is never imported.
+
+Results go to `$ALLPESTS_OUT_ROOT` (default `rice/outputs_allpests_e5d/`), also independent of
+the external workspace.

@@ -23,7 +23,7 @@ from pathlib import Path
 WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
 CS = Path("/home/gpu4080/research/cropscience")
 AP = CS / "rice/experiments/allpests_e5d"
-sys.path.insert(0, str(WS)); sys.path.insert(0, str(CS))
+sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor")); sys.path.insert(0, str(CS))
 
 YEARS = [2022, 2023, 2024]
 OFFSETS = [3, 7, 14, 21, 28, 30, 35, 42, 45, 49, 56, 60]
@@ -36,6 +36,7 @@ WARNS: list[str] = []
 def fail(msg): FAILS.append(msg); print(f"  FAIL  {msg}")
 def warn(msg): WARNS.append(msg); print(f"  WARN  {msg}")
 def ok(msg):   print(f"  ok    {msg}")
+ok_ = ok
 
 
 def registry() -> list[dict]:
@@ -269,6 +270,30 @@ def check_stage1_freeze(rows):
             ok(f"{r['pest']}: {pol} ({len(sub)} artifacts verified)")
 
 
+def check_vendor():
+    """(12) The pinned dependencies must be present and byte-identical to the manifest.
+
+    This is the gate that makes two servers provably run the same code. A missing or drifted
+    vendored file is a FAIL, which stops training. The external workspace is never imported;
+    if it exists here its comparison is printed as information only.
+    """
+    print("\n[12] vendored dependency pin")
+    import vendor_check
+    ok, fails, notes = vendor_check.verify(quiet=True)
+    if not ok:
+        for f in fails:
+            fail(f"vendor: {f}")
+    else:
+        ok_(f"all {len(notes)} pinned files match VENDOR_MANIFEST.csv")
+    drift = [n for n in notes if n.startswith("DRIFT")]
+    absent = [n for n in notes if n.startswith("absent")]
+    if absent:
+        ok_(f"external workspace not present for {len(absent)} file(s) -- expected on server 2")
+    if drift:
+        warn(f"external workspace has drifted from the pin on {len(drift)} file(s) "
+             f"(informational; the pinned copy is authoritative): {drift[:2]}")
+
+
 def check_uniformity(rows):
     """Knobs that MUST be identical across all 24 cells, and the ones that legitimately vary.
 
@@ -404,6 +429,7 @@ def main():
     check_stage1_binding(rows)
     check_gate_policy(rows)
     check_stage1_freeze(rows)
+    check_vendor()
     check_server_balance(rows)
     if a.level == "full":
         check_forward(rows, a.year)

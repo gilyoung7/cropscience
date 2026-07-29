@@ -47,13 +47,13 @@ train_phase() {
     if [ "${DRYRUN:-0}" = "1" ]; then echo "    [DRYRUN] skip"; continue; fi
     cd "$CS"
     if [ "$phase" = "dev" ]; then
-      PYTHONPATH="$WS:$CS" $PY -u -m src.vendor.run_train $args --out_root "$out" \
+      PYTHONPATH="$VENDOR:$CS" $PY -u -m src.vendor.run_train $args --out_root "$out" \
         2>&1 | tee "$out/train.log"
     else
       local assign="$PROOT/clean/split_assignment.json"
       [ -f "$assign" ] || { echo "[abort] missing $assign (step 3 must run first)"; exit 4; }
-      PYTHONPATH="$WS:$CS" $PY -u \
-        "$WS/outputs/feature_experiments/e5d_clean_selection_3fold_20260716/_code/_patched_train.py" \
+      PYTHONPATH="$VENDOR:$CS" $PY -u \
+        "$VENDOR/_patched_train.py" \
         --eval_year "$year" --assign "$assign" -- $args --out_root "$out" \
         2>&1 | tee "$out/train.log"
     fi
@@ -72,11 +72,11 @@ run_step() {                       # run_step <name> <command...>
   fi
 }
 
-grid()   { cd "$CS"; PYTHONPATH="$WS:$CS" $PY "$AP/pest_grid.py"   --pest "$PEST" --mode "$1" --years $YEARS --force \
+grid()   { cd "$CS"; PYTHONPATH="$VENDOR:$CS" $PY "$AP/pest_grid.py"   --pest "$PEST" --mode "$1" --years $YEARS --force \
              2>&1 | tee "$PROOT/logs/grid_$1.log"; }
-splits() { cd "$CS"; PYTHONPATH="$WS:$CS" $PY "$AP/pest_splits.py" --pest "$PEST" --years $YEARS \
+splits() { cd "$CS"; PYTHONPATH="$VENDOR:$CS" $PY "$AP/pest_splits.py" --pest "$PEST" --years $YEARS \
              2>&1 | tee "$PROOT/logs/splits.log"; }
-evaluate() { cd "$CS"; PYTHONPATH="$WS:$CS" $PY "$AP/pest_eval.py" --pest "$PEST" --years $YEARS \
+evaluate() { cd "$CS"; PYTHONPATH="$VENDOR:$CS" $PY "$AP/pest_eval.py" --pest "$PEST" --years $YEARS \
              2>&1 | tee "$PROOT/logs/eval.log"; }
 
 run_step train_dev   train_phase dev

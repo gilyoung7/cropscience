@@ -10,11 +10,14 @@ is one of gate_{dispatch_group_tau,A_baseline,D_history}_R088_features_per_sy.cs
 assert exactly one match instead of assuming a name.
 """
 from __future__ import annotations
+import os
 from pathlib import Path
 
 WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
 CS = Path("/home/gpu4080/research/cropscience")
-OUT_ROOT = WS / "outputs/allpests_e5d"
+# Results root. Must NOT require the external workspace -- server 2 may not have it.
+OUT_ROOT = Path(os.environ.get("ALLPESTS_OUT_ROOT",
+                               CS / "rice/outputs_allpests_e5d"))
 YEARS = [2022, 2023, 2024]
 OFFSETS = [3, 7, 14, 21, 28, 30, 35, 42, 45, 49, 56, 60]
 SEEDS = [0, 1, 2, 3, 4]

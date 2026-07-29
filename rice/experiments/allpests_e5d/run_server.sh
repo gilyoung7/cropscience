@@ -24,7 +24,7 @@ echo -e "pest\tstatus\tstarted\tfinished" > "$SUMMARY"
 echo "===== server$SERVER: $(echo $PESTS | tr '\n' ' ') ====="
 echo "[server$SERVER] pre-flight dry run (fast)"
 cd "$CS"
-if ! PYTHONPATH="$WS:$CS" $PY "$AP/dry_run.py" --level fast; then
+if ! PYTHONPATH="$VENDOR:$CS" $PY "$AP/dry_run.py" --level fast; then
   echo "[server$SERVER] ABORT: dry run reported FAIL -- fix before training"; exit 3
 fi
 
