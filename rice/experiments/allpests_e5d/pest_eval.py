@@ -16,11 +16,12 @@ truncates its run_log.txt at import time, which would corrupt the WBPH artifact.
   PYTHONPATH=$WS:$CS $PY $CS/rice/experiments/allpests_e5d/pest_eval.py --pest blast
 """
 from __future__ import annotations
-import argparse, hashlib, json, sys, time
+import argparse, hashlib, json, os, sys, time
 from pathlib import Path
 import numpy as np, pandas as pd
 
 WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
+CS = Path("/home/gpu4080/research/cropscience")
 sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d")); sys.path.insert(0, str(WS))
 import pest_paths as PP
 from src.io_utils import load_dispatch, load_clim_mid
@@ -207,6 +208,11 @@ def main():
     ap.add_argument("--pest", required=True)
     ap.add_argument("--years", type=int, nargs="+", default=PP.YEARS)
     ap.add_argument("--skip", choices=["dev", "clean"], default=None)
+    # W&B is opt-in and never fatal. No API key is read here -- wandb resolves
+    # WANDB_API_KEY / ~/.netrc itself. Omit the project to stay fully offline.
+    ap.add_argument("--wandb_project", default=os.environ.get("WANDB_PROJECT") or None)
+    ap.add_argument("--wandb_entity", default=os.environ.get("WANDB_ENTITY") or None)
+    ap.add_argument("--wandb_group", default=None)
     a = ap.parse_args()
 
     outd = PP.eval_dir(a.pest); outd.mkdir(parents=True, exist_ok=True)
@@ -226,6 +232,17 @@ def main():
             gd = pd.read_csv(gp)
             run_dev(a.pest, a.years, gd[(gd.variant == "E5d") & (gd.offset.isin(OFFSETS))],
                     DISP, doy_start, T, outd, log)
+            if a.wandb_project:
+                # One run per (pest, eval_year), all 5 selector seeds inside it. Any failure
+                # here is swallowed by log_run -- evaluation results are already on disk.
+                try:
+                    import wandb_viz_e5d as VW
+                    for y in a.years:
+                        VW.log_e5d_dev_year(a.pest, y, gd, DISP, doy_start, T,
+                                            outd, a.wandb_project, a.wandb_entity,
+                                            a.wandb_group, log)
+                except Exception as e:                                # noqa: BLE001
+                    log(f"[wandb] connector failed (non-fatal): {type(e).__name__}: {e}")
         else:
             log(f"[dev] grid missing {gp} -- skipped")
     if a.skip != "clean":

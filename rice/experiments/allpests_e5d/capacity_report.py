@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np, pandas as pd
 
 WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
+CS = Path("/home/gpu4080/research/cropscience")
 sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d"))
 import pest_paths as PP
 
