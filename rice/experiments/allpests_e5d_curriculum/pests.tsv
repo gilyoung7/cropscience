@@ -1,0 +1,29 @@
+# All-pest E5d registry. Tab-separated, '#' comments ignored. Read by common.sh and *.py.
+# Verified 2026-07-29 against rice/pests/<pest>/config.py, batch_*/<pest>/lead_v3_final/hparams.json,
+# and a 24-cell sweep of the actual extracted production commands.
+#
+# server     : which GPU server runs this pest (1 or 2). Balanced by cost (below).
+# doy_start/end : model geometry. NOT uniform across pests -- each cell inherits its own
+#                 production geometry and we do not override it (see README "Uniformity").
+#                 BPH is the only outlier: 140-270 => T=131 vs 241 for the other seven.
+# events     : full-corpus event rows (rice/outputs/stage1/neighbor_feature_stats.tsv).
+# b16_cells  : how many of the 3 year-cells carry --batch_train_override 16. Batch 16 costs
+#              ~4x the steps of the default 64 for the same data, and it is NOT a per-pest
+#              property -- WBPH uses it in all 3 years, BPH/rsb1/rsb2 only in 2024, the four
+#              diseases never. cost below accounts for that per-cell rather than per-pest.
+# cost       : sum over the 3 cells of events/batch. Used only to balance the two servers.
+#              server1 = 1337, server2 = 1174 (ratio 1.14).
+#
+# EXCLUDED: BPH2 -- loadable slug (rice/pests/BPH2) but NO Stage-2 batch data in any year
+#           (no dispatch CSV, no climatology, no lead_v3 ckpt) and n_event=26 on a 2020-2024
+#           window. Excluded by default everywhere downstream (--exclude_pests BPH2).
+#
+#pest	server	doy_start	doy_end	events	b16_cells	cost
+WBPH	1	60	300	5671	3	1063
+brown_spot	1	60	300	2389	0	112
+rice_stem_borer_2	1	60	300	1029	1	96
+rice_stem_borer_1	1	60	300	698	1	66
+sheath_blight	2	60	300	15446	0	724
+blast	2	60	300	4005	0	188
+BPH	2	140	270	1804	1	169
+bacterial_blight	2	60	300	1982	0	93
