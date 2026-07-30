@@ -39,10 +39,9 @@ import importlib.util, sys, traceback
 from pathlib import Path
 import numpy as np, pandas as pd
 
-CS = Path("/home/gpu4080/research/cropscience")
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d"))
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor"))   # pinned deps only
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(AP))
+sys.path.insert(0, str(VENDOR))   # pinned deps only
 import pest_paths as PP
 
 # reuse the legacy figure/table code verbatim -- do not reimplement any of it
@@ -187,7 +186,7 @@ def build_dev_year(pest: str, eval_year: int, g: pd.DataFrame, DISP: dict,
                calibration=f"global additive mu shift, grid {PP.SHIFT_GRID[0]}..{PP.SHIFT_GRID[-1]},"
                            f" selected on val_cal; delta*={best:+d}",
                calibration_shift=best, sigma_eval=PP.SIGMA)
-    f = CS / "rice/experiments/allpests_e5d/gate_policy_observed.csv"
+    f = AP / "gate_policy_observed.csv"
     if f.exists():
         gp = pd.read_csv(f)
         r = gp[(gp.pest == pest) & (gp.year == eval_year)]

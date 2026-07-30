@@ -22,8 +22,7 @@ import argparse, json, re, sys
 from pathlib import Path
 import pandas as pd, torch
 
-CS = Path("/home/gpu4080/research/cropscience")
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
+from repo_paths import AP, CS, WS        # roots derived from this file's location
 PESTS = ["WBPH", "BPH", "blast", "sheath_blight", "brown_spot",
          "bacterial_blight", "rice_stem_borer_1", "rice_stem_borer_2"]
 YEARS = [2022, 2023, 2024]

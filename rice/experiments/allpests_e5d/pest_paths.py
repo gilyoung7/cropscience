@@ -13,8 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-CS = Path("/home/gpu4080/research/cropscience")
+from repo_paths import AP, CS, WS        # roots derived from this file's location
 # Results root. Must NOT require the external workspace -- server 2 may not have it.
 OUT_ROOT = Path(os.environ.get("ALLPESTS_OUT_ROOT",
                                CS / "rice/outputs_allpests_e5d"))
@@ -58,7 +57,7 @@ def synthetic_paths(pest: str) -> dict:
 
 def geometry(pest: str) -> tuple[int, int]:
     """(doy_start, T) straight from pests.tsv. BPH is the outlier: 140..270 -> T=131."""
-    for line in (CS / "rice/experiments/allpests_e5d/pests.tsv").read_text().splitlines():
+    for line in (AP / "pests.tsv").read_text().splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         f = line.split()

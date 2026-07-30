@@ -21,8 +21,9 @@
 #   bash bph_regen_prepare.sh            # patch template + print plan
 #   bash bph_regen_prepare.sh --emit     # + write bph_regen_run.sh (still not executed)
 set -euo pipefail
-CS=/home/gpu4080/research/cropscience
-AP="$CS/rice/experiments/allpests_e5d"
+# Roots derived from this file's location (see common.sh); CROPSCIENCE_ROOT overrides.
+AP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CS="${CROPSCIENCE_ROOT:-$(cd "$AP/../../.." && pwd)}"
 PY="$CS/.venv/bin/python"
 
 SRC="$CS/rice/outputs_stage1/BPH_siteyear42/ckpt/event_run4_xgb_nowcast_w28_s1_tpos_split42_siteyear_ymin2002.pt"

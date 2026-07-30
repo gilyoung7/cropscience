@@ -9,8 +9,8 @@ Reuses scripts/87_make_shared_offset_grid.collect() verbatim -- same forward, sa
 semantics, same columns -- with its module-level PEST switched. Nothing about the model or the
 row math is reimplemented here.
 
-  cd /home/gpu4080/research/cropscience
-  PYTHONPATH=$WS:$CS $PY $CS/rice/experiments/allpests_e5d/pest_grid.py --pest blast --mode dev --force
+  cd <cropscience>
+  PYTHONPATH=$VENDOR:$CS $PY rice/experiments/allpests_e5d/pest_grid.py --pest blast --mode dev --force
 """
 from __future__ import annotations
 import os
@@ -19,13 +19,12 @@ import argparse, importlib.util, sys
 from pathlib import Path
 import pandas as pd, torch
 
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-CS = Path("/home/gpu4080/research/cropscience")
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d"))
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor"))   # pinned deps only
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(AP))
+sys.path.insert(0, str(VENDOR))   # pinned deps only
 import pest_paths as PP
 
-_spec = importlib.util.spec_from_file_location("mk87", str(CS / "rice/experiments/allpests_e5d/vendor/scripts/87_make_shared_offset_grid.py"))
+_spec = importlib.util.spec_from_file_location("mk87", str(VENDOR / "scripts/87_make_shared_offset_grid.py"))
 mk87 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mk87)
 

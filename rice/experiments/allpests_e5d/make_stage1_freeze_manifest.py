@@ -16,8 +16,7 @@ import argparse, hashlib, sys
 from pathlib import Path
 import pandas as pd
 
-CS = Path("/home/gpu4080/research/cropscience")
-AP = CS / "rice/experiments/allpests_e5d"
+from repo_paths import AP, CS        # roots derived from this file's location
 S1 = CS / "rice/outputs/stage1/batch_rolling"
 S2 = CS / "rice/outputs/stage2"
 SPLIT_OF = {2022: ("split1", 2021), 2023: ("split2", 2022), 2024: ("split3", 2023)}

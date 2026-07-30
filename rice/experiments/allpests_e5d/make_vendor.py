@@ -17,10 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
-CS = Path("/home/gpu4080/research/cropscience")
-AP = CS / "rice/experiments/allpests_e5d"
-VENDOR = AP / "vendor"
-WS_DEFAULT = Path("/home/gpu4080/research/wbph_interval_perf_202607")
+from repo_paths import AP, CS, VENDOR, WS as WS_DEFAULT   # roots derived from this file's location
 
 # (source path relative to the external workspace, destination relative to vendor/)
 FILES = [

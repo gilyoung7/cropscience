@@ -110,3 +110,7 @@ api_handoff_litert_portable/runs/
 # rule above is a dataset policy, and these are <1 KB illustrations).
 !api_handoff_litert_portable/examples/*.csv
 !api_handoff_litert_portable/docs/examples/*.csv
+
+# Layout shims: production ckpts record dispatch CSVs under the older flat
+# rice/outputs_stage2_<batch>/ path; these symlink to the normalized rice/outputs/stage2/<batch>/.
+/rice/outputs_stage2_batch_*

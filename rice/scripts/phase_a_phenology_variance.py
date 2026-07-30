@@ -17,7 +17,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-LONG_PATH = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_잎집무늬마름병.csv")
+from rice.configs.base import LONG_BY_PEST_DIR
+LONG_PATH = LONG_BY_PEST_DIR / "RICE_LONG_잎집무늬마름병.csv"
 YEAR_MIN = 2002
 
 PHENO_COLS = ["best_suitability", "best_months", "offset_days", "window_idx"]

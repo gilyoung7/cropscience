@@ -13,11 +13,14 @@
 
 set -euo pipefail
 
-CS=/home/gpu4080/research/cropscience
+# Roots are derived, not hard-coded: this file lives at
+# <CS>/rice/experiments/allpests_e5d/common.sh, so the repo root is three levels up from its
+# own directory. CROPSCIENCE_ROOT overrides it. Sourcing this from any checkout prefix works.
+AP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CS="${CROPSCIENCE_ROOT:-$(cd "$AP/../../.." && pwd)}"
 # The external workspace is NOT used at runtime -- all code comes from vendor/.
-VENDOR="$CS/rice/experiments/allpests_e5d/vendor"
+VENDOR="$AP/vendor"
 PY="$CS/.venv/bin/python"
-AP="$CS/rice/experiments/allpests_e5d"
 OUT_ROOT="${OUT_ROOT:-${ALLPESTS_OUT_ROOT:-$CS/rice/outputs_allpests_e5d}}"
 
 YEARS_DEFAULT="2022 2023 2024"

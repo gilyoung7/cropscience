@@ -16,9 +16,7 @@ import argparse, hashlib, sys
 from pathlib import Path
 import pandas as pd
 
-CS = Path("/home/gpu4080/research/cropscience")
-AP = CS / "rice/experiments/allpests_e5d"
-VENDOR = AP / "vendor"
+from repo_paths import AP, CS, VENDOR        # roots derived from this file's location
 MANIFEST = VENDOR / "VENDOR_MANIFEST.csv"
 
 

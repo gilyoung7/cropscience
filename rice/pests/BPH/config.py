@@ -1,7 +1,7 @@
 from pathlib import Path
-from rice.configs.base import PATH_DAILY, YEAR_MAX
+from rice.configs.base import LONG_BY_PEST_DIR, PATH_DAILY, YEAR_MAX
 
-PATH_OBS = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_벼멸구.csv")
+PATH_OBS = LONG_BY_PEST_DIR / "RICE_LONG_벼멸구.csv"
 PEST_SLUG = "BPH"
 
 COUNT_COL = "obs_value"

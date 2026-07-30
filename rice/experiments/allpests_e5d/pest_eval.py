@@ -12,18 +12,17 @@ The clean half is a faithful port of foldwise_shift_fix.py -- same helpers, same
 same assertions, same pooling rule. It is a PORT rather than an import because that module
 truncates its run_log.txt at import time, which would corrupt the WBPH artifact.
 
-  cd /home/gpu4080/research/cropscience
-  PYTHONPATH=$WS:$CS $PY $CS/rice/experiments/allpests_e5d/pest_eval.py --pest blast
+  cd <cropscience>
+  PYTHONPATH=$VENDOR:$CS $PY rice/experiments/allpests_e5d/pest_eval.py --pest blast
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, sys, time
 from pathlib import Path
 import numpy as np, pandas as pd
 
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-CS = Path("/home/gpu4080/research/cropscience")
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d"))
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor"))   # pinned deps only
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(AP))
+sys.path.insert(0, str(VENDOR))   # pinned deps only
 import pest_paths as PP
 from src.io_utils import load_dispatch, load_clim_mid
 from src.selector_utils import build_candidates, train_selector, pick_offsets, picked_rows

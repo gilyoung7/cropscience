@@ -14,7 +14,8 @@ import pandas as pd
 import numpy as np
 
 DAILY_PATH = Path("/home/gpu4080/ygdata/rice/1997_2024_RICE_union_all_sites_with_GDD10_since_gs.csv")
-LONG_PATH = Path("/home/gpu4080/ygdata/rice/LONG_by_pest/RICE_LONG_잎집무늬마름병.csv")
+from rice.configs.base import LONG_BY_PEST_DIR
+LONG_PATH = LONG_BY_PEST_DIR / "RICE_LONG_잎집무늬마름병.csv"
 YEAR_MIN = 2002
 
 TRAIN_YEARS = range(2002, 2022)   # 2002..2021

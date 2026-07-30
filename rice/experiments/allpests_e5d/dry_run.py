@@ -7,11 +7,11 @@ Run this before launching either server. It is the only thing standing between a
   --level fast  (default) static checks only, no data load, ~seconds
   --level full  additionally builds the real sample tensors and runs a model forward per pest
 
-Usage:
-  cd /home/gpu4080/research/cropscience
-  PYTHONPATH=/home/gpu4080/research/wbph_interval_perf_202607:/home/gpu4080/research/cropscience \
-    /home/gpu4080/research/cropscience/.venv/bin/python \
-    /home/gpu4080/research/wbph_interval_perf_202607/rice/experiments/allpests_e5d/dry_run.py --level full
+Usage (from the repo root; the roots are derived, so no absolute path is needed):
+  cd <cropscience>
+  .venv/bin/python rice/experiments/allpests_e5d/dry_run.py --level full
+
+Set CROPSCIENCE_ROOT only if you are running a copy of this directory from outside the repo.
 """
 from __future__ import annotations
 import os
@@ -20,10 +20,8 @@ import argparse, json, subprocess, sys
 import pandas as pd
 from pathlib import Path
 
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-CS = Path("/home/gpu4080/research/cropscience")
-AP = CS / "rice/experiments/allpests_e5d"
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor")); sys.path.insert(0, str(CS))
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(VENDOR)); sys.path.insert(0, str(CS))
 
 YEARS = [2022, 2023, 2024]
 OFFSETS = [3, 7, 14, 21, 28, 30, 35, 42, 45, 49, 56, 60]

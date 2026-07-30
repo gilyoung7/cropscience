@@ -16,8 +16,8 @@ Effective parameters are determined by GRADIENT FLOW, not by reading the source:
 forward + backward on the mu path and count only parameters that receive a non-None gradient.
 In the E5d configuration the hazard head and the template head_mu are both dead.
 
-  cd /home/gpu4080/research/cropscience
-  PYTHONPATH=$WS:$CS $PY $CS/rice/experiments/allpests_e5d/capacity_table.py --out <dir>
+  cd <cropscience>
+  PYTHONPATH=$VENDOR:$CS $PY rice/experiments/allpests_e5d/capacity_table.py --out <dir>
 """
 from __future__ import annotations
 import os
@@ -26,10 +26,9 @@ import argparse, json, sys, time
 from pathlib import Path
 import numpy as np, pandas as pd, torch
 
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-CS = Path("/home/gpu4080/research/cropscience")
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d"))
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor")); sys.path.insert(0, str(CS))   # pinned deps only
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(AP))
+sys.path.insert(0, str(VENDOR)); sys.path.insert(0, str(CS))   # pinned deps only
 import pest_paths as PP
 
 OFFSETS = PP.OFFSETS
@@ -38,7 +37,7 @@ NEIGHBOR_CH = 6          # --stage2_add_neighbor_history appends 6 channels
 
 def registry():
     rows = []
-    for line in (CS / "rice/experiments/allpests_e5d/pests.tsv").read_text().splitlines():
+    for line in (AP / "pests.tsv").read_text().splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         f = line.split()

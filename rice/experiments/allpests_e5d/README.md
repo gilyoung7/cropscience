@@ -29,17 +29,59 @@ no other pest's number should be trusted.
 
 ```bash
 # 0. pre-flight (do this first; it is the cheap thing that prevents 48 wasted GPU-hours)
-cd /home/gpu4080/research/cropscience
-PYTHONPATH=/home/gpu4080/research/wbph_interval_perf_202607:/home/gpu4080/research/cropscience \
-  .venv/bin/python /home/gpu4080/research/wbph_interval_perf_202607/rice/experiments/allpests_e5d/dry_run.py --level full
+cd <cropscience>
+.venv/bin/python rice/experiments/allpests_e5d/vendor_check.py
+.venv/bin/python rice/experiments/allpests_e5d/dry_run.py --level full
 
 # 1. server 1
-bash /home/gpu4080/research/wbph_interval_perf_202607/rice/experiments/allpests_e5d/run_server.sh 1
+bash rice/experiments/allpests_e5d/run_server.sh 1
 # 1'. server 2 (other machine, same repo state)
-bash /home/gpu4080/research/wbph_interval_perf_202607/rice/experiments/allpests_e5d/run_server.sh 2
+bash rice/experiments/allpests_e5d/run_server.sh 2
 ```
 
 `run_server.sh` re-runs the fast dry run itself and refuses to start on any FAIL.
+
+## Roots and environment
+
+Nothing here hard-codes a machine. `repo_paths.py` (Python) and `common.sh` (bash) both derive
+the repo root from their own file location — this directory is always
+`<root>/rice/experiments/allpests_e5d` — so a checkout under any prefix runs unmodified.
+
+| variable | meaning | default |
+|---|---|---|
+| `CROPSCIENCE_ROOT` | repo root override | derived from the script's own path |
+| `WBPH_WS_ROOT` | external `wbph_interval_perf_202607` workspace | sibling of the repo root |
+| `ALLPESTS_OUT_ROOT` | results root | `<root>/rice/outputs_allpests_e5d` |
+| `RICE_DAILY_CSV` | daily union table (`rice/configs/base.py`) | `/home/gpu4080/ygdata/rice/1997_2024_RICE_union_all_sites_with_GDD10_since_gs.csv` |
+| `RICE_LONG_BY_PEST_DIR` | per-pest observation CSV directory | `/home/gpu4080/ygdata/rice/LONG_by_pest` |
+
+The last two point at data that lives outside the repo, so they cannot be derived from the repo
+root. Only the *directory* is relocatable for `LONG_by_pest` — each pest config still owns its
+own `RICE_LONG_<korean name>.csv` filename. `BPH2` is the one pest whose observation file sits
+outside `LONG_by_pest`; it is excluded from this run and was left hard-coded.
+
+A host that does not mirror the first server's `/home/gpu4080/ygdata` layout sets both to
+wherever its own copy of the data lives — no code change and no edit to this file:
+
+```bash
+export RICE_LONG_BY_PEST_DIR=<DATA_ROOT>/LONG_by_pest
+export RICE_DAILY_CSV=<DATA_ROOT>/1997_2024_RICE_union_all_sites_with_GDD10_since_gs.csv
+```
+
+The external workspace is **optional** and never imported; only `capacity_report.py` and
+`smoke_wandb_wbph2024.py` read WBPH's published result CSVs from it, and both guard on
+existence. `repo_paths.py` refuses to guess: if the derived root does not contain `rice/configs`,
+`rice/pests` and `rice/src/pest_resolver.py` it exits with instructions rather than proceeding
+against the wrong tree.
+
+Interpreter: `.venv` at the repo root, built from `requirements.txt` in this directory. The
+Torch build is pinned to **cu118** because a 525.60.x driver does not meet the 525.60.13 floor
+of the cu121 wheels; check `nvidia-smi` on both servers before changing it.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r rice/experiments/allpests_e5d/requirements.txt
+```
 
 ## Per-pest chain (`run_pest.sh`)
 

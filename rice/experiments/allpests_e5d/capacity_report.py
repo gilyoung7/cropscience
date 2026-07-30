@@ -12,10 +12,9 @@ import json, sys
 from pathlib import Path
 import numpy as np, pandas as pd
 
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-CS = Path("/home/gpu4080/research/cropscience")
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d"))
-sys.path.insert(0, str(CS / "rice/experiments/allpests_e5d/vendor"))   # pinned deps only
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(AP))
+sys.path.insert(0, str(VENDOR))   # pinned deps only
 import pest_paths as PP
 
 CAP = PP.OUT_ROOT / "_capacity/capacity_by_pest_year.csv"
@@ -44,7 +43,7 @@ def perf_rows() -> pd.DataFrame:
                              clean_IoU80=float(r["IoU80_overall_tol0"]),
                              clean_oracle=float(r["oracle_iou"]), clean_shift=int(r["shift"])))
     # per-pest results produced by the all-pest sweep (empty until it runs)
-    for p in [r.split()[0] for r in (CS / "rice/experiments/allpests_e5d/pests.tsv").read_text().splitlines()
+    for p in [r.split()[0] for r in (AP / "pests.tsv").read_text().splitlines()
               if r.strip() and not r.lstrip().startswith("#")]:
         f = PP.eval_dir(p) / "clean_fold_metrics.csv"
         if f.exists():

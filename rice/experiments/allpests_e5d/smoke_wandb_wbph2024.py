@@ -7,19 +7,19 @@ Runs the real dev protocol (selector on the val_fit half, shift on val_cal, sele
 
 Also prints a key-parity table: every legacy W&B key vs what this connector emits.
 
-  cd /home/gpu4080/research/cropscience
-  PYTHONPATH=/home/gpu4080/research/wbph_interval_perf_202607:$PWD \
-    .venv/bin/python rice/experiments/allpests_e5d/smoke_wandb_wbph2024.py
+  cd <cropscience>
+  .venv/bin/python rice/experiments/allpests_e5d/smoke_wandb_wbph2024.py
+
+Needs the external workspace for WBPH's published dev grid; point WBPH_WS_ROOT at it if it is
+not the sibling directory wbph_interval_perf_202607.
 """
 from __future__ import annotations
 import argparse, json, sys
 from pathlib import Path
 import numpy as np, pandas as pd
 
-CS = Path("/home/gpu4080/research/cropscience")
-WS = Path("/home/gpu4080/research/wbph_interval_perf_202607")
-AP = CS / "rice/experiments/allpests_e5d"
-sys.path.insert(0, str(AP)); sys.path.insert(0, str(AP / "vendor"))   # pinned deps only
+from repo_paths import AP, CS, VENDOR, WS        # roots derived from this file's location
+sys.path.insert(0, str(AP)); sys.path.insert(0, str(VENDOR))   # pinned deps only
 import pest_paths as PP
 import pest_eval as PE
 import wandb_viz_e5d as VW
